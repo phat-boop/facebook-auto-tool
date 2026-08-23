@@ -1,5 +1,5 @@
 {
-    "version": "2.0.0",
+    "version": "2.1.0",
     "download_url": "https://github.com/phat-boop/facebook-auto-tool/releases",
     "changelog": "- Ra mắt phiên bản 2.0.0 chính thức\n- Tích hợp quét UID và Nhóm\n- Tối ưu đa luồng và chống checkpoint"
 }
