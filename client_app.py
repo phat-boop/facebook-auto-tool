@@ -8,9 +8,11 @@ import re
 import subprocess
 import sys
 import threading
+import hashlib
+import hmac
 import tkinter as tk
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 from urllib.parse import quote
 from cryptography.fernet import Fernet
@@ -21,7 +23,7 @@ CURRENT_VERSION = "2.0.0"
 # Link file version.json trên GitHub raw hoặc hosting cá nhân của bạn
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
-SECRET_KEY = b'uV9xP_7qWz1Y3kLmN8sR2tA4bC6dE8fG0hI2jK4lM6o='
+SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
 LICENSE_FILE = "license.lic"
 SETTINGS_FILE = "settings.json"
 
@@ -81,23 +83,36 @@ def get_hwid():
     except Exception:
         return "UNKNOWN_DEVICE_ID"
 
+
 def verify_license(key_str: str):
+    """Xác thực Key ngắn định dạng XXXX-XXXX-XXXX-XXXX"""
     try:
-        cipher = Fernet(SECRET_KEY)
-        encrypted_data = base64.b64decode(key_str.encode("utf-8"))
-        decrypted_json = cipher.decrypt(encrypted_data).decode("utf-8")
-        data = json.loads(decrypted_json)
+        clean_key = key_str.strip().replace("-", "").upper()
+        if len(clean_key) != 16:
+            return False, "Định dạng Key không hợp lệ!"
 
-        if data["hwid"] != get_hwid():
-            return False, "Mã máy không khớp! Key này không thuộc thiết bị này."
+        days_hex = clean_key[:4]
+        signature = clean_key[4:]
 
-        expire_at = datetime.strptime(data["expire_at"], "%Y-%m-%d %H:%M:%S")
+        # 1. Tính toán lại ngày hết hạn
+        days_offset = int(days_hex, 16)
+        epoch = datetime(2026, 1, 1)
+        expire_at = epoch + timedelta(days=days_offset)
+
+        # 2. Xác thực chữ ký băm với HWID hiện tại
+        current_hwid = get_hwid().strip().upper()
+        raw_payload = f"{current_hwid}-{days_hex}"
+        expected_sig = hmac.new(SECRET_SALT, raw_payload.encode(), hashlib.sha256).hexdigest()[:12].upper()
+
+        if not hmac.compare_digest(signature, expected_sig):
+            return False, "Mã máy không khớp hoặc Key đã bị chỉnh sửa!"
+
         if datetime.now() > expire_at:
-            return False, f"Key bản quyền đã hết hạn vào {data['expire_at']}."
+            return False, f"Key bản quyền đã hết hạn vào ngày {expire_at.strftime('%d/%m/%Y')}."
 
-        return True, data["expire_at"]
+        return True, expire_at.strftime("%d/%m/%Y")
     except Exception:
-        return False, "Key bản quyền không hợp lệ!"
+        return False, "Key không hợp lệ!"
 
 def parse_cookies(cookie_raw: str):
     cookies_list = []
