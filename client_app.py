@@ -9,6 +9,8 @@ import subprocess
 import sys
 import threading
 import hashlib
+import subprocess
+import winreg
 import hmac
 import tkinter as tk
 import urllib.request
@@ -54,35 +56,84 @@ CANCEL_REQUEST_SELECTORS = (
 )
 
 def check_for_updates():
-    """Kiểm tra cập nhật phiên bản mới ngầm qua Internet"""
+    """Tự động kiểm tra, tự tải bản mới đè lên bản cũ và khởi động lại"""
     try:
         req = urllib.request.Request(VERSION_CHECK_URL, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=5) as response:
+        with urllib.request.urlopen(req, timeout=6) as response:
             if response.status == 200:
                 data = json.loads(response.read().decode('utf-8'))
                 latest_version = data.get("version", CURRENT_VERSION)
                 download_url = data.get("download_url", "")
-                changelog = data.get("changelog", "Bản cập nhật nâng cao tính năng.")
+                changelog = data.get("changelog", "Nâng cấp tính năng và sửa lỗi.")
 
+                # So sánh phiên bản
                 if latest_version > CURRENT_VERSION:
-                    res = messagebox.askyesno(
-                        "Cập nhật mới",
+                    confirm = messagebox.askyesno(
+                        "Cập nhật tự động",
                         f"Đã có phiên bản mới: v{latest_version} (Bản hiện tại: v{CURRENT_VERSION})\n\n"
-                        f"Nội dung mới:\n{changelog}\n\nBạn có muốn tải về ngay không?"
+                        f"Nội dung mới:\n{changelog}\n\n"
+                        "Bạn có muốn phần mềm tự động cập nhật ngay bây giờ không?"
                     )
-                    if res and download_url:
-                        os.system(f"start {download_url}")
+                    
+                    if confirm and download_url:
+                        # 1. Tải file .exe mới về lưu tạm thành update.exe
+                        temp_file = "update_temp.exe"
+                        urllib.request.urlretrieve(download_url, temp_file)
+
+                        # 2. Tạo file kịch bản updater.bat để thay thế file cũ và mở lại app
+                        current_exe = sys.executable
+                        bat_script = f"""@echo off
+timeout /t 2 /nobreak > nul
+move /y "{temp_file}" "{current_exe}"
+start "" "{current_exe}"
+del "%~f0"
+"""
+                        with open("updater.bat", "w", encoding="utf-8") as f:
+                            f.write(bat_script)
+
+                        messagebox.showinfo("Cập nhật", "Đã tải xong! Ứng dụng sẽ tự khởi động lại sau 2 giây.")
+                        os.system("start updater.bat")
+                        os._exit(0) # Tắt ứng dụng hiện tại để file .bat thay thế file mới
     except Exception:
         pass
 
 def get_hwid():
+    """Lấy mã định danh phần cứng máy tính duy nhất và bảo mật"""
+    unique_parts = []
+    
+    # 1. Lấy MachineGuid từ Windows Registry (Chuẩn tuyệt đối trên mọi bản Windows)
     try:
-        cmd = "wmic csproduct get uuid"
-        uuid = subprocess.check_output(cmd, shell=True).decode().split('\n')[1].strip()
-        return uuid
+        registry_key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography", 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
+        machine_guid, _ = winreg.QueryValueEx(registry_key, "MachineGuid")
+        winreg.CloseKey(registry_key)
+        if machine_guid:
+            unique_parts.append(str(machine_guid).strip())
     except Exception:
-        return "UNKNOWN_DEVICE_ID"
+        pass
 
+    # 2. Lấy Serial của ổ đĩa C: (Volume Serial Number)
+    try:
+        vol_cmd = "vol C:"
+        output = subprocess.check_output(vol_cmd, shell=True, stderr=subprocess.DEVNULL).decode(errors="ignore")
+        match = re.search(r"Serial Number is ([A-Fa-f0-9-]+)", output, re.IGNORECASE)
+        if match:
+            unique_parts.append(match.group(1).strip())
+    except Exception:
+        pass
+
+    # 3. Lấy UUID bo mạch chủ qua PowerShell
+    try:
+        ps_cmd = 'powershell -Command "(Get-CimInstance -Class Win32_ComputerSystemProduct).UUID"'
+        ps_out = subprocess.check_output(ps_cmd, shell=True, stderr=subprocess.DEVNULL).decode(errors="ignore").strip()
+        if ps_out and "UUID" not in ps_out:
+            unique_parts.append(ps_out)
+    except Exception:
+        pass
+
+    # Ghép và băm thành một chuỗi HWID ngắn gọn 16 ký tự cố định cho từng máy
+    raw_id = "-".join(unique_parts) if unique_parts else "FALLBACK_DEVICE_DEFAULT"
+    hashed_hwid = hashlib.md5(raw_id.encode("utf-8")).hexdigest()[:16].upper()
+    return f"HWID-{hashed_hwid}"
 
 def verify_license(key_str: str):
     """Xác thực Key ngắn định dạng XXXX-XXXX-XXXX-XXXX"""
@@ -241,6 +292,8 @@ class MainToolApp:
         ttk.Radiobutton(frame_mode, text="1. Tìm kiếm theo Tên ngẫu nhiên", variable=self.add_mode, value="by_name").grid(row=0, column=0, sticky="w", padx=10, pady=4)
         ttk.Radiobutton(frame_mode, text="2. Thành viên Nhóm Facebook (Group)", variable=self.add_mode, value="by_group").grid(row=0, column=1, sticky="w", padx=10, pady=4)
         ttk.Radiobutton(frame_mode, text="3. Danh sách UID / Link Profile", variable=self.add_mode, value="by_uid").grid(row=0, column=2, sticky="w", padx=10, pady=4)
+        ttk.Radiobutton(frame_mode, text="4. Tự động Tham gia Nhóm (Join Groups)", variable=self.add_mode, value="join_group").grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=4)
+        ttk.Radiobutton(frame_mode, text="5. Tự động Đăng bài (Auto Post Timeline)", variable=self.add_mode, value="auto_post").grid(row=1, column=2, sticky="w", padx=10, pady=4)
 
         frame_targets = ttk.Frame(frame_mode)
         frame_targets.pack(fill="x", padx=10, pady=4)
@@ -265,6 +318,11 @@ class MainToolApp:
         self.chk_cancel_old = tk.BooleanVar(value=True)
         ttk.Checkbutton(frame_system, text="Hủy lời mời cũ", variable=self.chk_cancel_old).grid(row=0, column=4, padx=15, sticky="w")
 
+        self.chk_watch_reels = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame_system, text="Xem Reels Video", variable=self.chk_watch_reels).grid(row=1, column=2, padx=15, pady=4, sticky="w")
+
+        self.chk_view_stories = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame_system, text="Xem Story bạn bè", variable=self.chk_view_stories).grid(row=1, column=3, padx=15, pady=4, sticky="w")
         frame_cfg = ttk.LabelFrame(self.tab_main, text=" 5. Thông số gửi kết bạn ")
         frame_cfg.pack(fill="x", padx=10, pady=5)
 
@@ -284,11 +342,16 @@ class MainToolApp:
 
         frame_btns = ttk.Frame(self.tab_main)
         frame_btns.pack(fill="x", padx=10, pady=5)
+
+
+
         self.btn_start = ttk.Button(frame_btns, text="▶ BẮT ĐẦU CHẠY", command=self.start_thread)
         self.btn_start.pack(side="left", fill="x", expand=True, padx=5)
         self.btn_stop = ttk.Button(frame_btns, text="⏹ DỪNG LẠI", command=self.stop_bot, state="disabled")
         self.btn_stop.pack(side="right", fill="x", expand=True, padx=5)
-
+        # Thanh tiến độ tổng quan %
+        self.progress_bar = ttk.Progressbar(self.tab_main, orient="horizontal", mode="determinate")
+        self.progress_bar.pack(fill="x", padx=10, pady=5)
         frame_log = ttk.LabelFrame(self.tab_main, text=" Nhật ký hoạt động ")
         frame_log.pack(fill="both", expand=True, padx=10, pady=5)
         self.txt_log = scrolledtext.ScrolledText(frame_log, height=5, state="disabled", bg="#fcfcfc")
@@ -308,9 +371,13 @@ class MainToolApp:
         self.ent_max_friends.insert(0, "5000")
         self.ent_max_friends.pack(side="left", padx=2)
 
-        ttk.Button(frame_tools, text="🔍 Lọc", command=self.apply_filter).pack(side="left", padx=8)
-        ttk.Button(frame_tools, text="🔄 Nạp vào Bảng", command=self.reload_table_from_text).pack(side="left", padx=5)
-        ttk.Button(frame_tools, text="📊 Xuất Báo Cáo Excel/CSV", command=self.export_to_csv).pack(side="right", padx=5)
+        ttk.Button(frame_tools, text="🔍 Lọc", command=self.apply_filter).pack(side="left", padx=5)
+        ttk.Button(frame_tools, text="🌐 Open Profile", command=self.open_selected_profile).pack(side="left", padx=3)
+        ttk.Button(frame_tools, text="🔍 Check Live/Die", command=self.check_live_selected).pack(side="left", padx=3)
+        ttk.Button(frame_tools, text="🔑 Get Token", command=self.get_token_selected).pack(side="left", padx=3)
+        ttk.Button(frame_tools, text="🔐 Lấy mã 2FA", command=self.generate_2fa_dialog).pack(side="left", padx=3)
+        ttk.Button(frame_tools, text="🔄 Nạp vào Bảng", command=self.reload_table_from_text).pack(side="left", padx=3)
+        ttk.Button(frame_tools, text="📊 Xuất Báo Cáo", command=self.export_to_csv).pack(side="right", padx=5)
 
         frame_tree = ttk.Frame(self.tab_data)
         frame_tree.pack(fill="both", expand=True, padx=10, pady=5)
@@ -336,7 +403,23 @@ class MainToolApp:
         self.tree.configure(yscrollcommand=scroll_y.set)
         self.tree.pack(side="left", fill="both", expand=True)
         scroll_y.pack(side="right", fill="y")
+        self.tree_menu = tk.Menu(self.root, tearoff=0)
+        self.tree_menu.add_command(label="🌐 Mở Trình Duyệt (Open Profile)", command=self.open_selected_profile)
+        self.tree_menu.add_command(label="🔍 Kiểm tra Live/Die", command=self.check_live_selected)
+        self.tree_menu.add_command(label="🔑 Trích xuất Access Token (EAAB)", command=self.get_token_selected)
+        self.tree_menu.add_command(label="🔐 Tạo mã 2FA", command=self.generate_2fa_dialog)
+        self.tree_menu.add_separator()
+        self.tree_menu.add_command(label="▶ BẮT ĐẦU CHẠY", command=self.start_thread)
+        self.tree_menu.add_command(label="⏹ DỪNG LẠI (STOP)", command=self.stop_bot)
 
+        def _show_popup(event):
+            row_id = self.tree.identify_row(event.y)
+            if row_id:
+                if row_id not in self.tree.selection():
+                    self.tree.selection_set(row_id)
+                self.tree_menu.post(event.x_root, event.y_root)
+
+        self.tree.bind("<Button-3>", _show_popup)
     def log(self, text):
         self.txt_log.config(state="normal")
         self.txt_log.insert("end", f"{text}\n")
@@ -389,8 +472,14 @@ class MainToolApp:
             pass
 
     def on_close(self):
-        self.save_settings()
-        self.root.destroy()
+        try:
+            self.is_running = False
+            self.save_settings()
+        except Exception:
+            pass
+        finally:
+            self.root.destroy()
+            os._exit(0)  # Ép tắt ngay lập tức toàn bộ tiến trình ngầm và giải phóng bộ nhớ
 
     def import_accounts_file(self):
         file_path = filedialog.askopenfilename(filetypes=[("Text & CSV", "*.txt *.csv"), ("All Files", "*.*")])
@@ -449,7 +538,11 @@ class MainToolApp:
     def update_tree_row(self, item_id, sent_today=None, current_friends=None, status=None):
         try:
             curr = list(self.tree.item(item_id, "values"))
-            if sent_today is not None: curr[3] = str(sent_today)
+            if sent_today is not None: 
+                curr[3] = str(sent_today)
+                # Tự động tính toán và đẩy thanh tiến độ %
+                target_val = int(self.ent_target.get() or 25)
+                self.progress_bar['value'] = min(100, int((int(sent_today) / target_val) * 100))
             if current_friends is not None: curr[4] = str(current_friends)
             if status is not None: curr[5] = str(status)
             self.tree.item(item_id, values=curr)
@@ -508,7 +601,50 @@ class MainToolApp:
                     await asyncio.sleep(2)
         except Exception:
             pass
+    # ---> ĐOẠN CẦN CHÈN THÊM <---
+    async def watch_facebook_reels(self, page, acc_name):
+        """Tự động mở mục Reels, xem video ngẫu nhiên và like"""
+        self.log(f"[*] [{acc_name}] Đang xem Reels Video...")
+        try:
+            await page.goto("https://www.facebook.com/reel/", wait_until="domcontentloaded", timeout=35000)
+            await asyncio.sleep(4)
+            
+            # Xem qua 2-3 video ngắn
+            for i in range(random.randint(2, 3)):
+                if not self.is_running: break
+                watch_time = random.randint(8, 15)
+                self.log(f"[*] [{acc_name}] Đang xem Reel video {i+1} ({watch_time}s)...")
+                await asyncio.sleep(watch_time)
 
+                # Xác suất 50% thả Like video
+                if random.choice([True, False]):
+                    like_reel_btn = page.locator('div[aria-label="Thích"], div[aria-label="Like"]').first
+                    if await like_reel_btn.count() > 0 and await like_reel_btn.is_visible():
+                        try:
+                            await like_reel_btn.click()
+                            await asyncio.sleep(1)
+                        except Exception: pass
+                
+                # Cuộn phím mũi tên xuống để qua video tiếp theo
+                await page.keyboard.press("ArrowDown")
+                await asyncio.sleep(2)
+        except Exception:
+            pass
+
+    async def view_facebook_stories(self, page, acc_name):
+        """Tự động mở xem Story của bạn bè trên trang chủ"""
+        self.log(f"[*] [{acc_name}] Đang xem Story...")
+        try:
+            await page.goto("https://www.facebook.com/stories/", wait_until="domcontentloaded", timeout=35000)
+            await asyncio.sleep(4)
+            for _ in range(random.randint(2, 4)):
+                if not self.is_running: break
+                await asyncio.sleep(random.randint(5, 8))
+                # Bấm phím mũi tên phải để sang story kế tiếp
+                await page.keyboard.press("ArrowRight")
+        except Exception:
+            pass
+    
     async def cancel_old_requests(self, page, acc_name):
         try:
             await page.goto("https://www.facebook.com/friends/requests/", wait_until="domcontentloaded", timeout=30000)
@@ -637,7 +773,108 @@ class MainToolApp:
             except Exception:
                 pass
         return total_sent
+    # ---> ĐOẠN CẦN CHÈN THÊM <---
+    async def run_join_groups(self, page, acc_name, idx, targets, target_total, min_del, max_del):
+        """Tự động tìm kiếm nhóm theo từ khóa hoặc link và gửi yêu cầu tham gia"""
+        total_joined = 0
+        keywords = targets if targets else ["Bất động sản", "Việc làm", "Rao vặt", "Kinh doanh online"]
+        
+        JOIN_BTN_SELECTORS = (
+            'div[role="button"]:has-text("Tham gia nhóm"), '
+            'div[role="button"]:has-text("Tham gia"), '
+            'div[role="button"]:has-text("Join group"), '
+            'div[role="button"]:has-text("Join Group"), '
+            'div[aria-label="Tham gia nhóm"], '
+            'div[aria-label="Tham gia"]'
+        )
 
+        for kw in keywords:
+            if total_joined >= target_total or not self.is_running: break
+            
+            # Nếu khách nhập thẳng Link Group
+            if kw.startswith("http"):
+                group_url = kw
+            else:
+                group_url = f"https://www.facebook.com/search/groups/?q={quote(kw)}"
+
+            self.log(f"[*] [{acc_name}] Đang tìm nhóm: '{kw}'")
+            try:
+                await page.goto(group_url, wait_until="domcontentloaded", timeout=45000)
+                await asyncio.sleep(4)
+
+                for _ in range(3):
+                    if total_joined >= target_total or not self.is_running: break
+                    join_buttons = await page.locator(JOIN_BTN_SELECTORS).all()
+                    
+                    for btn in join_buttons:
+                        if not self.is_running or total_joined >= target_total: break
+                        if await btn.is_visible():
+                            try:
+                                await btn.scroll_into_view_if_needed()
+                                await asyncio.sleep(1)
+                                await btn.click()
+                                total_joined += 1
+                                self.update_tree_row(str(idx), sent_today=total_joined)
+                                delay = random.randint(min_del, max_del)
+                                self.log(f"[+] [{acc_name}] Đã bấm Tham gia nhóm ({total_joined}/{target_total}) - Delay {delay}s...")
+                                await asyncio.sleep(delay)
+                            except Exception:
+                                continue
+                    await page.mouse.wheel(0, 1000)
+                    await asyncio.sleep(3)
+            except Exception as e:
+                self.log(f"[-] Lỗi tìm nhóm {kw}: {e}")
+        return total_joined
+    # ---> HẾT ĐOẠN CHÈN <---
+    # ---> ĐOẠN CẦN CHÈN THÊM <---
+    async def run_auto_post(self, page, acc_name, idx, targets):
+        """Tự động đăng bài viết lên trang cá nhân Facebook"""
+        content_to_post = "\n".join(targets) if targets else "Chào ngày mới mọi người! Chúc cả nhà một ngày tràn đầy năng lượng."
+        self.log(f"[*] [{acc_name}] Đang chuẩn bị đăng bài lên trang cá nhân...")
+
+        POST_BOX_SELECTORS = (
+            'div[role="button"]:has-text("Bạn đang nghĩ gì?"), '
+            'div[role="button"]:has-text("What\'s on your mind?"), '
+            'div[aria-label="Tạo bài viết"], '
+            'div[aria-label="Create a post"]'
+        )
+        
+        SUBMIT_BTN_SELECTORS = (
+            'div[role="button"]:has-text("Đăng"), '
+            'div[role="button"]:has-text("Post"), '
+            'div[aria-label="Đăng"], '
+            'div[aria-label="Post"]'
+        )
+
+        try:
+            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=40000)
+            await asyncio.sleep(4)
+
+            # 1. Bấm mở khung đăng bài
+            post_box = page.locator(POST_BOX_SELECTORS).first
+            if await post_box.count() > 0 and await post_box.is_visible():
+                await post_box.click()
+                await asyncio.sleep(3)
+
+                # 2. Nhập nội dung bài viết
+                input_area = page.locator('div[role="textbox"][contenteditable="true"]').first
+                if await input_area.count() > 0:
+                    await input_area.fill(content_to_post)
+                    await asyncio.sleep(2)
+
+                    # 3. Bấm nút Đăng
+                    post_btn = page.locator(SUBMIT_BTN_SELECTORS).first
+                    if await post_btn.count() > 0 and await post_btn.is_visible():
+                        await post_btn.click()
+                        self.log(f"[✔] [{acc_name}] Đã đăng bài thành công lên trang cá nhân!")
+                        self.update_tree_row(str(idx), sent_today="1", status="Đã đăng bài")
+                        await asyncio.sleep(5)
+                        return 1
+            self.log(f"[-] [{acc_name}] Không tìm thấy khung soạn bài viết.")
+        except Exception as e:
+            self.log(f"[-] [{acc_name}] Lỗi khi đăng bài: {e}")
+        return 0
+    # ---> HẾT ĐOẠN CHÈN <---
     async def process_account(self, playwright_instance, idx, acc_name, cookie_str, assigned_proxy_str, semaphore):
         async with semaphore:
             if not self.is_running: return
@@ -663,6 +900,8 @@ class MainToolApp:
                 page = await context.new_page()
 
                 if self.chk_warmup.get(): await self.warm_up_feed(page, acc_name)
+                if self.chk_watch_reels.get(): await self.watch_facebook_reels(page, acc_name)
+                if self.chk_view_stories.get(): await self.view_facebook_stories(page, acc_name)
                 if self.chk_cancel_old.get(): await self.cancel_old_requests(page, acc_name)
 
                 cur_friends = await self.get_current_friends_count(page)
@@ -673,6 +912,10 @@ class MainToolApp:
                     total_sent = await self.run_add_by_group(page, acc_name, idx, targets, target_total, min_del, max_del)
                 elif mode == "by_uid":
                     total_sent = await self.run_add_by_uid(page, acc_name, idx, targets, target_total, min_del, max_del)
+                elif mode == "join_group":
+                    total_sent = await self.run_join_groups(page, acc_name, idx, targets, target_total, min_del, max_del)
+                elif mode == "auto_post":
+                    total_sent = await self.run_auto_post(page, acc_name, idx, targets)
                 else:
                     total_sent = await self.run_add_by_name(page, acc_name, idx, target_total, min_del, max_del)
 
@@ -723,6 +966,163 @@ class MainToolApp:
         self.log("\n[🎉] TOÀN BỘ CÁC LUỒNG ĐÃ HOÀN TẤT.")
         self.stop_bot()
 
+    def check_live_selected(self):
+        selected = self.tree.selection() or self.tree.get_children()
+        if not selected:
+            messagebox.showwarning("Chú ý", "Bảng đang trống!")
+            return
+
+        def worker():
+            for item in selected:
+                vals = list(self.tree.item(item, "values"))
+                acc_name = vals[1]
+                acc_lines = [l.strip() for l in self.txt_accounts.get("1.0", "end").splitlines() if l.strip()]
+                uid = None
+                for line in acc_lines:
+                    if line.startswith(acc_name):
+                        m = re.search(r'c_user=(\d+)', line)
+                        if m: uid = m.group(1)
+                        break
+
+                if uid:
+                    try:
+                        url = f"https://graph.facebook.com/{uid}/picture?type=normal"
+                        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            status_live = "Live" if "static.xx.fbcdn.net" not in resp.geturl() else "Checkpoint/Die"
+                    except Exception:
+                        status_live = "Checkpoint/Die"
+                else:
+                    status_live = "Không có UID"
+
+                self.update_tree_row(item, status=status_live)
+            messagebox.showinfo("Hoàn tất", "Đã kiểm tra xong tình trạng Live/Die.")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def open_selected_profile(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("Chú ý", "Vui lòng chọn 1 dòng tài khoản để mở Profile!")
+            return
+
+        item = selected[0]
+        vals = self.tree.item(item, "values")
+        acc_name = vals[1]
+        proxy_str = vals[2]
+
+        acc_lines = [l.strip() for l in self.txt_accounts.get("1.0", "end").splitlines() if l.strip()]
+        cookie_str = ""
+        for line in acc_lines:
+            if line.startswith(acc_name):
+                parts = line.split('|')
+                if len(parts) > 1: cookie_str = parts[1]
+                break
+
+        profiles_dir = os.path.join(os.getcwd(), "browser_profiles")
+        os.makedirs(profiles_dir, exist_ok=True)
+        profile_path = os.path.join(profiles_dir, f"profile_{acc_name}")
+
+        def launch():
+            async def run():
+                async with async_playwright() as p:
+                    proxy_cfg = parse_proxy(proxy_str if proxy_str != "Không dùng" else "")
+                    context = await p.chromium.launch_persistent_context(
+                        user_data_dir=profile_path,
+                        headless=False,
+                        proxy=proxy_cfg,
+                        args=["--disable-blink-features=AutomationControlled"]
+                    )
+                    if cookie_str:
+                        await context.add_cookies(parse_cookies(cookie_str))
+                    page = context.pages[0] if context.pages else await context.new_page()
+                    await page.goto("https://www.facebook.com/")
+                    while len(context.pages) > 0:
+                        await asyncio.sleep(1)
+            asyncio.run(run())
+
+        threading.Thread(target=launch, daemon=True).start()
+        # ---> ĐOẠN CẦN CHÈN THÊM <---
+    def get_token_selected(self):
+        """Trích xuất Access Token EAAB từ Cookie tài khoản"""
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("Chú ý", "Vui lòng chọn 1 dòng tài khoản để lấy Token!")
+            return
+
+        item = selected[0]
+        acc_name = self.tree.item(item, "values")[1]
+        
+        # Tìm cookie của nick
+        acc_lines = [l.strip() for l in self.txt_accounts.get("1.0", "end").splitlines() if l.strip()]
+        cookie_str = ""
+        for line in acc_lines:
+            if line.startswith(acc_name):
+                parts = line.split('|')
+                if len(parts) > 1: cookie_str = parts[1]
+                break
+
+        if not cookie_str:
+            messagebox.showerror("Lỗi", "Không tìm thấy chuỗi Cookie của nick này!")
+            return
+
+        def extract_worker():
+            try:
+                # Gửi request lấy token từ trang Ads Manager của Facebook
+                req = urllib.request.Request(
+                    "https://adsmanager.facebook.com/adsmanager/manage/campaigns",
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Cookie': cookie_str
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    html_content = resp.read().decode('utf-8', errors='ignore')
+                    token_match = re.search(r'(EAAB\w+)', html_content)
+                    
+                    if token_match:
+                        token = token_match.group(1)
+                        # Tự động sao chép vào Clipboard
+                        self.root.clipboard_clear()
+                        self.root.clipboard_append(token)
+                        messagebox.showinfo("Thành công", f"Đã lấy được Token EAAB (Đã tự động Copy vào Clipboard):\n\n{token[:45]}...")
+                    else:
+                        messagebox.showwarning("Thông báo", "Cookie không hợp lệ hoặc không trích xuất được Token EAAB.")
+            except Exception as e:
+                messagebox.showerror("Lỗi", f"Không thể lấy Token: {e}")
+
+        threading.Thread(target=extract_worker, daemon=True).start()
+
+    def generate_2fa_dialog(self):
+        """Tạo mã xác thực 2FA 6 số nhanh từ 2FA Private Key"""
+        from tkinter import simpledialog
+        key_2fa = simpledialog.askstring("Tạo mã 2FA", "Nhập mã bí mật 2FA (Secret Key gồm 16-32 ký tự):")
+        if not key_2fa: return
+        
+        try:
+            # Thuật toán TOTP chuẩn RFC 6238
+            import struct, time
+            clean_secret = key_2fa.replace(" ", "").upper()
+            # Bổ sung padding nếu thiếu
+            missing_padding = len(clean_secret) % 8
+            if missing_padding:
+                clean_secret += '=' * (8 - missing_padding)
+            
+            key_bytes = base64.b32decode(clean_secret, casefold=True)
+            time_counter = int(time.time() // 30)
+            time_bytes = struct.pack(">Q", time_counter)
+            
+            h = hmac.new(key_bytes, time_bytes, hashlib.sha1).digest()
+            offset = h[19] & 0xF
+            code = ((h[offset] & 0x7F) << 24 | (h[offset + 1] & 0xFF) << 16 | (h[offset + 2] & 0xFF) << 8 | (h[offset + 3] & 0xFF)) % 1000000
+            str_code = f"{code:06d}"
+            
+            self.root.clipboard_clear()
+            self.root.clipboard_append(str_code)
+            messagebox.showinfo("Mã 2FA", f"Mã xác thực 2FA hiện tại: {str_code}\n(Đã tự động Copy)")
+        except Exception:
+            messagebox.showerror("Lỗi", "Mã 2FA Secret Key không hợp lệ!")
+    # ---> HẾT ĐOẠN CHÈN <---
 
 def main():
     if os.path.exists(LICENSE_FILE):
@@ -733,16 +1133,18 @@ def main():
             root = tk.Tk()
             app = MainToolApp(root, exp_date)
             root.mainloop()
-            return
+            sys.exit(0)
 
     root = tk.Tk()
     def launch_main():
+        root.destroy()  # Đóng sạch cửa sổ kích hoạt cũ trước khi mở app chính
         main_root = tk.Tk()
         with open(LICENSE_FILE, "r", encoding="utf-8") as f:
             k = f.read().strip()
         _, exp = verify_license(k)
         app = MainToolApp(main_root, exp)
         main_root.mainloop()
+        sys.exit(0)
 
     app = LicenseCheckDialog(root, launch_main)
     root.mainloop()
