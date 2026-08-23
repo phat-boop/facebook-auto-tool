@@ -1,0 +1,6 @@
+dist/ 
+build/ 
+*.spec 
+license.lic 
+settings.json 
+admin_key_gen.py 
