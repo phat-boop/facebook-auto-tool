@@ -1,5 +1,5 @@
 {
-    "version": "2.1.",
+    "version": "2.1.2",
     "download_url": "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.1.2/client_app.exe",
     "sha256": "AEE7E01ADDEB3CD5C4AF74A2986E582FD3DD4EF5B29075A777EFDB0C4C858174",
     "changelog": "🚀 CẬP NHẬT PHIÊN BẢN MỚI (PRO VERSION)\n\n✅ Tối ưu cơ chế Auto-Update & Ghi đè file thông minh bằng Taskkill\n✅ Mở rộng dải độ phân giải & Tự động chia lưới cửa sổ chuẩn xác\n✅ Ép toàn bộ ngôn ngữ trình duyệt về tiếng Việt chuẩn hóa\n✅ Bổ sung nút Kiểm tra Update thủ công và Tải trực tiếp\n✅ Nâng cao hiệu suất đa luồng & Chống lỗi phân quyền hệ thống",
