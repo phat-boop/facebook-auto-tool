@@ -36,7 +36,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.1.3"
+CURRENT_VERSION = "2.1.4"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -93,6 +93,19 @@ ADD_FRIEND_SELECTORS = (
     'div[aria-label="Add Friend"]'
 )
 
+FRIEND_REQUEST_SENT_SELECTORS = (
+    'div[role="button"]:has-text("Hủy lời mời"), '
+    'div[role="button"]:has-text("Hủy yêu cầu"), '
+    'div[role="button"]:has-text("Cancel request"), '
+    'div[role="button"]:has-text("Request sent"), '
+    'div[aria-label="Hủy lời mời"], '
+    'div[aria-label="Hủy yêu cầu"], '
+    'div[aria-label="Cancel request"], '
+    'div[aria-label="Request sent"]'
+)
+
+RESULT_FILE_LOCK = threading.Lock()
+
 MESSAGE_BTN_SELECTORS = (
     'div[role="button"]:has-text("Nhắn tin"), '
     'div[role="button"]:has-text("Message"), '
@@ -124,6 +137,83 @@ def version_tuple(version):
     """Chuyển chuỗi version thành tuple số để so sánh đúng thứ tự."""
     parts = re.findall(r"\d+", str(version))
     return tuple(int(part) for part in parts) if parts else (0,)
+
+
+def parse_page_plan(value: str):
+    """Parse `page name|category`; old one-column page names remain valid."""
+    parts = [part.strip() for part in str(value or "").split("|", 1)]
+    return {
+        "name": parts[0] if parts and parts[0] else generate_random_person_name(),
+        "category": parts[1] if len(parts) > 1 and parts[1] else "Blog cá nhân",
+    }
+
+
+def select_page_admin_job(targets, account_index: int, account_name: str):
+    """Select an account-specific Page/admin mapping while preserving legacy input."""
+    legacy_job = None
+    has_scoped_jobs = False
+    account_keys = {str(account_index), str(account_name or "").strip().casefold()}
+    for raw_target in targets or []:
+        parts = [part.strip() for part in str(raw_target).split("|")]
+        if len(parts) >= 3:
+            has_scoped_jobs = True
+            owner = parts[0].casefold()
+            if owner in account_keys or owner in {"*", "all", "tất cả", "tat ca"}:
+                return {"page": parts[1], "admin": parts[2]}
+        elif len(parts) == 2 and all(parts):
+            legacy_job = {"page": parts[0], "admin": parts[1]}
+
+    # Backward compatibility: two separate lines used to mean URL then admin.
+    if legacy_job:
+        return legacy_job
+    if has_scoped_jobs:
+        return None
+    clean_targets = [str(item).strip() for item in (targets or []) if str(item).strip()]
+    if len(clean_targets) >= 2:
+        return {"page": clean_targets[0], "admin": clean_targets[1]}
+    return None
+
+
+def extract_facebook_page_identity(urls):
+    """Return a stable Page URL/ID from current or canonical Facebook URLs."""
+    for raw_url in urls or []:
+        url = str(raw_url or "").strip()
+        if not url:
+            continue
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.rstrip("/")
+        if host not in {"facebook.com", "www.facebook.com", "m.facebook.com"}:
+            continue
+        if path in {"", "/", "/pages", "/pages/creation"} or path.startswith("/pages/creation/"):
+            continue
+        first_segment = path.strip("/").split("/", 1)[0].casefold()
+        if first_segment in {
+            "bookmarks", "events", "friends", "gaming", "groups", "home.php",
+            "login", "manage", "marketplace", "messages", "notifications",
+            "pages", "search", "settings", "watch",
+        }:
+            continue
+        query_id = re.search(r"(?:^|&)id=(\d+)(?:&|$)", parsed.query)
+        path_id = re.search(r"/(?:profile\.php/)?(\d{5,})(?:/|$)", path)
+        page_id = (query_id or path_id).group(1) if (query_id or path_id) else ""
+        clean_url = f"https://www.facebook.com{path}"
+        if query_id and path.endswith("profile.php"):
+            clean_url += f"?id={page_id}"
+        return {"url": clean_url, "id": page_id}
+    return {"url": "", "id": ""}
+
+
+def append_csv_result(filename: str, fieldnames, row):
+    """Append one durable result row without interleaving concurrent workers."""
+    path = output_path(filename)
+    with RESULT_FILE_LOCK:
+        has_content = os.path.exists(path) and os.path.getsize(path) > 0
+        with open(path, "a", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            if not has_content:
+                writer.writeheader()
+            writer.writerow(row)
 
 def is_trusted_update_url(download_url: str) -> bool:
     parsed = urlparse(download_url)
@@ -2217,7 +2307,9 @@ class MainToolApp:
                     await search_input.fill(target_uid_or_name)
                     await asyncio.sleep(3)
                     
-                    user_res = page.locator('div[role="listbox"] div[role="option"], div[role="button"]:has-text("' + target_uid_or_name + '")').first
+                    user_res = page.locator('div[role="listbox"] div[role="option"]').first
+                    if await user_res.count() == 0:
+                        user_res = page.get_by_text(target_uid_or_name, exact=False).first
                     if await user_res.count() > 0:
                         await user_res.click()
                         await asyncio.sleep(2)
@@ -2225,9 +2317,55 @@ class MainToolApp:
                         give_access = page.locator('div[role="button"]:has-text("Cấp quyền truy cập"), div[role="button"]:has-text("Give access")').first
                         if await give_access.count() > 0:
                             await give_access.click()
-                            await asyncio.sleep(4)
-                            self.log(f"[✔] [{acc_name}] Đã gửi lời mời Admin Page cho: {target_uid_or_name}")
-                            return 1
+                            await asyncio.sleep(3)
+                            password_prompt = page.locator('input[type="password"]:visible')
+                            if await password_prompt.count() > 0:
+                                self.log(
+                                    f"[!] [{acc_name}] Facebook yêu cầu xác nhận mật khẩu; "
+                                    "chưa ghi nhận ghép Page thành công."
+                                )
+                                append_csv_result(
+                                    "page_admin_jobs.csv",
+                                    ["time", "account", "page_url", "admin", "status"],
+                                    {
+                                        "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                        "account": acc_name,
+                                        "page_url": page_url,
+                                        "admin": target_uid_or_name,
+                                        "status": "password_confirmation_required",
+                                    },
+                                )
+                                return 0
+
+                            result_text = ""
+                            feedback = page.locator('[role="alert"], [role="status"], [role="dialog"]')
+                            if await feedback.count() > 0:
+                                try:
+                                    result_text = (await feedback.last.inner_text(timeout=1500)).casefold()
+                                except Exception:
+                                    result_text = ""
+                            confirmed = any(message in result_text for message in (
+                                "đã gửi lời mời", "invitation sent", "đang chờ", "pending"
+                            ))
+                            append_csv_result(
+                                "page_admin_jobs.csv",
+                                ["time", "account", "page_url", "admin", "status"],
+                                {
+                                    "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                    "account": acc_name,
+                                    "page_url": page_url,
+                                    "admin": target_uid_or_name,
+                                    "status": "confirmed" if confirmed else "submitted_needs_review",
+                                },
+                            )
+                            if confirmed:
+                                self.log(f"[✔] [{acc_name}] Facebook xác nhận đã mời Admin: {target_uid_or_name}")
+                                return 1
+                            self.log(
+                                f"[!] [{acc_name}] Đã gửi thao tác ghép Page nhưng chưa thấy xác nhận; "
+                                "đã lưu để kiểm tra."
+                            )
+                            return 0
             self.log(f"[-] [{acc_name}] Không tìm thấy mục quản lý quyền Page.")
         except Exception as e:
             self.log(f"[-] [{acc_name}] Lỗi phân quyền Admin Page: {e}")
@@ -2926,13 +3064,20 @@ class MainToolApp:
                 extra_http_headers={
                     "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"  # Ưu tiên tiếng Việt hàng đầu
                 },
-                ignore_https_errors=True,
+                ignore_https_errors=False,
             )
             page = await context.new_page()
 
-            # Health Check nhanh: Trình duyệt mở nhưng proxy chết/chặn thì sẽ báo lỗi ngay
-            await page.goto("about:blank", timeout=10000)
-            await page.wait_for_load_state("domcontentloaded", timeout=10000)
+            # Test a real HTTPS route so a dead/auth-failed proxy cannot pass on about:blank.
+            health_response = await page.goto(
+                "https://www.facebook.com/robots.txt",
+                wait_until="domcontentloaded",
+                timeout=15000,
+            )
+            if health_response is None:
+                raise RuntimeError("Không nhận được phản hồi HTTPS từ Facebook")
+            if health_response.status == 407 or health_response.status >= 500:
+                raise RuntimeError(f"Proxy trả về HTTP {health_response.status}")
 
         except Exception as e:
             try: await context.close()
@@ -3178,16 +3323,24 @@ class MainToolApp:
                             btn = btns.first
                             await btn.scroll_into_view_if_needed()
                             await asyncio.sleep(random.uniform(0.5, 1.5))
-                            await btn.click(timeout=5000)
-
-                            sent += 1
-                            no_new_data_count = 0  # Bấm được thì reset đếm scroll
-                            self.log(
-                                f"[✔] [{acc_name}] Đã gửi {sent}/{target_total} (Từ khóa: {keyword})"
-                            )
-
-                            # Giãn cách an toàn sau khi kết bạn thành công
-                            await asyncio.sleep(random.randint(min_del, max_del))
+                            confirmed, detail = await self.click_and_confirm_friend_request(page, btn)
+                            if confirmed:
+                                sent += 1
+                                no_new_data_count = 0
+                                self.log(
+                                    f"[✔] [{acc_name}] Đã xác nhận gửi {sent}/{target_total} (Từ khóa: {keyword})"
+                                )
+                                await asyncio.sleep(random.randint(min_del, max_del))
+                            else:
+                                self.log(f"[!] [{acc_name}] Không tính lượt kết bạn: {detail}")
+                                no_new_data_count += 1
+                                await page.evaluate("window.scrollBy(0, 350)")
+                                await asyncio.sleep(2)
+                                if no_new_data_count > 5:
+                                    self.log(
+                                        f"[-] [{acc_name}] Không thể xác nhận thêm lời mời cho '{keyword}'."
+                                    )
+                                    break
 
                         except Exception as click_err:
                             self.log(f"[!] [{acc_name}] Nút bị che hoặc lỗi: {click_err}")
@@ -3213,6 +3366,100 @@ class MainToolApp:
 
         self.log(f"[✓] [{acc_name}] Hoàn thành. Tổng lời mời đã gửi: {sent}")
         return sent
+
+    async def click_and_confirm_friend_request(self, page, button):
+        """Click once and count only a request confirmed by Facebook's UI."""
+        blocked_phrases = (
+            "không thể gửi lời mời", "can't send friend request",
+            "bạn đã gửi quá nhiều", "you've sent too many",
+            "tạm thời bị chặn", "temporarily blocked",
+        )
+        before_count = await page.locator(FRIEND_REQUEST_SENT_SELECTORS).count()
+        await button.click(timeout=5000)
+
+        for _ in range(8):
+            await asyncio.sleep(0.5)
+            try:
+                label = " ".join(filter(None, [
+                    await button.get_attribute("aria-label"),
+                    await button.inner_text(timeout=500),
+                ])).casefold()
+                if any(text in label for text in (
+                    "hủy lời mời", "hủy yêu cầu", "cancel request", "request sent"
+                )):
+                    return True, "Facebook đã đổi trạng thái nút"
+            except Exception:
+                pass
+
+            after_count = await page.locator(FRIEND_REQUEST_SENT_SELECTORS).count()
+            if after_count > before_count:
+                return True, "Facebook đã hiển thị trạng thái đã gửi"
+
+            alerts = page.locator('[role="alert"], [role="dialog"]')
+            if await alerts.count() > 0:
+                try:
+                    alert_text = (await alerts.last.inner_text(timeout=500)).casefold()
+                    if any(phrase in alert_text for phrase in blocked_phrases):
+                        return False, alert_text[:160]
+                except Exception:
+                    pass
+
+        return False, "không thấy trạng thái xác nhận sau khi bấm"
+
+    async def verify_facebook_session(self, page, context):
+        """Distinguish a real logged-in session from login/checkpoint shells."""
+        current_url = page.url.lower()
+        if any(marker in current_url for marker in (
+            "/login", "checkpoint", "challenge", "disabled", "suspended"
+        )):
+            return False, "Login / Checkpoint"
+
+        cookies = await context.cookies("https://www.facebook.com/")
+        cookie_names = {cookie.get("name") for cookie in cookies}
+        if "c_user" not in cookie_names:
+            return False, "Cookie thiếu c_user"
+
+        login_fields = page.locator(
+            'input[name="email"], input[name="pass"], form[action*="login"]'
+        )
+        if await login_fields.count() > 0:
+            for index in range(await login_fields.count()):
+                try:
+                    if await login_fields.nth(index).is_visible():
+                        return False, "Facebook đang hiển thị biểu mẫu đăng nhập"
+                except Exception:
+                    continue
+        return True, "Phiên Facebook hợp lệ"
+
+    async def get_current_page_identity(self, page):
+        candidates = [page.url]
+        for selector in ('link[rel="canonical"]', 'meta[property="og:url"]'):
+            locator = page.locator(selector).first
+            if await locator.count() > 0:
+                attribute = "href" if selector.startswith("link") else "content"
+                value = await locator.get_attribute(attribute)
+                if value:
+                    candidates.insert(0, value)
+        return extract_facebook_page_identity(candidates)
+
+    async def ensure_personal_profile(self, context, page, acc_name):
+        """Clear Facebook's Page-profile selector cookie before another Page job."""
+        cookies = await context.cookies("https://www.facebook.com/")
+        if not any(cookie.get("name") == "i_user" for cookie in cookies):
+            return True
+        try:
+            await context.clear_cookies(name="i_user")
+            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=40000)
+            await asyncio.sleep(2)
+            remaining = await context.cookies("https://www.facebook.com/")
+            is_personal = not any(cookie.get("name") == "i_user" for cookie in remaining)
+            if not is_personal:
+                self.log(f"[!] [{acc_name}] Chưa chuyển chắc chắn về hồ sơ cá nhân.")
+            return is_personal
+        except Exception as exc:
+            self.log(f"[!] [{acc_name}] Không thể chuyển về hồ sơ cá nhân: {exc}")
+            return False
+
     async def safe_action_click(self, page, selector, acc_name, action_name="Click", retries=3):
         """
         Click an toàn khi DOM thay đổi, tự động retry khi bị Stale Element.
@@ -3245,13 +3492,13 @@ class MainToolApp:
                 await asyncio.sleep(random.uniform(1.0, 1.5))
 
         return False
-    async def run_create_page(self, page, acc_name, idx, targets=None, max_pages=5, min_page_del=60, max_page_del=120):
+    async def run_create_page(self, page, context, acc_name, idx, targets=None, max_pages=5, min_page_del=60, max_page_del=120):
         """
         Tạo Fanpage: Tích hợp check Checkpoint, đa tầng Selector, xử lý Stale Element (DOM refresh), 
         kiểm tra iframe, focus trước khi gõ và chụp ảnh debug.
         """
-        category_name = "Blog cá nhân"
         created_count = 0
+        created_pages = []
 
         self.log(f"[*] [{acc_name}] Bắt đầu tiến trình tạo {max_pages} Fanpage...")
 
@@ -3259,9 +3506,9 @@ class MainToolApp:
             if not self.is_running or created_count >= max_pages:
                 break
 
-            page_name = generate_random_person_name()
-            if targets and len(targets) > p_idx and targets[p_idx].strip():
-                page_name = targets[p_idx].strip()
+            page_plan = parse_page_plan(targets[p_idx] if targets and len(targets) > p_idx else "")
+            page_name = page_plan["name"]
+            category_name = page_plan["category"]
 
             self.log(f"[*] [{acc_name}] [{created_count + 1}/{max_pages}] Đang tải trang tạo Page: '{page_name}'...")
 
@@ -3493,7 +3740,7 @@ class MainToolApp:
                         self.log(f"[!] [{acc_name}] Bị Checkpoint ngay sau khi ấn Tạo!")
                         break
 
-                    if any(x in cur_url for x in ["/pages/", "/manage/", "/page/"]):
+                    if extract_facebook_page_identity([page.url])["url"]:
                         is_created_success = True
                         break
 
@@ -3547,9 +3794,38 @@ class MainToolApp:
 
                 created_count += 1
                 now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                self.log(f"[✔] [{acc_name}] Tạo thành công Page {created_count}/{max_pages}: '{page_name}'")
-                with open(output_path("created_pages_success.txt"), "a", encoding="utf-8") as f:
-                    f.write(f"{acc_name} | {page_name} | {now_str}\n")
+                page_identity = await self.get_current_page_identity(page)
+                page_record = {
+                    "time": now_str,
+                    "account_index": idx,
+                    "account": acc_name,
+                    "page_name": page_name,
+                    "category": category_name,
+                    "page_url": page_identity["url"],
+                    "page_id": page_identity["id"],
+                    "status": "created" if page_identity["url"] else "created_needs_identity_check",
+                }
+                created_pages.append(page_record)
+                append_csv_result(
+                    "created_pages.csv",
+                    ["time", "account_index", "account", "page_name", "category", "page_url", "page_id", "status"],
+                    page_record,
+                )
+                with RESULT_FILE_LOCK:
+                    with open(output_path("created_pages_success.txt"), "a", encoding="utf-8") as f:
+                        f.write(
+                            f"{acc_name} | {page_name} | {page_identity['url'] or 'CHUA_XAC_DINH_URL'} | {now_str}\n"
+                        )
+                if page_identity["url"]:
+                    self.log(
+                        f"[✔] [{acc_name}] Tạo Page {created_count}/{max_pages}: "
+                        f"'{page_name}' | {page_identity['url']}"
+                    )
+                else:
+                    self.log(
+                        f"[!] [{acc_name}] Page '{page_name}' đã được tạo nhưng chưa đọc được URL/ID; "
+                        "đã đánh dấu cần kiểm tra."
+                    )
 
                 # ======================================================
                 # BƯỚC 7: NUÔI NICK THEO CẤU HÌNH NGƯỜI DÙNG (NHẬP 0 SẼ BỎ QUA)
@@ -3564,27 +3840,23 @@ class MainToolApp:
                     if watch_mins > 0:
                         await self.human_watch_movie_reviews(page, acc_name, duration_minutes=watch_mins)
 
-                    self.log(f"[*] [{acc_name}] Đang hoàn tác chuyển về tài khoản cá nhân...")
-                    undo_btn = page.locator('div[role="button"]:has-text("Hoàn tác"), button:has-text("Hoàn tác")').first
-                    if await undo_btn.count() > 0 and await undo_btn.is_visible():
-                        await undo_btn.click()
-                        await asyncio.sleep(4)
-                    else:
-                        acc_menu = page.locator('div[aria-label*="Tài khoản cá nhân"], div[role="button"][aria-label*="Trang cá nhân"]').first
-                        if await acc_menu.count() > 0:
-                            await acc_menu.click()
-                            await asyncio.sleep(2)
-                            switch_btn = page.locator('div[role="button"]:has-text("Chuyển sang"), div[role="link"]:has-text("Chuyển sang")').first
-                            if await switch_btn.count() > 0:
-                                await switch_btn.click()
-                                await asyncio.sleep(4)               
+                    self.log(f"[*] [{acc_name}] Đang chuyển về tài khoản cá nhân...")
+                    if not await self.ensure_personal_profile(context, page, acc_name):
+                        self.log(
+                            f"[!] [{acc_name}] Dừng tạo thêm Page để tránh thao tác nhầm bằng danh tính Page."
+                        )
+                        break
+                    page_delay = random.randint(int(min_page_del), int(max_page_del))
+                    if page_delay > 0:
+                        self.log(f"[*] [{acc_name}] Chờ {page_delay} giây trước Page tiếp theo...")
+                        await asyncio.sleep(page_delay)
 
             except Exception as e:
                 self.log(f"[-] [{acc_name}] Lỗi vòng lặp tạo Page: {e}")
                 if hasattr(self, 'take_error_snapshot'):
                     await self.take_error_snapshot(page, acc_name, "create_page_fatal")
 
-        return created_count
+        return created_pages
 
     async def run_add_by_group(self, page, acc_name, idx, targets, target_total, min_del, max_del):
         """Kết bạn theo danh sách thành viên nhóm"""
@@ -3601,10 +3873,15 @@ class MainToolApp:
                 if not self.is_running: break
                 add_btn = page.locator(ADD_FRIEND_SELECTORS).first
                 if await add_btn.count() > 0 and await add_btn.is_visible():
-                    await add_btn.click()
-                    sent += 1
-                    self.log(f"[✔] [{acc_name}] Đã gửi kết bạn nhóm {sent}/{target_total}")
-                    await asyncio.sleep(random.randint(min_del, max_del))
+                    confirmed, detail = await self.click_and_confirm_friend_request(page, add_btn)
+                    if confirmed:
+                        sent += 1
+                        self.log(f"[✔] [{acc_name}] Đã xác nhận kết bạn nhóm {sent}/{target_total}")
+                        await asyncio.sleep(random.randint(min_del, max_del))
+                    else:
+                        self.log(f"[!] [{acc_name}] Không tính lượt kết bạn nhóm: {detail}")
+                        await page.evaluate("window.scrollBy(0, 500)")
+                        await asyncio.sleep(2)
                 else:
                     await page.evaluate("window.scrollBy(0, 800)")
                     await asyncio.sleep(2)
@@ -3627,10 +3904,25 @@ class MainToolApp:
                 await asyncio.sleep(3)
                 btn = page.locator(ADD_FRIEND_SELECTORS).first
                 if await btn.count() > 0 and await btn.is_visible():
-                    await btn.click()
-                    sent += 1
-                    self.log(f"[✔] [{acc_name}] Kết bạn thành công: {target}")
-                    await asyncio.sleep(random.randint(min_del, max_del))
+                    confirmed, detail = await self.click_and_confirm_friend_request(page, btn)
+                    append_csv_result(
+                        "friend_actions.csv",
+                        ["time", "account", "target", "method", "status", "detail"],
+                        {
+                            "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            "account": acc_name,
+                            "target": target,
+                            "method": "uid",
+                            "status": "sent" if confirmed else "not_confirmed",
+                            "detail": detail,
+                        },
+                    )
+                    if confirmed:
+                        sent += 1
+                        self.log(f"[✔] [{acc_name}] Facebook xác nhận đã gửi: {target}")
+                        await asyncio.sleep(random.randint(min_del, max_del))
+                    else:
+                        self.log(f"[!] [{acc_name}] Không tính {target}: {detail}")
         except Exception as e:
             self.log(f"[-] [{acc_name}] Lỗi kết bạn UID: {e}")
         return sent
@@ -3878,6 +4170,11 @@ class MainToolApp:
             proxy_cfg = parse_proxy(assigned_proxy_str)
             is_headless = config.get("headless", False)
 
+            if assigned_proxy_str and not proxy_cfg:
+                self.log(f"[-] [{acc_name}] Proxy sai định dạng, dừng để tránh chạy nhầm IP thật.")
+                self.update_tree_row(str(idx), status="Proxy sai định dạng")
+                return
+
             target_total = config.get("target", 25)
             min_del = config.get("min_delay", 25)
             max_del = config.get("max_delay", 35)
@@ -3896,8 +4193,16 @@ class MainToolApp:
                 if fresh_proxy:
                     assigned_proxy_str = fresh_proxy
                     proxy_cfg = parse_proxy(assigned_proxy_str)
+                    if not proxy_cfg:
+                        self.log(f"[-] [{acc_name}] API trả về proxy sai định dạng.")
+                        self.update_tree_row(str(idx), status="Proxy API không hợp lệ")
+                        return
                     self.log(f"[✔] [{acc_name}] Đã cấp IP SuiProxy mới: {assigned_proxy_str}")
                     await asyncio.sleep(2)
+                else:
+                    self.log(f"[-] [{acc_name}] API proxy không trả về IP; dừng để tránh dùng IP thật.")
+                    self.update_tree_row(str(idx), status="Không lấy được proxy")
+                    return
             
             browser = None
             context = None
@@ -3923,13 +4228,12 @@ class MainToolApp:
                     await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=40000)
                     await asyncio.sleep(4)
                     
-                    final_url = page.url.lower()
-                    if "login" in final_url or "checkpoint" in final_url:
-                        self.log(f"[-] [{acc_name}] Cookie Die hoặc dính Checkpoint!")
-                        self.update_tree_row(str(idx), status="Die / Checkpoint")
-                        return  # Bị lỗi thì THOÁT NGAY LẬP TỨC
-                    else:
-                        is_valid_session = True
+                    is_valid_session, session_detail = await self.verify_facebook_session(page, context)
+                    if not is_valid_session:
+                        self.log(f"[-] [{acc_name}] Phiên Cookie không hợp lệ: {session_detail}")
+                        self.update_tree_row(str(idx), status=session_detail)
+                        return
+                    self.log(f"[✔] [{acc_name}] {session_detail}")
 
                 # Đăng nhập Facebook bằng UID/email và mật khẩu
                 elif account_type == "RAW" and login_user and login_password:
@@ -3957,6 +4261,7 @@ class MainToolApp:
                 self.update_tree_row(str(idx), current_friends=cur_friends)
 
                 total_sent = 0
+                created_pages = []
                 # 1. Kết bạn theo tên
                 if modes.get("by_name", False):
                     total_sent += (await self.run_add_by_name(page, acc_name, idx, targets_by_mode["by_name"], target_total, min_del, max_del)) or 0
@@ -4007,12 +4312,13 @@ class MainToolApp:
                     p_min_del = config.get("min_page_delay", 60)
                     p_max_del = config.get("max_page_delay", 120)
                     
-                    total_sent += (await self.run_create_page(
-                        page, acc_name, idx, targets_by_mode["create_page"], 
+                    created_pages = await self.run_create_page(
+                        page, context, acc_name, idx, targets_by_mode["create_page"],
                         max_pages=page_target_num, 
                         min_page_del=p_min_del, 
                         max_page_del=p_max_del
-                    )) or 0
+                    )
+                    total_sent += len(created_pages)
                 # 13. Đăng bài lên Fanpage
                 if modes.get("post_page", False):
                     await self.run_post_page(page, acc_name, idx, targets_by_mode["post_page"])
@@ -4024,8 +4330,13 @@ class MainToolApp:
                 # 15. Đổi mật khẩu
                 if modes.get("change_pass", False):
                     password_targets = targets_by_mode["change_pass"]
-                    new_pwd = password_targets[0].strip() if password_targets else "DangPhat@2026Secure!"
-                    await self.run_change_password(page, acc_name, idx, "OldPassMacDinh", new_pwd)
+                    new_pwd = password_targets[0].strip() if password_targets else ""
+                    if not login_password or not new_pwd:
+                        self.log(
+                            f"[-] [{acc_name}] Bỏ qua đổi mật khẩu vì thiếu mật khẩu hiện tại hoặc mật khẩu mới."
+                        )
+                    else:
+                        await self.run_change_password(page, acc_name, idx, login_password, new_pwd)
 
                 # 16. Bật 2FA
                 if modes.get("enable_2fa", False):
@@ -4038,21 +4349,45 @@ class MainToolApp:
                 # 18. Thêm Admin Fanpage
                 if modes.get("add_page_admin", False):
                     admin_targets = targets_by_mode["add_page_admin"]
-                    target_page = admin_targets[0] if len(admin_targets) > 0 else "https://www.facebook.com/me"
-                    target_admin = admin_targets[1] if len(admin_targets) > 1 else "UID_HOAC_TEN"
-                    await self.run_add_page_admin(page, acc_name, idx, target_page, target_admin)
+                    admin_job = select_page_admin_job(admin_targets, idx, acc_name)
+                    if not admin_job:
+                        self.log(
+                            f"[-] [{acc_name}] Thiếu cấu hình ghép Page. Dùng: "
+                            "STT tài khoản|URL Page hoặc AUTO|UID admin"
+                        )
+                    else:
+                        target_page = admin_job["page"]
+                        if target_page.casefold() == "auto":
+                            target_page = next(
+                                (record["page_url"] for record in reversed(created_pages) if record["page_url"]),
+                                "",
+                            )
+                        if not target_page:
+                            self.log(
+                                f"[-] [{acc_name}] Không có URL Page để ghép; xem created_pages.csv."
+                            )
+                        else:
+                            await self.run_add_page_admin(
+                                page, acc_name, idx, target_page, admin_job["admin"]
+                            )
 
                 # 19. Đổi tên Fanpage
                 if modes.get("update_page_name", False):
                     page_name_targets = targets_by_mode["update_page_name"]
-                    target_page = page_name_targets[0] if len(page_name_targets) > 0 else "https://www.facebook.com/me"
-                    new_name = page_name_targets[1] if len(page_name_targets) > 1 else "Fanpage Mới 2026"
-                    await self.run_update_page_info(page, acc_name, idx, target_page, new_name)
+                    if len(page_name_targets) < 2:
+                        self.log(f"[-] [{acc_name}] Thiếu URL Page hoặc tên mới; không thực hiện đổi tên.")
+                    else:
+                        await self.run_update_page_info(
+                            page, acc_name, idx, page_name_targets[0], page_name_targets[1]
+                        )
 
                 # 20. Mời like Page
                 if modes.get("invite_like_page", False):
-                    target_page = targets_by_mode["invite_like_page"][0] if targets_by_mode["invite_like_page"] else "https://www.facebook.com/me"
-                    await self.run_invite_friends_like_page(page, acc_name, idx, target_page)
+                    like_targets = targets_by_mode["invite_like_page"]
+                    if not like_targets:
+                        self.log(f"[-] [{acc_name}] Thiếu URL Page; không thực hiện mời like.")
+                    else:
+                        await self.run_invite_friends_like_page(page, acc_name, idx, like_targets[0])
 
                 # 21. Nhắn tin người comment
                 if modes.get("inbox_commenters", False):
@@ -4086,7 +4421,7 @@ class MainToolApp:
                     await self.run_scrape_contact_info(page, acc_name, idx, targets_by_mode["scrape_contacts"])
 
                 self.update_tree_row(str(idx), sent_today=total_sent, status="Hoàn thành")
-                self.log(f"[✔ XONG] Nick {acc_name} đã hoàn thành ({total_sent} lời mời).")
+                self.log(f"[✔ XONG] Nick {acc_name} đã hoàn thành ({total_sent} kết quả đã xác nhận).")
 
             except asyncio.CancelledError:
                 self.update_tree_row(str(idx), status="Đã dừng")
@@ -4210,14 +4545,23 @@ class MainToolApp:
                 )))
 
             self.worker_tasks = tasks
-            await asyncio.gather(*tasks, return_exceptions=True)
+            task_results = await asyncio.gather(*tasks, return_exceptions=True)
+            unexpected_errors = [
+                result for result in task_results
+                if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError)
+            ]
+            for error in unexpected_errors:
+                self.log(f"[-] Lỗi luồng chưa được xử lý: {type(error).__name__}: {error}")
             self.worker_tasks = []
 
         if self.stop_requested:
             self.log("\n[!] Tiến trình đã dừng; các luồng đang chạy đã được đóng an toàn.")
             return
 
-        self.log("\n[🎉] TOÀN BỘ CÁC LUỒNG ĐÃ HOÀN TẤT.")
+        if unexpected_errors:
+            self.log(f"\n[!] ĐÃ CHẠY XONG NHƯNG CÓ {len(unexpected_errors)} LUỒNG LỖI.")
+        else:
+            self.log("\n[🎉] TOÀN BỘ CÁC LUỒNG ĐÃ HOÀN TẤT.")
         t_token = config.get("tele_token", "")
         t_id = config.get("tele_chatid", "")
         if t_token and t_id:

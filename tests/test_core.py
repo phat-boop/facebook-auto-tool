@@ -46,6 +46,41 @@ class CoreHelpersTest(unittest.TestCase):
         for label in ("Tạo Trang", "Create Page", "Créer une Page", "Crear página", "Criar Página"):
             self.assertIsNotNone(client_app.CREATE_PAGE_BUTTON_PATTERN.fullmatch(label))
 
+    def test_page_plan_supports_name_and_category(self):
+        self.assertEqual(
+            client_app.parse_page_plan("Cửa hàng A|Dịch vụ địa phương"),
+            {"name": "Cửa hàng A", "category": "Dịch vụ địa phương"},
+        )
+        self.assertEqual(client_app.parse_page_plan("Cửa hàng B")["category"], "Blog cá nhân")
+
+    def test_page_admin_job_is_scoped_to_account(self):
+        targets = [
+            "1|https://www.facebook.com/page-one|10001",
+            "2|AUTO|10002",
+        ]
+        self.assertEqual(
+            client_app.select_page_admin_job(targets, 2, "FB_2"),
+            {"page": "AUTO", "admin": "10002"},
+        )
+        self.assertIsNone(client_app.select_page_admin_job(targets, 3, "FB_3"))
+
+    def test_page_identity_rejects_creation_screen(self):
+        self.assertEqual(
+            client_app.extract_facebook_page_identity(
+                ["https://www.facebook.com/pages/creation/"]
+            ),
+            {"url": "", "id": ""},
+        )
+        self.assertEqual(
+            client_app.extract_facebook_page_identity(
+                ["https://www.facebook.com/profile.php?id=123456789"]
+            ),
+            {
+                "url": "https://www.facebook.com/profile.php?id=123456789",
+                "id": "123456789",
+            },
+        )
+
     def test_async_methods_do_not_read_tk_widgets(self):
         source_path = pathlib.Path(client_app.__file__)
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
