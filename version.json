@@ -1,7 +1,7 @@
 {
-    "version": "2.1.3",
-    "download_url": "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.1.3/client_app.exe",
+    "version": "2.1.4",
+    "download_url": "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.1.4/client_app.exe",
     "sha256": "2C18106D4FD7DAD2F0E1099DFBE4B1E83A3641E5829FD0C8575F23A1A3053F23",
-    "changelog": "Facebook Workspace Pro v2.1.3\n\n- Giao diện tập trung vào Facebook, Page, kết bạn và proxy\n- Logo mới được nhúng vào cửa sổ và file EXE\n- Hỗ trợ hàng đợi 50-100 tài khoản, tối đa 20 trình duyệt đồng thời\n- Thêm ghép proxy luân phiên, theo nhóm, ngẫu nhiên và API xoay\n- Sửa lỗi Tkinter đa luồng, dừng tác vụ và đóng trình duyệt\n- Hỗ trợ nút tạo Page đa ngôn ngữ\n- Bỏ TikTok và Instagram khỏi luồng công việc\n- Không còn yêu cầu quyền Administrator khi khởi động",
+    "changelog": "Sửa lỗi tạo Page, lưu thông tin Page, ghép Page đúng tài khoản, xác nhận kết bạn, kiểm tra Proxy và cải thiện thời gian chờ tạo Page.Sửa lỗi tạo Page, lưu thông tin Page, ghép Page đúng tài khoản, xác nhận kết bạn, kiểm tra Proxy và cải thiện thời gian chờ tạo Page.",
     "mandatory": false
 }
