@@ -1,0 +1,12 @@
+name = "facebook-tool-license"
+main = "src/index.js"
+compatibility_date = "2026-09-04"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "facebook-tool-license"
+database_id = "95d11f80-c6a0-41ba-aacc-54be5dbc946f"
+
+[vars]
+# Set these with `wrangler secret put`, do not commit real values.
+ADMIN_CHAT_ID = "7369788958"
