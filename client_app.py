@@ -36,7 +36,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.1.4"
+CURRENT_VERSION = "2.1.5"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -249,48 +249,66 @@ def check_for_updates(self):
                         # Tạo cửa sổ Toplevel đồng bộ màu với app
                         dlg = tk.Toplevel(self.root)
                         dlg.title("Thông báo cập nhật phần mềm")
-                        dlg.geometry("480x420")
+                        dlg.geometry("520x460")
+                        dlg.minsize(460, 380)
                         dlg.resizable(True, True)
                         dlg.configure(bg="#131C2E")
                         dlg.transient(self.root)
                         dlg.grab_set()
 
-                        # Chặn nút X nếu là bắt buộc cập nhật
                         if is_mandatory:
                             dlg.protocol("WM_DELETE_WINDOW", lambda: None)
 
                         # Tiêu đề
                         tk.Label(dlg, text="🚀 THÔNG BÁO CẬP NHẬT PHẦN MỀM", font=("Segoe UI", 11, "bold"), fg="#38BDF8", bg="#131C2E").pack(pady=(15, 5))
-                        
+
                         info_text = f"Đã có phiên bản mới: v{latest_version} (Bản hiện tại: v{CURRENT_VERSION})\nBản cập nhật này giúp nâng cao hiệu suất và tính bảo mật."
                         tk.Label(dlg, text=info_text, font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E", justify="center").pack(pady=5)
 
-                        # Khung hiển thị Changelog
-                        f_log = tk.Frame(dlg, bg="#070B14", highlightbackground="#1E293B", highlightthickness=1)
-                        f_log.pack(fill="both", expand=True, padx=20, pady=10)
+                        # Footer được giữ cố định ở đáy để changelog không thể che các nút.
+                        f_footer = tk.Frame(dlg, bg="#131C2E")
+                        f_footer.pack(side="bottom", fill="x", padx=20, pady=(5, 15))
+
+                        # Thanh Progressbar tải xuống (Ẩn lúc đầu)
+                        progress_var = tk.DoubleVar(value=0)
+                        p_bar = ttk.Progressbar(f_footer, orient="horizontal", mode="determinate", variable=progress_var)
                         
-                        txt_changelog = scrolledtext.ScrolledText(f_log, bg="#070B14", fg="#00FF66", font=("Consolas", 8), relief="flat")
+                        lbl_progress = tk.Label(f_footer, text="", font=("Segoe UI", 8), fg="#94A3B8", bg="#131C2E")
+
+                        # Nút bấm hành động
+                        f_btn = tk.Frame(f_footer, bg="#131C2E")
+                        f_btn.pack(side="bottom", fill="x")
+                        action_columns = 2 if is_mandatory else 3
+                        for column in range(action_columns):
+                            f_btn.columnconfigure(column, weight=1, uniform="update_actions")
+
+                        # Khung changelog chỉ sử dụng phần không gian còn lại phía trên footer.
+                        f_log = tk.Frame(dlg, bg="#070B14", highlightbackground="#1E293B", highlightthickness=1)
+                        f_log.pack(side="top", fill="both", expand=True, padx=20, pady=10)
+
+                        txt_changelog = scrolledtext.ScrolledText(
+                            f_log,
+                            height=10,
+                            bg="#070B14",
+                            fg="#00FF66",
+                            font=("Consolas", 8),
+                            relief="flat",
+                            wrap="word",
+                        )
                         txt_changelog.pack(fill="both", expand=True, padx=5, pady=5)
                         txt_changelog.insert("1.0", f"Nội dung thay đổi:\n{changelog}")
                         txt_changelog.config(state="disabled")
 
-                        # Thanh Progressbar tải xuống (Ẩn lúc đầu)
-                        progress_var = tk.DoubleVar(value=0)
-                        p_bar = ttk.Progressbar(dlg, orient="horizontal", length=440, mode="determinate", variable=progress_var)
-                        
-                        lbl_progress = tk.Label(dlg, text="", font=("Segoe UI", 8), fg="#94A3B8", bg="#131C2E")
-
-                        # Nút bấm hành động
-                        f_btn = tk.Frame(dlg, bg="#131C2E")
-                        f_btn.pack(fill="x", padx=20, pady=(0, 15))
+                        btn_cancel = None
 
                         def start_download():
                             btn_update.config(state="disabled")
-                            if not is_mandatory:
+                            btn_download.config(state="disabled")
+                            if btn_cancel is not None:
                                 btn_cancel.config(state="disabled")
                             
-                            p_bar.pack(pady=(0, 5))
-                            lbl_progress.pack(pady=(0, 5))
+                            p_bar.pack(side="top", fill="x", pady=(0, 5))
+                            lbl_progress.pack(side="top", pady=(0, 5))
                             lbl_progress.config(text="Đang kết nối tải xuống tệp cập nhật...")
 
                             def download_worker():
@@ -353,13 +371,16 @@ del "%~f0"
 
                             threading.Thread(target=download_worker, daemon=True).start()
 
-                        btn_update = tk.Button(f_btn, text="ĐỒNG Ý CẬP NHẬT", font=("Segoe UI", 9, "bold"), bg="#10B981", fg="#FFFFFF", relief="flat", padx=15, pady=6, cursor="hand2", command=start_download)
-                        btn_update.pack(side="right", padx=5)
-                        btn_download = tk.Button(f_btn, text="TẢI THỦ CÔNG", font=("Segoe UI", 9), bg="#2563EB", fg="#FFFFFF", relief="flat", padx=15, pady=6, cursor="hand2", command=lambda: webbrowser.open(download_url))
-                        btn_download.pack(side="right", padx=5)
+                        next_column = 0
                         if not is_mandatory:
-                            btn_cancel = tk.Button(f_btn, text="ĐỂ SAU", font=("Segoe UI", 9), bg="#1E293B", fg="#94A3B8", relief="flat", padx=15, pady=6, cursor="hand2", command=dlg.destroy)
-                            btn_cancel.pack(side="right", padx=5)
+                            btn_cancel = tk.Button(f_btn, text="ĐỂ SAU", font=("Segoe UI", 9), bg="#1E293B", fg="#E2E8F0", relief="flat", padx=15, pady=8, cursor="hand2", command=dlg.destroy)
+                            btn_cancel.grid(row=0, column=next_column, sticky="ew", padx=(0, 5))
+                            next_column += 1
+                        btn_download = tk.Button(f_btn, text="TẢI THỦ CÔNG", font=("Segoe UI", 9), bg="#2563EB", fg="#FFFFFF", relief="flat", padx=15, pady=8, cursor="hand2", command=lambda: webbrowser.open(download_url))
+                        btn_download.grid(row=0, column=next_column, sticky="ew", padx=5)
+                        next_column += 1
+                        btn_update = tk.Button(f_btn, text="CẬP NHẬT NGAY", font=("Segoe UI", 9, "bold"), bg="#10B981", fg="#FFFFFF", relief="flat", padx=15, pady=8, cursor="hand2", command=start_download)
+                        btn_update.grid(row=0, column=next_column, sticky="ew", padx=(5, 0))
 
                     self.post_ui(show_update_dialog)
     except Exception:
