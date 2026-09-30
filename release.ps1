@@ -22,6 +22,30 @@ function Get-RequiredCommand {
     return $command.Source
 }
 
+function Invoke-NativeCapture {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string[]]$ArgumentList
+    )
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell 5.1 wraps native stderr as ErrorRecord objects.
+        # Keep collecting that output and decide success only from the exit code.
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $FilePath @ArgumentList 2>&1)
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = $output
+    }
+}
+
 function Invoke-NativeChecked {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -30,15 +54,14 @@ function Invoke-NativeChecked {
     )
 
     Write-Host "`n==> $Label" -ForegroundColor Cyan
-    $output = & $FilePath @ArgumentList 2>&1
-    $exitCode = $LASTEXITCODE
-    foreach ($line in $output) {
+    $result = Invoke-NativeCapture $FilePath $ArgumentList
+    foreach ($line in $result.Output) {
         Write-Host $line
     }
-    if ($exitCode -ne 0) {
-        throw "$Label thất bại (exit code $exitCode)."
+    if ($result.ExitCode -ne 0) {
+        throw "$Label thất bại (exit code $($result.ExitCode))."
     }
-    return @($output | ForEach-Object { "$_" })
+    return @($result.Output | ForEach-Object { "$_" })
 }
 
 function Write-Utf8NoBom {
@@ -91,23 +114,25 @@ try {
 
     Invoke-NativeChecked $gh @('auth', 'status') 'Kiểm tra đăng nhập GitHub CLI' | Out-Null
 
-    $branch = (& $git branch --show-current 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $branch -ne 'main') {
+    $branchResult = Invoke-NativeCapture $git @('branch', '--show-current')
+    $branch = ($branchResult.Output -join [Environment]::NewLine).Trim()
+    if ($branchResult.ExitCode -ne 0 -or $branch -ne 'main') {
         throw "Release chỉ được chạy trên nhánh main. Nhánh hiện tại: '$branch'."
     }
 
     Invoke-NativeChecked $git @('fetch', 'origin', 'main', '--tags') 'Đồng bộ thông tin origin/main và tag' | Out-Null
 
-    $aheadBehind = (& $git rev-list --left-right --count 'origin/main...HEAD' 2>&1 | Out-String).Trim() -split '\s+'
-    if ($LASTEXITCODE -ne 0 -or $aheadBehind.Count -lt 2) {
+    $aheadBehindResult = Invoke-NativeCapture $git @('rev-list', '--left-right', '--count', 'origin/main...HEAD')
+    $aheadBehind = (($aheadBehindResult.Output -join [Environment]::NewLine).Trim()) -split '\s+'
+    if ($aheadBehindResult.ExitCode -ne 0 -or $aheadBehind.Count -lt 2) {
         throw 'Không thể so sánh nhánh main với origin/main.'
     }
     if ([int]$aheadBehind[0] -gt 0) {
         throw 'Nhánh main trên máy đang chậm hơn origin/main. Hãy pull/rebase trước khi release.'
     }
 
-    & $git show-ref --verify --quiet "refs/tags/$tagName"
-    $localTagExit = $LASTEXITCODE
+    $localTagResult = Invoke-NativeCapture $git @('show-ref', '--verify', '--quiet', "refs/tags/$tagName")
+    $localTagExit = $localTagResult.ExitCode
     if ($localTagExit -eq 0) {
         throw "Tag $tagName đã tồn tại trên máy."
     }
@@ -115,16 +140,18 @@ try {
         throw "Không thể kiểm tra tag $tagName trên máy."
     }
 
-    $remoteTag = (& $git ls-remote --tags origin "refs/tags/$tagName" 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0) {
+    $remoteTagResult = Invoke-NativeCapture $git @('ls-remote', '--tags', 'origin', "refs/tags/$tagName")
+    $remoteTag = ($remoteTagResult.Output -join [Environment]::NewLine).Trim()
+    if ($remoteTagResult.ExitCode -ne 0) {
         throw "Không thể kiểm tra tag $tagName trên origin."
     }
     if ($remoteTag) {
         throw "Tag $tagName đã tồn tại trên origin."
     }
 
-    $repository = (& $gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $repository) {
+    $repositoryResult = Invoke-NativeCapture $gh @('repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner')
+    $repository = ($repositoryResult.Output -join [Environment]::NewLine).Trim()
+    if ($repositoryResult.ExitCode -ne 0 -or -not $repository) {
         throw 'Không xác định được GitHub repository hiện tại.'
     }
 
@@ -171,11 +198,11 @@ try {
 
     Invoke-NativeChecked $git @('add', '-A', '--', '.') 'Đưa source vào staging' | Out-Null
     Invoke-NativeChecked $git @('reset', '--', 'version.json') 'Để version.json cho commit cuối' | Out-Null
-    & $git diff --cached --quiet
-    if ($LASTEXITCODE -eq 0) {
+    $stagedDiffResult = Invoke-NativeCapture $git @('diff', '--cached', '--quiet')
+    if ($stagedDiffResult.ExitCode -eq 0) {
         throw 'Không có thay đổi source để commit cho release này.'
     }
-    if ($LASTEXITCODE -ne 1) {
+    if ($stagedDiffResult.ExitCode -ne 1) {
         throw 'Không thể kiểm tra thay đổi source trong staging.'
     }
 
@@ -230,8 +257,9 @@ try {
     Write-Utf8NoBom $versionJsonPath ($metadataJson + [Environment]::NewLine)
 
     Invoke-NativeChecked $git @('add', '--', 'version.json') 'Đưa version.json vào staging' | Out-Null
-    $stagedFiles = @(& $git diff --cached --name-only 2>&1 | ForEach-Object { "$_" })
-    if ($LASTEXITCODE -ne 0 -or $stagedFiles.Count -ne 1 -or $stagedFiles[0] -ne 'version.json') {
+    $stagedFilesResult = Invoke-NativeCapture $git @('diff', '--cached', '--name-only')
+    $stagedFiles = @($stagedFilesResult.Output | ForEach-Object { "$_" })
+    if ($stagedFilesResult.ExitCode -ne 0 -or $stagedFiles.Count -ne 1 -or $stagedFiles[0] -ne 'version.json') {
         throw 'Commit metadata cuối phải chỉ chứa version.json.'
     }
     Invoke-NativeChecked $git @('commit', '-m', "chore: publish metadata for $tagName") 'Commit version.json' | Out-Null
