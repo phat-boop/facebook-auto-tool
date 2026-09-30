@@ -232,10 +232,12 @@ class CoreHelpersTest(unittest.TestCase):
             {
                 "stt": 1, "account_id": "account-A", "locale": "vi-VN",
                 "country": "VN", "proxy": "10.0.0.1:8001",
+                "raw_line": "1. account-A|pass-A", "source_line": "account-A|pass-A",
             },
             {
                 "stt": 2, "account_id": "account-B", "locale": "th-TH",
                 "country": "TH", "proxy": "10.0.0.2:8002",
+                "raw_line": "2. account-B|pass-B", "source_line": "account-B|pass-B",
             },
         ])
         states.append_log(1, "log chỉ thuộc A")
@@ -249,6 +251,66 @@ class CoreHelpersTest(unittest.TestCase):
         self.assertEqual(states.get(2)["locale"], "th-TH")
         self.assertEqual(states.get(1)["proxy"], "10.0.0.1:8001")
         self.assertEqual(states.get(2)["proxy"], "10.0.0.2:8002")
+        self.assertEqual(states.get(1)["source_line"], "account-A|pass-A")
+        self.assertEqual(states.get(1)["name"], "account-A")
+        self.assertEqual(
+            client_app.account_display_name({"account_id": "legacy-account"}, 9),
+            "legacy-account",
+        )
+        self.assertEqual(client_app.account_display_name({}, 9), "Nick_9")
+
+        self.assertEqual(
+            client_app.keep_unprocessed_account_lines(
+                ["1. account-A|pass-A", "2. account-B|pass-B", "3. account-C|pass-C"],
+                {"account-A|pass-A", "account-B|pass-B"},
+            ),
+            ["3. account-C|pass-C"],
+        )
+        self.assertTrue(client_app.is_invalid_facebook_account_url(
+            "https://www.facebook.com/disabled/"
+        ))
+        self.assertTrue(client_app.is_invalid_facebook_account_url(
+            "https://www.facebook.com/checkpoint/"
+        ))
+        self.assertFalse(client_app.is_invalid_facebook_account_url(
+            "https://www.facebook.com/pages/creation/"
+        ))
+
+        result_app = client_app.MainToolApp.__new__(client_app.MainToolApp)
+        result_app.account_states = states
+        result_app.create_page_result_lock = threading.RLock()
+        result_app.create_page_account_results = {"completed": {}, "die": {}}
+        result_app.post_ui = lambda _callback: None
+        result_app.record_create_page_account_result(
+            1, "completed", created_count=3, target_count=3
+        )
+        result_app.record_create_page_account_result(
+            2, "die", reason="Cookie hết hạn", created_count=1, target_count=3
+        )
+        completed = result_app.get_create_page_account_results("completed")
+        died = result_app.get_create_page_account_results("die")
+        self.assertEqual(completed[0]["account_id"], "account-A")
+        self.assertEqual(completed[0]["created_count"], 3)
+        self.assertEqual(died[0]["account_id"], "account-B")
+        self.assertEqual(died[0]["reason"], "Cookie hết hạn")
+        self.assertEqual(
+            result_app.get_processed_create_page_sources(),
+            {"account-A|pass-A", "account-B|pass-B"},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_path = pathlib.Path(temp_dir) / "create_page_results.xlsx"
+            client_app.write_create_page_results_xlsx(
+                report_path,
+                {"completed": completed, "die": died},
+            )
+            from openpyxl import load_workbook
+            workbook = load_workbook(report_path, read_only=True)
+            self.assertEqual(workbook.sheetnames, ["LIVE", "DIE"])
+            self.assertEqual(workbook["LIVE"]["B2"].value, "account-A")
+            self.assertEqual(workbook["LIVE"]["C2"].value, "LIVE")
+            self.assertEqual(workbook["DIE"]["B2"].value, "account-B")
+            self.assertEqual(workbook["DIE"]["C2"].value, "DIE")
+            workbook.close()
 
         async def update_scoped_account(index, status, message):
             await asyncio.sleep(0)
@@ -440,6 +502,47 @@ class CoreHelpersTest(unittest.TestCase):
             {"name": "Cửa hàng A", "category": "Dịch vụ địa phương"},
         )
         self.assertEqual(client_app.parse_page_plan("Cửa hàng B")["category"], "Blog cá nhân")
+        valid, reason = client_app.validate_create_page_targets(["Cửa hàng A|Spa"], 15)
+        self.assertTrue(valid, reason)
+        with mock.patch.object(
+            client_app,
+            "generate_random_person_name",
+            side_effect=["Page tự động 1", "Page tự động 2"],
+        ):
+            generated_plans = client_app.build_create_page_plans([], 2)
+        self.assertEqual(
+            generated_plans,
+            ["Page tự động 1|Blog cá nhân", "Page tự động 2|Blog cá nhân"],
+        )
+        with mock.patch.object(
+            client_app,
+            "generate_random_person_name",
+            return_value="Page tự động",
+        ):
+            filled_plans = client_app.build_create_page_plans(["Cửa hàng A|Spa"], 3)
+        self.assertEqual(filled_plans[0], "Cửa hàng A|Spa")
+        self.assertEqual(len(filled_plans), 3)
+        mixed_targets = [
+            "by_uid:10001",
+            "Cửa hàng A|Spa",
+            "friend_request:https://www.facebook.com/profile.php?id=10002",
+        ]
+        self.assertEqual(
+            client_app.filter_targets_for_mode(
+                mixed_targets,
+                "create_page",
+                {"by_uid": True, "friend_request": True, "create_page": True},
+            ),
+            ["Cửa hàng A|Spa"],
+        )
+        self.assertEqual(
+            client_app.filter_targets_for_mode(
+                [" CREATE_PAGE : Cửa hàng B|Nhà hàng", "Cửa hàng cũ|Blog"],
+                "create_page",
+                {"create_page": True},
+            ),
+            ["Cửa hàng B|Nhà hàng"],
+        )
 
     def test_page_admin_job_is_scoped_to_account(self):
         targets = [
@@ -617,8 +720,27 @@ class CoreHelpersTest(unittest.TestCase):
         ):
             app = client_app.MainToolApp.__new__(client_app.MainToolApp)
             app.is_running = True
-            app.run_config = {"feed_surf_min": 0, "watch_review_min": 0}
+            app.run_config = {
+                "feed_surf_min": 0,
+                "watch_review_min": 0,
+                "modes": {"create_page": True},
+            }
             app.log = mock.Mock()
+            app.account_states = client_app.AccountStateStore()
+            app.account_states.sync([
+                {
+                    "stt": 1,
+                    "account_id": "FB_1",
+                    "raw_line": "FB_1|password",
+                    "source_line": "FB_1|password",
+                }
+            ])
+            app.create_page_result_lock = threading.RLock()
+            app.create_page_account_results = {"completed": {}, "die": {}}
+            app.post_ui = lambda _callback: None
+            app.refresh_account_state_row = lambda _index: None
+            app.render_log_view = lambda: None
+            app.selected_log_account = None
 
             async def take_error_snapshot(*_args, **_kwargs):
                 return None
@@ -653,10 +775,11 @@ class CoreHelpersTest(unittest.TestCase):
                 records,
                 save_result.call_count,
                 fake_page.typed_categories,
+                app.account_states.get(1)["status"],
             )
 
         cases = (
-            ("manage text only", None, "manage page / quản lý trang", None, "FAILED", 0),
+            ("manage text only", None, "manage page / quản lý trang", None, "FAILED", 0, "UNKNOWN"),
             (
                 "verified URL",
                 "https://www.facebook.com/profile.php?id=123456789",
@@ -664,17 +787,31 @@ class CoreHelpersTest(unittest.TestCase):
                 None,
                 "SUCCESS",
                 1,
+                "UNKNOWN",
             ),
-            ("create exception", None, "", RuntimeError("click failed"), "ERROR", 0),
+            ("create exception", None, "", RuntimeError("click failed"), "ERROR", 0, "UNKNOWN"),
+            (
+                "account disabled during create",
+                "https://www.facebook.com/disabled/",
+                "",
+                None,
+                "FAILED",
+                0,
+                "DIE",
+            ),
         )
-        for case_name, result_url, body_text, click_error, expected_status, expected_saves in cases:
+        for (
+            case_name, result_url, body_text, click_error,
+            expected_status, expected_saves, expected_account_status,
+        ) in cases:
             with self.subTest(case=case_name):
-                records, save_calls, _categories = asyncio.run(
+                records, save_calls, _categories, account_status = asyncio.run(
                     run_create_case(result_url, body_text, click_error)
                 )
                 self.assertEqual(len(records), 1)
                 self.assertEqual(records[0]["status"], expected_status)
                 self.assertEqual(save_calls, expected_saves)
+                self.assertEqual(account_status, expected_account_status)
 
         category_cases = (
             ("restaurant", "Trang A|Nhà hàng", "Nhà hàng", "123456789"),
@@ -683,7 +820,7 @@ class CoreHelpersTest(unittest.TestCase):
         )
         for case_name, target, expected_category, page_id in category_cases:
             with self.subTest(category=case_name):
-                records, _save_calls, categories = asyncio.run(
+                records, _save_calls, categories, _account_status = asyncio.run(
                     run_create_case(
                         f"https://www.facebook.com/profile.php?id={page_id}",
                         targets=[target],
@@ -694,7 +831,7 @@ class CoreHelpersTest(unittest.TestCase):
                 if expected_category != "Blog":
                     self.assertNotEqual(categories, ["Blog"])
 
-        records, _save_calls, categories = asyncio.run(
+        records, _save_calls, categories, _account_status = asyncio.run(
             run_create_case(
                 [
                     "https://www.facebook.com/profile.php?id=423456789",
@@ -708,6 +845,10 @@ class CoreHelpersTest(unittest.TestCase):
 
         self.assertEqual(
             client_app.validate_create_page_targets(["Trang A|Spa"], 1),
+            (True, ""),
+        )
+        self.assertEqual(
+            client_app.validate_create_page_targets(["Trang A|Spa"], 5),
             (True, ""),
         )
         self.assertFalse(client_app.validate_create_page_targets(["|Spa"], 1)[0])

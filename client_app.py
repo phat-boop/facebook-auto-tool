@@ -37,7 +37,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.1.6"
+CURRENT_VERSION = "2.1.9"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -157,6 +157,103 @@ def account_status_for_failure(failure_kind):
     return "DIE" if failure_kind in {"invalid_cookie", "invalid_login"} else "ERROR"
 
 
+def normalize_account_source_line(raw_line):
+    """Normalize only the UI number prefix so account data remains byte-for-byte intact."""
+    return re.sub(r'^\s*\d+[\.\-]\s*', '', str(raw_line or "").rstrip("\r\n")).strip()
+
+
+def account_display_name(account, index):
+    """Return a stable label for parsed input and older account-state snapshots."""
+    account = account or {}
+    return str(
+        account.get("name")
+        or account.get("account_id")
+        or account.get("uid")
+        or f"Nick_{index}"
+    )
+
+
+def is_invalid_facebook_account_url(url):
+    normalized = str(url or "").casefold()
+    return any(
+        marker in normalized
+        for marker in ("/login", "checkpoint", "challenge", "disabled", "suspended")
+    )
+
+
+def keep_unprocessed_account_lines(lines, processed_source_lines):
+    processed = {
+        normalize_account_source_line(line)
+        for line in (processed_source_lines or [])
+        if normalize_account_source_line(line)
+    }
+    return [
+        line for line in (lines or [])
+        if normalize_account_source_line(line) not in processed
+    ]
+
+
+def write_create_page_results_xlsx(file_path, categorized_records):
+    """Write LIVE/DIE account results to a styled Excel workbook."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError as exc:
+        raise RuntimeError("Thiếu thư viện openpyxl để xuất Excel.") from exc
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    headers = (
+        "STT", "Tài khoản / UID", "Trạng thái", "Page đã tạo",
+        "Chỉ tiêu Page", "Kết quả / Lý do", "Thời gian", "Dữ liệu tài khoản gốc",
+    )
+    sheet_specs = (
+        ("LIVE", categorized_records.get("completed", []), "16A34A"),
+        ("DIE", categorized_records.get("die", []), "DC2626"),
+    )
+    result_key_by_sheet = {"LIVE": "completed", "DIE": "die"}
+    for sheet_name, records, accent in sheet_specs:
+        if result_key_by_sheet[sheet_name] not in categorized_records:
+            continue
+        sheet = workbook.create_sheet(sheet_name)
+        sheet.append(headers)
+        for record in records:
+            sheet.append((
+                record.get("stt", ""),
+                record.get("account_id") or record.get("uid", ""),
+                sheet_name,
+                int(record.get("created_count") or 0),
+                int(record.get("target_count") or 0),
+                (
+                    "Đã tạo đủ Page"
+                    if sheet_name == "LIVE"
+                    else record.get("reason") or "Tài khoản không còn đăng nhập hợp lệ"
+                ),
+                record.get("time", ""),
+                record.get("raw_line", ""),
+            ))
+
+        header_fill = PatternFill("solid", fgColor=accent)
+        for cell in sheet[1]:
+            cell.fill = header_fill
+            cell.font = Font(color="FFFFFF", bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        for row in sheet.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = f"A1:H{max(1, sheet.max_row)}"
+        sheet.row_dimensions[1].height = 26
+        widths = (8, 24, 12, 14, 14, 48, 22, 58)
+        for column_index, width in enumerate(widths, 1):
+            sheet.column_dimensions[get_column_letter(column_index)].width = width
+
+    if not workbook.sheetnames:
+        raise ValueError("Không có danh sách LIVE/DIE để xuất Excel.")
+    workbook.save(file_path)
+
+
 class AccountStateStore:
     def __init__(self):
         self._lock = threading.RLock()
@@ -171,6 +268,8 @@ class AccountStateStore:
                 account_id = str(account.get("account_id") or f"Tài khoản {index}")
                 account_payload = {
                     "raw_line": str(account.get("raw_line") or ""),
+                    "source_line": str(account.get("source_line") or ""),
+                    "name": account_display_name(account, index),
                     "fields": list(account.get("fields") or []),
                     "unknown_fields": list(account.get("unknown_fields") or []),
                     "uid": str(account.get("uid") or ""),
@@ -430,12 +529,25 @@ def parse_page_plan(value: str):
     }
 
 
+def build_create_page_plans(targets, max_pages):
+    """Build the requested Page plans while preserving legacy auto-name behavior."""
+    requested = max(1, int(max_pages))
+    plans = [
+        str(target).strip()
+        for target in (targets or [])
+        if str(target or "").strip()
+    ][:requested]
+    while len(plans) < requested:
+        plans.append(f"{generate_random_person_name()}|Blog cá nhân")
+    return plans
+
+
 def validate_create_page_targets(targets, max_pages):
     """Validate explicit Page plans before any browser is launched."""
     requested = max(1, int(max_pages))
-    clean_targets = [str(target or "") for target in (targets or [])]
-    if len(clean_targets) < requested:
-        return False, f"Cần {requested} cấu hình Page nhưng chỉ có {len(clean_targets)}."
+    clean_targets = [str(target or "") for target in (targets or []) if str(target or "").strip()]
+    if not clean_targets:
+        return False, "Chưa có cấu hình Page hợp lệ."
     for position, target in enumerate(clean_targets[:requested], 1):
         parts = target.split("|", 1)
         page_name = parts[0].strip() if parts else ""
@@ -445,6 +557,32 @@ def validate_create_page_targets(targets, max_pages):
         if not category:
             return False, f"Page #{position} thiếu category."
     return True, ""
+
+
+def filter_targets_for_mode(targets, mode, known_modes):
+    """Return targets for one mode without discarding legacy unscoped entries."""
+    available_modes = known_modes.keys() if hasattr(known_modes, "keys") else known_modes
+    normalized_modes = {
+        str(available_mode).strip().casefold()
+        for available_mode in (available_modes or [])
+    }
+    requested_mode = str(mode or "").strip().casefold()
+    scoped_targets = []
+    unscoped_targets = []
+
+    for target in targets or []:
+        raw_target = str(target or "").strip()
+        if not raw_target:
+            continue
+        prefix, separator, value = raw_target.partition(":")
+        normalized_prefix = prefix.strip().casefold()
+        if separator and normalized_prefix in normalized_modes:
+            if normalized_prefix == requested_mode and value.strip():
+                scoped_targets.append(value.strip())
+            continue
+        unscoped_targets.append(raw_target)
+
+    return scoped_targets if scoped_targets else unscoped_targets
 
 
 def build_create_page_result(
@@ -1537,6 +1675,10 @@ class MainToolApp:
         self.global_log_lock = threading.RLock()
         self.selected_log_account = None
         self.current_batch = 1
+        self.create_page_result_lock = threading.RLock()
+        self.create_page_account_results = {"completed": {}, "die": {}}
+        self.create_page_results_window = None
+        self.create_page_result_trees = {}
 
         self.theme_name = "Dark Charcoal (Mặc định)"
         self.current_theme = self.theme_name
@@ -2168,26 +2310,56 @@ class MainToolApp:
         paned_data = tk.PanedWindow(self.tab_data, orient="vertical", bg="#0A0E1A", bd=0, sashwidth=4, sashrelief="ridge")
         paned_data.pack(fill="both", expand=True, padx=8, pady=6)
 
-        # 1. Thanh Ribbon Nút Bấm Xanh
-        frame_ribbon = tk.Frame(paned_data, bg="#131C2E", padx=10, pady=6, highlightbackground="#1E293B", highlightthickness=1)
-        paned_data.add(frame_ribbon, minsize=45, height=52)
+        # 1. Khu điều khiển quản lý: chia hàng để dễ quét và không dồn nút.
+        frame_ribbon = tk.Frame(
+            paned_data, bg="#131C2E", padx=12, pady=8,
+            highlightbackground="#26384A", highlightthickness=1,
+        )
+        paned_data.add(frame_ribbon, minsize=84, height=92)
 
-        def make_btn(text, cmd, color="#0284C7"):
-            return tk.Button(frame_ribbon, text=text, font=("Segoe UI", 8, "bold"), bg=color, fg="#FFFFFF",
-                             relief="flat", padx=10, pady=4, cursor="hand2", command=cmd)
+        ribbon_head = tk.Frame(frame_ribbon, bg="#131C2E")
+        ribbon_head.pack(fill="x", pady=(0, 7))
+        tk.Label(
+            ribbon_head, text="QUẢN LÝ TÀI KHOẢN", font=("Segoe UI", 10, "bold"),
+            fg="#F8FAFC", bg="#131C2E",
+        ).pack(side="left")
+        self.lbl_management_summary = tk.Label(
+            ribbon_head, text="Tổng 0  •  LIVE 0  •  DIE 0  •  ERROR 0",
+            font=("Segoe UI", 8, "bold"), fg="#94A3B8", bg="#131C2E",
+        )
+        self.lbl_management_summary.pack(side="right")
 
-        make_btn("➕ Nhập Tài Khoản", self.open_import_dialog).pack(side="left", padx=2)
-        make_btn("🌐 Open Profile", self.open_selected_profile).pack(side="left", padx=2)
-        make_btn("🔍 Check Live/Die", self.check_live_selected).pack(side="left", padx=2)
-        make_btn("🔑 Get Token EAAB", self.get_token_selected).pack(side="left", padx=2)
-        make_btn("🔐 Lấy mã 2FA", self.generate_2fa_dialog).pack(side="left", padx=2)
-        make_btn("🗑 Xóa Chọn", self.delete_selected_rows, color="#EF4444").pack(side="left", padx=2)
+        ribbon_actions = tk.Frame(frame_ribbon, bg="#131C2E")
+        ribbon_actions.pack(fill="x")
 
-        f_search = tk.Frame(frame_ribbon, bg="#131C2E")
-        f_search.pack(side="left", padx=(10, 2))
-        tk.Label(f_search, text="🔍 Tìm:", font=("Segoe UI", 8), fg="#38BDF8", bg="#131C2E").pack(side="left", padx=(0, 2))
-        self.ent_search_tree = tk.Entry(f_search, width=15, font=("Segoe UI", 8), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
-        self.ent_search_tree.pack(side="left", padx=2)
+        def make_btn(parent, text, cmd, color="#0369A1"):
+            return tk.Button(
+                parent, text=text, font=("Segoe UI", 8, "bold"),
+                bg=color, fg="#FFFFFF", activebackground=color,
+                activeforeground="#FFFFFF", relief="flat", padx=9, pady=5,
+                cursor="hand2", command=cmd,
+            )
+
+        make_btn(ribbon_actions, "➕ Nhập tài khoản", self.open_import_dialog).pack(side="left", padx=(0, 4))
+        make_btn(ribbon_actions, "🌐 Mở profile", self.open_selected_profile).pack(side="left", padx=2)
+        make_btn(ribbon_actions, "🔍 Kiểm tra LIVE/DIE", self.check_live_selected).pack(side="left", padx=2)
+        make_btn(ribbon_actions, "🔑 Lấy token", self.get_token_selected).pack(side="left", padx=2)
+        make_btn(ribbon_actions, "🔐 Lấy mã 2FA", self.generate_2fa_dialog).pack(side="left", padx=2)
+        make_btn(
+            ribbon_actions,
+            "📋 Kết quả tạo Page",
+            self.open_create_page_results_dialog,
+            color="#7C3AED",
+        ).pack(side="left", padx=2)
+        make_btn(ribbon_actions, "🗑 Xóa chọn", self.delete_selected_rows, color="#B91C1C").pack(side="left", padx=2)
+
+        f_search = tk.Frame(ribbon_actions, bg="#131C2E")
+        f_search.pack(side="right")
+        self.ent_search_tree = tk.Entry(
+            f_search, width=20, font=("Segoe UI", 9), bg="#070B14", fg="#FFFFFF",
+            insertbackground="#FFFFFF", relief="solid", bd=1,
+        )
+        self.ent_search_tree.pack(side="left", ipady=3, padx=(0, 5))
 
         def filter_table(event=None):
             kw = self.ent_search_tree.get().strip().lower()
@@ -2199,7 +2371,7 @@ class MainToolApp:
                     self.tree.detach(item)
         self.ent_search_tree.bind("<KeyRelease>", filter_table)
 
-        make_btn("📊 Xuất Báo Cáo CSV", self.export_to_csv, color="#10B981").pack(side="right", padx=2)
+        make_btn(f_search, "Xuất CSV", self.export_to_csv, color="#047857").pack(side="left")
 
         # 2. Bảng dữ liệu trung tâm Dark Theme
         frame_tree = tk.Frame(paned_data, bg="#0A0E1A")
@@ -2208,6 +2380,11 @@ class MainToolApp:
         columns = ("select", "id", "uid", "name", "password", "2fa", "cookie", "email", "proxy", "status")
         self.tree = ttk.Treeview(frame_tree, columns=columns, show="headings", selectmode="extended")
         self.tree.tag_configure("empty", foreground="#8EA3B5")
+        self.tree.tag_configure("UNKNOWN", foreground="#94A3B8")
+        self.tree.tag_configure("CHECKING", foreground="#FACC15")
+        self.tree.tag_configure("LIVE", foreground="#4ADE80")
+        self.tree.tag_configure("DIE", foreground="#F87171")
+        self.tree.tag_configure("ERROR", foreground="#FB923C")
 
         self.tree.heading("select", text="[✔]")
         self.tree.heading("id", text="STT")
@@ -2266,6 +2443,207 @@ class MainToolApp:
         self.lbl_footer_status = tk.Label(self.tab_data, text="Tổng số nick: 0 | Sẵn sàng hoạt động.", font=("Segoe UI", 9), fg="#94A3B8", bg="#131C2E", anchor="w", padx=10, pady=4)
         self.lbl_footer_status.pack(fill="x", side="bottom")
 # [KẾT THÚC THAY THẾ]
+
+    def open_create_page_results_dialog(self):
+        window = self.create_page_results_window
+        if window is not None and window.winfo_exists():
+            window.deiconify()
+            window.lift()
+            self.refresh_create_page_results_dialog()
+            return
+
+        window = tk.Toplevel(self.root)
+        self.create_page_results_window = window
+        window.title("Kết quả tạo Page theo tài khoản")
+        window.geometry("1080x620")
+        window.minsize(820, 480)
+        window.configure(bg="#0B1117")
+
+        header = tk.Frame(window, bg="#101820", padx=16, pady=12)
+        header.pack(fill="x")
+        header_text = tk.Frame(header, bg="#101820")
+        header_text.pack(side="left")
+        tk.Label(
+            header_text, text="KẾT QUẢ CREATE PAGE", font=("Segoe UI", 13, "bold"),
+            fg="#F8FAFC", bg="#101820",
+        ).pack(anchor="w")
+        tk.Label(
+            header_text,
+            text="Theo dõi tài khoản đã hoàn tất và tài khoản ngừng do mất phiên đăng nhập",
+            font=("Segoe UI", 8), fg="#94A3B8", bg="#101820",
+        ).pack(anchor="w", pady=(2, 0))
+
+        summary = tk.Frame(header, bg="#101820")
+        summary.pack(side="right")
+        self.lbl_create_page_live_count = tk.Label(
+            summary, text="LIVE  0", font=("Segoe UI", 10, "bold"),
+            fg="#4ADE80", bg="#17332A", padx=12, pady=7,
+        )
+        self.lbl_create_page_live_count.pack(side="left", padx=4)
+        self.lbl_create_page_die_count = tk.Label(
+            summary, text="DIE  0", font=("Segoe UI", 10, "bold"),
+            fg="#F87171", bg="#3B1D24", padx=12, pady=7,
+        )
+        self.lbl_create_page_die_count.pack(side="left", padx=4)
+
+        notebook = ttk.Notebook(window)
+        notebook.pack(fill="both", expand=True, padx=12, pady=(12, 6))
+        self.create_page_results_notebook = notebook
+        self.create_page_result_trees = {}
+
+        for result_type, title in (
+            ("completed", "LIVE - ĐÃ TẠO XONG PAGE"),
+            ("die", "DIE - ĐÃ DỪNG"),
+        ):
+            frame = tk.Frame(notebook, bg="#0B1117")
+            notebook.add(frame, text=title)
+            columns = ("stt", "account", "pages", "detail", "time")
+            tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="extended")
+            tree.heading("stt", text="STT")
+            tree.heading("account", text="Tài khoản / UID")
+            tree.heading("pages", text="Số Page")
+            tree.heading("detail", text="Kết quả / Lý do")
+            tree.heading("time", text="Thời gian")
+            tree.column("stt", width=55, anchor="center", stretch=False)
+            tree.column("account", width=180)
+            tree.column("pages", width=90, anchor="center", stretch=False)
+            tree.column("detail", width=430)
+            tree.column("time", width=145, anchor="center", stretch=False)
+            scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+            tree.configure(yscrollcommand=scrollbar.set)
+            tree.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
+            self.create_page_result_trees[result_type] = tree
+
+        footer = tk.Frame(window, bg="#0B1117", padx=12, pady=10)
+        footer.pack(fill="x", side="bottom")
+        self.lbl_create_page_result_summary = tk.Label(
+            footer, text="", font=("Segoe UI", 9, "bold"),
+            fg="#E2E8F0", bg="#0B1117",
+        )
+        self.lbl_create_page_result_summary.pack(side="left")
+        tk.Button(
+            footer, text="XUẤT TẤT CẢ", command=lambda: self.export_create_page_results_excel(),
+            font=("Segoe UI", 8, "bold"), bg="#0369A1", fg="#FFFFFF",
+            relief="flat", padx=12, pady=6, cursor="hand2",
+        ).pack(side="right", padx=(5, 0))
+        tk.Button(
+            footer, text="XUẤT DIE", command=lambda: self.export_create_page_results_excel("die"),
+            font=("Segoe UI", 8, "bold"), bg="#B91C1C", fg="#FFFFFF",
+            relief="flat", padx=12, pady=6, cursor="hand2",
+        ).pack(side="right", padx=(5, 0))
+        tk.Button(
+            footer, text="XUẤT LIVE", command=lambda: self.export_create_page_results_excel("completed"),
+            font=("Segoe UI", 8, "bold"), bg="#047857", fg="#FFFFFF",
+            relief="flat", padx=12, pady=6, cursor="hand2",
+        ).pack(side="right", padx=(5, 0))
+        tk.Button(
+            footer, text="ĐÓNG", command=window.destroy,
+            font=("Segoe UI", 9, "bold"), bg="#1E293B", fg="#FFFFFF",
+            relief="flat", padx=14, pady=5, cursor="hand2",
+        ).pack(side="right", padx=(10, 0))
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        self.refresh_create_page_results_dialog()
+
+    def refresh_create_page_results_dialog(self):
+        window = getattr(self, "create_page_results_window", None)
+        if window is None or not window.winfo_exists():
+            return
+        counts = {}
+        for result_type in ("completed", "die"):
+            tree = self.create_page_result_trees.get(result_type)
+            if tree is None:
+                continue
+            for item in tree.get_children():
+                tree.delete(item)
+            records = self.get_create_page_account_results(result_type)
+            counts[result_type] = len(records)
+            for position, record in enumerate(records, 1):
+                pages = f"{record['created_count']}/{record['target_count']}"
+                if result_type == "die" and not record["target_count"]:
+                    pages = str(record["created_count"])
+                detail = (
+                    "Đã tạo đủ Page"
+                    if result_type == "completed"
+                    else record["reason"] or "Tài khoản không còn đăng nhập hợp lệ"
+                )
+                tree.insert(
+                    "", "end", iid=f"{result_type}_{position}",
+                    values=(
+                        record["stt"], record["account_id"] or record["uid"],
+                        pages, detail, record["time"],
+                    ),
+                )
+        if hasattr(self, "lbl_create_page_result_summary"):
+            self.lbl_create_page_result_summary.config(
+                text=(
+                    f"LIVE đã tạo xong: {counts.get('completed', 0)}   |   "
+                    f"DIE: {counts.get('die', 0)}"
+                )
+            )
+        if hasattr(self, "lbl_create_page_live_count"):
+            self.lbl_create_page_live_count.config(
+                text=f"LIVE  {counts.get('completed', 0)}"
+            )
+        if hasattr(self, "lbl_create_page_die_count"):
+            self.lbl_create_page_die_count.config(text=f"DIE  {counts.get('die', 0)}")
+
+    def export_create_page_results_excel(self, result_type=None):
+        result_types = (result_type,) if result_type else ("completed", "die")
+        categorized_records = {
+            key: self.get_create_page_account_results(key)
+            for key in result_types
+        }
+        if not any(categorized_records.values()):
+            messagebox.showwarning("Xuất Excel", "Danh sách được chọn đang trống.")
+            return
+        suffix = {None: "LIVE_DIE", "completed": "LIVE", "die": "DIE"}[result_type]
+        file_path = filedialog.asksaveasfilename(
+            parent=self.create_page_results_window,
+            title=f"Xuất danh sách {suffix}",
+            defaultextension=".xlsx",
+            initialfile=f"create_page_{suffix}_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+            filetypes=[("Excel Workbook", "*.xlsx")],
+        )
+        if not file_path:
+            return
+        try:
+            write_create_page_results_xlsx(file_path, categorized_records)
+        except (OSError, RuntimeError, ValueError) as exc:
+            messagebox.showerror("Xuất Excel thất bại", str(exc), parent=self.create_page_results_window)
+            return
+        messagebox.showinfo(
+            "Xuất Excel thành công",
+            f"Đã lưu báo cáo tại:\n{file_path}",
+            parent=self.create_page_results_window,
+        )
+
+    def remove_processed_create_page_accounts_from_input(self):
+        processed_sources = self.get_processed_create_page_sources()
+        if not processed_sources:
+            return
+        current_lines = [
+            line for line in self.txt_accounts.get("1.0", "end").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        remaining_lines = keep_unprocessed_account_lines(current_lines, processed_sources)
+        removed_count = len(current_lines) - len(remaining_lines)
+        if removed_count <= 0:
+            return
+        self.txt_accounts.delete("1.0", "end")
+        if remaining_lines:
+            self.txt_accounts.insert(
+                "1.0",
+                "\n".join(
+                    f"{index}. {normalize_account_source_line(line)}"
+                    for index, line in enumerate(remaining_lines, 1)
+                ) + "\n",
+            )
+        self.reload_table_from_text()
+        self.save_settings()
+        self.log(
+            f"[i] Đã chuyển {removed_count} tài khoản đã hoàn tất/DIE khỏi danh sách chờ."
+        )
 
 
 
@@ -2356,6 +2734,13 @@ class MainToolApp:
             self.lbl_stat_running.config(text=str(summary["CHECKING"]))
             self.lbl_stat_success.config(text=str(summary["LIVE"]))
             self.lbl_stat_failed.config(text=str(summary["DIE"] + summary["ERROR"]))
+        if hasattr(self, "lbl_management_summary"):
+            self.lbl_management_summary.config(
+                text=(
+                    f"Tổng {total}  •  LIVE {summary['LIVE']}  •  "
+                    f"DIE {summary['DIE']}  •  ERROR {summary['ERROR']}"
+                )
+            )
 
     def change_batch(self, offset):
         total_batches = len(split_account_batches(self.account_states.indexes(), self.get_batch_size()))
@@ -2413,24 +2798,69 @@ class MainToolApp:
 
     def set_account_failure(self, index, failure_kind, reason):
         status = self.account_states.set_failure(index, failure_kind, reason)
+        if (
+            status == "DIE"
+            and getattr(self, "run_config", {}).get("modes", {}).get("create_page", False)
+        ):
+            self.record_create_page_account_result(index, "die", reason=reason)
         self.post_ui(lambda idx=int(index): [
             self.refresh_account_state_row(idx),
             self.render_log_view() if self.selected_log_account == idx else None,
         ])
         return status
 
+    def reset_create_page_account_results(self):
+        with self.create_page_result_lock:
+            self.create_page_account_results = {"completed": {}, "die": {}}
+        self.refresh_create_page_results_dialog()
+
+    def record_create_page_account_result(
+        self, index, result_type, reason="", created_count=0, target_count=0
+    ):
+        if result_type not in {"completed", "die"}:
+            raise ValueError(f"Loại kết quả Create Page không hợp lệ: {result_type}")
+        state = self.account_states.get(index)
+        if state is None:
+            return
+        source_line = normalize_account_source_line(
+            state.get("source_line") or state.get("raw_line")
+        )
+        key = source_line or state.get("uid") or state.get("account_id") or str(index)
+        record = {
+            "stt": state.get("stt", index),
+            "account_id": state.get("account_id", ""),
+            "uid": state.get("uid", ""),
+            "raw_line": source_line,
+            "created_count": int(created_count or 0),
+            "target_count": int(target_count or 0),
+            "reason": str(reason or ""),
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        opposite = "die" if result_type == "completed" else "completed"
+        with self.create_page_result_lock:
+            self.create_page_account_results[opposite].pop(key, None)
+            self.create_page_account_results[result_type][key] = record
+        self.post_ui(self.refresh_create_page_results_dialog)
+
+    def get_create_page_account_results(self, result_type):
+        with self.create_page_result_lock:
+            return [
+                dict(record)
+                for record in self.create_page_account_results.get(result_type, {}).values()
+            ]
+
+    def get_processed_create_page_sources(self):
+        with self.create_page_result_lock:
+            records = [
+                *self.create_page_account_results["completed"].values(),
+                *self.create_page_account_results["die"].values(),
+            ]
+        return {record["raw_line"] for record in records if record.get("raw_line")}
+
     def get_targets_for_mode(self, targets, mode, known_modes=None):
         """Lọc target theo prefix mode, vẫn hỗ trợ danh sách cũ không có prefix."""
-        scoped_targets = []
-        has_scoped_targets = False
         available_modes = known_modes if known_modes is not None else self.mode_vars
-        for target in targets:
-            prefix, separator, value = target.partition(":")
-            if separator and prefix in available_modes:
-                has_scoped_targets = True
-                if prefix == mode and value.strip():
-                    scoped_targets.append(value.strip())
-        return scoped_targets if has_scoped_targets else targets
+        return filter_targets_for_mode(targets, mode, available_modes)
 
     def update_tree_row(self, item_id, current_friends=None, sent_today=None, status=None):
         """Cập nhật dữ liệu hàng trong bảng Treeview chính xác vào cột Trạng Thái (Index 8)"""
@@ -2453,7 +2883,8 @@ class MainToolApp:
                 
                 if msg_parts:
                     vals[9] = " | ".join(msg_parts)
-                self.tree.item(item_id, values=vals)
+                row_status = account_state["status"] if account_state else "UNKNOWN"
+                self.tree.item(item_id, values=vals, tags=(row_status,))
         self.post_ui(_update)
 
     def log(self, text, account_index=None):
@@ -2792,7 +3223,7 @@ class MainToolApp:
                 parsed["email"], 
                 assigned_proxy, 
                 "CHƯA KIỂM TRA"
-            ))
+            ), tags=("UNKNOWN",))
 
         self.account_states.sync(account_records)
         for index in self.account_states.indexes():
@@ -2801,7 +3232,7 @@ class MainToolApp:
             if self.tree.exists(item_id) and state:
                 values = list(self.tree.item(item_id, "values"))
                 values[9] = ACCOUNT_STATUS_LABELS[state["status"]]
-                self.tree.item(item_id, values=values)
+                self.tree.item(item_id, values=values, tags=(state["status"],))
         self.refresh_account_state_table(reset_batch=True)
         
         if hasattr(self, 'lbl_stat_total'):
@@ -2829,6 +3260,8 @@ class MainToolApp:
         }
         self.reload_table_from_text(checked_indexes=checked_indexes)
         self.run_config = self.capture_run_config()
+        if self.run_config.get("modes", {}).get("create_page", False):
+            self.reset_create_page_account_results()
         try:
             requested_threads = int(self.ent_threads.get().strip())
         except ValueError:
@@ -2890,7 +3323,7 @@ class MainToolApp:
             # Chạy trực tiếp worker chính, không gọi lại set_event_loop_policy để tránh xung đột luồng
             asyncio.run(self.main_worker())
         except Exception as e:
-            self.log(f"[-] Lỗi hệ thống luồng chính: {e}")
+            self.log(f"[-] Lỗi hệ thống luồng chính [{type(e).__name__}]: {e}")
         finally:
             self.worker_loop = None
             self.worker_tasks = []
@@ -4388,7 +4821,10 @@ class MainToolApp:
                 self.log(f"[ERROR] [{acc_name}] Không ghi được kết quả Create Page: {exc}")
             return result
 
-        valid_targets, validation_error = validate_create_page_targets(targets, max_pages)
+        planned_targets = build_create_page_plans(targets, max_pages)
+        valid_targets, validation_error = validate_create_page_targets(
+            planned_targets, max_pages
+        )
         if not valid_targets:
             record_result(build_create_page_result(
                 "FAILED", acc_name, "", "", reason=validation_error,
@@ -4397,18 +4833,23 @@ class MainToolApp:
             self.log(f"[FAILED] [{acc_name}] {validation_error}")
             return results
 
-        self.log(f"[*] [{acc_name}] Bắt đầu tiến trình tạo {max_pages} Fanpage...")
+        effective_max_pages = len(planned_targets)
 
-        for p_idx in range(max_pages):
-            if not self.is_running or created_count >= max_pages:
+        self.log(
+            f"[*] [{acc_name}] Bắt đầu tiến trình tạo {effective_max_pages} Fanpage "
+            f"theo {len(planned_targets)} cấu hình hợp lệ..."
+        )
+
+        for p_idx in range(effective_max_pages):
+            if not self.is_running or created_count >= effective_max_pages:
                 break
 
-            page_plan = parse_page_plan(targets[p_idx] if targets and len(targets) > p_idx else "")
+            page_plan = parse_page_plan(planned_targets[p_idx])
             page_name = page_plan["name"]
             category_name = page_plan["category"]
             retry_count = 0
 
-            self.log(f"[*] [{acc_name}] [{created_count + 1}/{max_pages}] Đang tải trang tạo Page: '{page_name}'...")
+            self.log(f"[*] [{acc_name}] [{created_count + 1}/{effective_max_pages}] Đang tải trang tạo Page: '{page_name}'...")
 
             try:
                 # ======================================================
@@ -4457,14 +4898,16 @@ class MainToolApp:
                 self.log(
                     f"[DEBUG] Frames={len(page.frames)}"
                 )
-                if any(x in cur_url for x in ["checkpoint", "challenge", "disabled", "suspended"]):
-                    self.log(f"[!] [{acc_name}] Tài khoản dính Checkpoint ngay lúc vào trang tạo Page!")
+                if is_invalid_facebook_account_url(cur_url):
+                    reason = "Session invalid/checkpoint khi mở trang tạo Page."
+                    self.log(f"[!] [{acc_name}] Tài khoản không còn phiên đăng nhập hợp lệ!")
                     record_result(build_create_page_result(
                         "FAILED", acc_name, page_name, category_name,
-                        reason="Session invalid/checkpoint khi mở trang tạo Page.",
+                        reason=reason,
                         retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
                     ))
-                    break
+                    self.set_account_failure(idx, "invalid_login", reason)
+                    return results
                 if "/pages/creation" not in cur_url:
                     self.log(
                         f"[-] [{acc_name}] Facebook đã chuyển khỏi trang tạo Page ({page.url}). "
@@ -4708,10 +5151,14 @@ class MainToolApp:
                 self.log(f"[*] [{acc_name}] Đã bấm Tạo, chờ Facebook xử lý...")
 
                 verified_page_identity = {"url": "", "id": ""}
+                invalid_session_reason = ""
                 for _ in range(10):
                     await asyncio.sleep(2)
                     cur_url = page.url.lower()
-                    if any(x in cur_url for x in ["checkpoint", "challenge", "disabled"]):
+                    if is_invalid_facebook_account_url(cur_url):
+                        invalid_session_reason = (
+                            f"Tài khoản mất phiên đăng nhập sau khi gửi tạo Page: {page.url}"
+                        )
                         self.log(f"[!] [{acc_name}] Bị Checkpoint ngay sau khi ấn Tạo!")
                         break
 
@@ -4728,6 +5175,15 @@ class MainToolApp:
                             await self.take_error_snapshot(page, acc_name, "rate_limit_page")
                         break
                     
+                if invalid_session_reason:
+                    record_result(build_create_page_result(
+                        "FAILED", acc_name, page_name, category_name,
+                        reason=invalid_session_reason,
+                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    ))
+                    self.set_account_failure(idx, "invalid_login", invalid_session_reason)
+                    return results
+
                 if not is_verified_page_identity(verified_page_identity):
                     self.log(
                         f"[-] [{acc_name}] Tạo trang thất bại hoặc chưa xác minh được Page URL/ID."
@@ -4806,14 +5262,14 @@ class MainToolApp:
                 created_count += 1
                 record_result(page_record)
                 self.log(
-                    f"[✔] [{acc_name}] Tạo Page {created_count}/{max_pages}: "
+                    f"[✔] [{acc_name}] Tạo Page {created_count}/{effective_max_pages}: "
                     f"'{page_name}' | {page_identity['url'] or page_identity['id']}"
                 )
 
                 # ======================================================
                 # BƯỚC 7: NUÔI NICK THEO CẤU HÌNH NGƯỜI DÙNG (NHẬP 0 SẼ BỎ QUA)
                 # ======================================================
-                if created_count < max_pages and self.is_running:
+                if created_count < effective_max_pages and self.is_running:
                     surf_mins = self.run_config.get("feed_surf_min", 10)
                     watch_mins = self.run_config.get("watch_review_min", 5)
 
@@ -5290,6 +5746,7 @@ class MainToolApp:
 
                 total_sent = 0
                 created_pages = []
+                create_page_completion_action = ""
                 # 1. Kết bạn theo tên
                 if modes.get("by_name", False):
                     total_sent += (await self.run_add_by_name(page, acc_name, idx, targets_by_mode["by_name"], target_total, min_del, max_del)) or 0
@@ -5352,6 +5809,35 @@ class MainToolApp:
                         if result.get("status") == "SUCCESS"
                     ]
                     total_sent += len(created_pages)
+                    current_state = self.account_states.get(idx)
+                    if current_state and current_state["status"] == "DIE":
+                        self.record_create_page_account_result(
+                            idx,
+                            "die",
+                            reason=current_state["current_action"],
+                            created_count=len(created_pages),
+                            target_count=page_target_num,
+                        )
+                        self.update_tree_row(str(idx), status="DIE")
+                        self.log(
+                            f"[DIE] [{acc_name}] Dừng riêng tài khoản này; "
+                            "các tài khoản khác tiếp tục chạy."
+                        )
+                        return
+                    if len(created_pages) >= page_target_num:
+                        create_page_completion_action = (
+                            f"Đã tạo xong {len(created_pages)}/{page_target_num} Page"
+                        )
+                        self.record_create_page_account_result(
+                            idx,
+                            "completed",
+                            created_count=len(created_pages),
+                            target_count=page_target_num,
+                        )
+                    else:
+                        create_page_completion_action = (
+                            f"Chưa hoàn tất Create Page: {len(created_pages)}/{page_target_num}"
+                        )
                 # 13. Đăng bài lên Fanpage
                 if modes.get("post_page", False):
                     await self.run_post_page(page, acc_name, idx, targets_by_mode["post_page"])
@@ -5453,7 +5939,11 @@ class MainToolApp:
                 if modes.get("scrape_contacts", False):
                     await self.run_scrape_contact_info(page, acc_name, idx, targets_by_mode["scrape_contacts"])
 
-                self.set_account_state(idx, status="LIVE", current_action="Hoàn thành")
+                self.set_account_state(
+                    idx,
+                    status="LIVE",
+                    current_action=create_page_completion_action or "Hoàn thành",
+                )
                 self.update_tree_row(str(idx), sent_today=total_sent, status="LIVE")
                 self.log(f"[✔ XONG] Nick {acc_name} đã hoàn thành ({total_sent} kết quả đã xác nhận).")
 
@@ -5537,8 +6027,11 @@ class MainToolApp:
                 if line.strip()
             ]
             create_targets = self.get_targets_for_mode(raw_targets, "create_page", modes)
-            valid_targets, validation_error = validate_create_page_targets(
+            planned_targets = build_create_page_plans(
                 create_targets, config.get("page_target", 5)
+            )
+            valid_targets, validation_error = validate_create_page_targets(
+                planned_targets, config.get("page_target", 5)
             )
             if not valid_targets:
                 self.log(f"[FAILED][CREATE_PAGE][PRE-FLIGHT] {validation_error}")
@@ -5562,7 +6055,7 @@ class MainToolApp:
             if not parsed:
                 continue
 
-            acc_name = parsed["name"]
+            acc_name = account_display_name(parsed, idx)
             cookie_str = parsed.get("cookie", "")
             if parsed["type"] == "TOKEN":
                 self.set_account_failure(
@@ -5671,6 +6164,8 @@ class MainToolApp:
             f"[KẾT THÚC ĐỢT CHẠY] LIVE: {final_summary['LIVE']} • "
             f"DIE: {final_summary['DIE']} • ERROR: {final_summary['ERROR']}"
         )
+        if modes.get("create_page", False):
+            self.post_ui(self.remove_processed_create_page_accounts_from_input)
         t_token = config.get("tele_token", "")
         t_id = config.get("tele_chatid", "")
         if t_token and t_id:
