@@ -1,7 +1,7 @@
 {
-    "version": "2.1.4",
-    "download_url": "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.1.4/client_app.exe",
-    "sha256": "2C18106D4FD7DAD2F0E1099DFBE4B1E83A3641E5829FD0C8575F23A1A3053F23",
-    "changelog": "Sửa lỗi tạo Page, lưu thông tin Page, ghép Page đúng tài khoản, xác nhận kết bạn, kiểm tra Proxy và cải thiện thời gian chờ tạo Page.Sửa lỗi tạo Page, lưu thông tin Page, ghép Page đúng tài khoản, xác nhận kết bạn, kiểm tra Proxy và cải thiện thời gian chờ tạo Page.",
-    "mandatory": false
+    "version":  "2.1.5",
+    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.1.5/client_app.exe",
+    "sha256":  "7C85B5090168B4EFF52BC2EB4D2778DD681AB9EDEB389271BBDB2B4306DE6EB2",
+    "changelog":  "Sửa giao diện Auto Update.",
+    "mandatory":  false
 }
