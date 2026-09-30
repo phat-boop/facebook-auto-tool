@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextvars
 import csv
 import json
 import os
@@ -36,7 +37,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.1.5"
+CURRENT_VERSION = "2.1.6"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -85,12 +86,25 @@ def generate_random_person_name():
     return f"{ho} {dem} {ten}{hau_to}".strip()
 
 ADD_FRIEND_SELECTORS = (
+    '[role="main"] [role="button"][data-testid*="add_friend" i], '
+    '[role="main"] button[name*="add_friend" i], '
+    '[role="main"] [role="button"][data-action*="add_friend" i], '
     'div[role="button"]:has-text("Thêm bạn bè"), '
     'div[role="button"]:has-text("Add friend"), '
     'div[role="button"]:has-text("Add Friend"), '
+    'div[role="button"]:has-text("เพิ่มเป็นเพื่อน"), '
+    'div[role="button"]:has-text("Tambahkan Teman"), '
+    'div[role="button"]:has-text("Magdagdag ng kaibigan"), '
+    'div[role="button"]:has-text("友達を追加"), '
+    'div[role="button"]:has-text("친구 추가"), '
     'div[aria-label="Thêm bạn bè"], '
     'div[aria-label="Add friend"], '
-    'div[aria-label="Add Friend"]'
+    'div[aria-label="Add Friend"], '
+    'div[aria-label="เพิ่มเป็นเพื่อน"], '
+    'div[aria-label="Tambahkan Teman"], '
+    'div[aria-label="Magdagdag ng kaibigan"], '
+    'div[aria-label="友達を追加"], '
+    'div[aria-label="친구 추가"]'
 )
 
 FRIEND_REQUEST_SENT_SELECTORS = (
@@ -105,6 +119,149 @@ FRIEND_REQUEST_SENT_SELECTORS = (
 )
 
 RESULT_FILE_LOCK = threading.Lock()
+
+ACCOUNT_STATUSES = {"UNKNOWN", "CHECKING", "LIVE", "DIE", "ERROR"}
+ACCOUNT_STATUS_LABELS = {
+    "UNKNOWN": "CHƯA KIỂM TRA",
+    "CHECKING": "ĐANG KIỂM TRA",
+    "LIVE": "LIVE",
+    "DIE": "DIE",
+    "ERROR": "ERROR",
+}
+ACCOUNT_STATUS_COLORS = {
+    "UNKNOWN": "#94A3B8",
+    "CHECKING": "#FACC15",
+    "LIVE": "#22C55E",
+    "DIE": "#EF4444",
+    "ERROR": "#F97316",
+}
+LOGIN_SUCCESS = "SUCCESS"
+LOGIN_INVALID = "INVALID"
+LOGIN_TECHNICAL_ERROR = "TECHNICAL_ERROR"
+
+
+def split_account_batches(items, batch_size):
+    size = max(1, int(batch_size))
+    values = list(items)
+    return [values[index:index + size] for index in range(0, len(values), size)]
+
+
+def effective_account_worker_count(requested_threads, modes, max_create_page_workers=3):
+    requested = max(1, int(requested_threads))
+    if (modes or {}).get("create_page", False):
+        return min(requested, max(1, int(max_create_page_workers)))
+    return requested
+
+
+def account_status_for_failure(failure_kind):
+    return "DIE" if failure_kind in {"invalid_cookie", "invalid_login"} else "ERROR"
+
+
+class AccountStateStore:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._states = {}
+
+    def sync(self, accounts):
+        with self._lock:
+            active_indexes = set()
+            for account in accounts:
+                index = int(account["stt"])
+                active_indexes.add(index)
+                account_id = str(account.get("account_id") or f"Tài khoản {index}")
+                account_payload = {
+                    "raw_line": str(account.get("raw_line") or ""),
+                    "fields": list(account.get("fields") or []),
+                    "unknown_fields": list(account.get("unknown_fields") or []),
+                    "uid": str(account.get("uid") or ""),
+                    "password": str(account.get("password") or account.get("pwd") or ""),
+                    "pwd": str(account.get("pwd") or account.get("password") or ""),
+                    "2fa": str(account.get("2fa") or ""),
+                    "cookie": str(account.get("cookie") or ""),
+                    "token": str(account.get("token") or ""),
+                    "email": str(account.get("email") or ""),
+                    "proxy": str(account.get("proxy") or ""),
+                    "type": str(account.get("type") or ""),
+                }
+                existing = self._states.get(index)
+                if existing is None or existing["account_id"] != account_id:
+                    self._states[index] = {
+                        "stt": index,
+                        "account_id": account_id,
+                        "country": str(account.get("country") or ""),
+                        "locale": normalize_account_locale(account.get("locale")),
+                        "timezone": normalize_account_timezone(account.get("timezone")),
+                        "status": "UNKNOWN",
+                        "current_action": "Chưa chạy",
+                        "logs": [],
+                        **account_payload,
+                    }
+                else:
+                    existing["country"] = str(account.get("country") or "")
+                    existing["locale"] = normalize_account_locale(account.get("locale"))
+                    existing["timezone"] = normalize_account_timezone(account.get("timezone"))
+                    existing.update(account_payload)
+            for index in list(self._states):
+                if index not in active_indexes:
+                    del self._states[index]
+
+    def indexes(self):
+        with self._lock:
+            return sorted(self._states)
+
+    def get(self, index):
+        with self._lock:
+            state = self._states.get(int(index))
+            if state is None:
+                return None
+            snapshot = dict(state)
+            snapshot["logs"] = list(state["logs"])
+            snapshot["fields"] = list(state.get("fields") or [])
+            snapshot["unknown_fields"] = [
+                dict(field) for field in state.get("unknown_fields") or []
+            ]
+            return snapshot
+
+    def update(self, index, status=None, current_action=None):
+        with self._lock:
+            state = self._states.get(int(index))
+            if state is None:
+                return None
+            if status is not None:
+                normalized_status = str(status).upper()
+                if normalized_status not in ACCOUNT_STATUSES:
+                    raise ValueError(f"Trạng thái tài khoản không hợp lệ: {status}")
+                state["status"] = normalized_status
+            if current_action is not None:
+                state["current_action"] = str(current_action)
+            return self.get(index)
+
+    def append_log(self, index, message, current_action=None):
+        with self._lock:
+            state = self._states.get(int(index))
+            if state is None:
+                return None
+            state["logs"].append(str(message))
+            if len(state["logs"]) > 5000:
+                del state["logs"][:-4500]
+            if current_action:
+                state["current_action"] = str(current_action)
+            return self.get(index)
+
+    def set_failure(self, index, failure_kind, reason):
+        status = account_status_for_failure(failure_kind)
+        self.update(index, status=status, current_action=str(reason))
+        self.append_log(index, f"[-] {reason}")
+        return status
+
+    def summary(self, indexes=None):
+        with self._lock:
+            selected = set(indexes) if indexes is not None else set(self._states)
+            counts = {status: 0 for status in ACCOUNT_STATUSES}
+            for index, state in self._states.items():
+                if index in selected:
+                    counts[state["status"]] += 1
+            return counts
 
 MESSAGE_BTN_SELECTORS = (
     'div[role="button"]:has-text("Nhắn tin"), '
@@ -129,9 +286,134 @@ CANCEL_REQUEST_SELECTORS = (
 
 CREATE_PAGE_BUTTON_PATTERN = re.compile(
     r"^(Tạo Trang|Create Page|Créer une Page|Crear página|Criar Página|"
-    r"Seite erstellen|Buat Halaman)$",
+    r"Seite erstellen|Buat Halaman|สร้างเพจ|Gumawa ng Page|ページを作成|페이지 만들기)$",
     re.IGNORECASE,
 )
+ADD_PAGE_ADMIN_BUTTON_PATTERN = re.compile(
+    r"^(Thêm mới|Add new|เพิ่มใหม่|Tambahkan baru|Magdagdag ng bago|新しく追加|새로 추가)$",
+    re.IGNORECASE,
+)
+NEXT_BUTTON_PATTERN = re.compile(
+    r"^(Tiếp|Next|ถัดไป|Berikutnya|Susunod|次へ|다음)$",
+    re.IGNORECASE,
+)
+GIVE_ACCESS_BUTTON_PATTERN = re.compile(
+    r"^(Cấp quyền truy cập|Give access|ให้สิทธิ์การเข้าถึง|Berikan akses|"
+    r"Magbigay ng access|アクセスを許可|액세스 권한 부여)$",
+    re.IGNORECASE,
+)
+
+ACCOUNT_METADATA_PATTERN = re.compile(
+    r"^(locale|language|country|timezone)\s*=\s*(.*?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def normalize_account_locale(value):
+    locale = str(value or "AUTO").strip()
+    if not locale or locale.casefold() == "auto":
+        return "AUTO"
+    if not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z]{2}|-[A-Za-z]{4})?", locale):
+        return "AUTO"
+    pieces = locale.split("-")
+    return pieces[0].lower() + (f"-{pieces[1].upper()}" if len(pieces) > 1 else "")
+
+
+def normalize_account_timezone(value):
+    timezone = str(value or "").strip()
+    if not timezone:
+        return ""
+    return timezone if re.fullmatch(r"[A-Za-z_]+(?:/[A-Za-z0-9_+\-]+)+", timezone) else ""
+
+
+def split_account_metadata(raw_line):
+    """Remove optional account metadata tokens without inferring them from the proxy."""
+    metadata = {"locale": "AUTO", "country": "", "timezone": ""}
+    account_parts = []
+    for part in str(raw_line or "").split("|"):
+        match = ACCOUNT_METADATA_PATTERN.fullmatch(part.strip())
+        if not match:
+            account_parts.append(part)
+            continue
+        key, value = match.group(1).casefold(), match.group(2).strip()
+        if key in {"locale", "language"}:
+            metadata["locale"] = normalize_account_locale(value)
+        elif key == "country":
+            metadata["country"] = value
+        elif key == "timezone":
+            metadata["timezone"] = normalize_account_timezone(value)
+    return "|".join(account_parts), metadata
+
+
+def browser_locale_options(locale):
+    """Return browser locale settings; AUTO leaves Facebook/browser language untouched."""
+    normalized = normalize_account_locale(locale)
+    if normalized == "AUTO":
+        return {"locale": None, "accept_language": None, "lang_arg": None}
+    language = normalized.split("-", 1)[0]
+    return {
+        "locale": normalized,
+        "accept_language": f"{normalized},{language};q=0.9,en-US;q=0.7,en;q=0.6",
+        "lang_arg": normalized,
+    }
+
+
+def resolve_account_proxy(account_proxy, resolved_proxies, account_index):
+    """Use the proxy captured for this account; never borrow another account's proxy."""
+    inline_proxy = str(account_proxy or "").strip()
+    if inline_proxy:
+        return inline_proxy
+    resolved = str((resolved_proxies or {}).get(int(account_index), "") or "").strip()
+    return "" if resolved in {"", "Không dùng"} else resolved
+
+
+def facebook_page_reference(url):
+    """Extract a Page reference from Page and Page-settings URLs."""
+    parsed = urlparse(str(url or "").strip())
+    if (parsed.hostname or "").casefold() not in {
+        "facebook.com", "www.facebook.com", "m.facebook.com"
+    }:
+        return ""
+    query_id = re.search(r"(?:^|&)id=(\d+)(?:&|$)", parsed.query)
+    if query_id:
+        return query_id.group(1)
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts or parts[0].casefold() in {"pages", "settings", "login"}:
+        return ""
+    return parts[0].casefold()
+
+
+def page_reference_matches(expected_url, current_url):
+    expected = facebook_page_reference(expected_url)
+    current = facebook_page_reference(current_url)
+    return bool(expected and current and expected == current)
+
+
+async def locator_matches_account_target(locator, target):
+    """Verify a search result against the user-provided UID/name, independent of UI language."""
+    expected = str(target or "").strip().casefold()
+    if not expected:
+        return False
+    evidence = []
+    for attribute in ("href", "data-id", "data-testid", "aria-label"):
+        try:
+            evidence.append(await locator.get_attribute(attribute) or "")
+        except Exception:
+            pass
+    try:
+        target_link = locator.locator('a[href]').first
+        if await target_link.count() > 0:
+            evidence.append(await target_link.get_attribute("href") or "")
+    except Exception:
+        pass
+    try:
+        evidence.append(await locator.inner_text(timeout=1000) or "")
+    except Exception:
+        pass
+    combined = " ".join(evidence).casefold()
+    if expected.isdigit():
+        return re.search(rf"(?<!\d){re.escape(expected)}(?!\d)", combined) is not None
+    return expected in combined
 
 def version_tuple(version):
     """Chuyển chuỗi version thành tuple số để so sánh đúng thứ tự."""
@@ -146,6 +428,175 @@ def parse_page_plan(value: str):
         "name": parts[0] if parts and parts[0] else generate_random_person_name(),
         "category": parts[1] if len(parts) > 1 and parts[1] else "Blog cá nhân",
     }
+
+
+def validate_create_page_targets(targets, max_pages):
+    """Validate explicit Page plans before any browser is launched."""
+    requested = max(1, int(max_pages))
+    clean_targets = [str(target or "") for target in (targets or [])]
+    if len(clean_targets) < requested:
+        return False, f"Cần {requested} cấu hình Page nhưng chỉ có {len(clean_targets)}."
+    for position, target in enumerate(clean_targets[:requested], 1):
+        parts = target.split("|", 1)
+        page_name = parts[0].strip() if parts else ""
+        category = parse_page_plan(target)["category"]
+        if not page_name:
+            return False, f"Page #{position} thiếu page_name."
+        if not category:
+            return False, f"Page #{position} thiếu category."
+    return True, ""
+
+
+def build_create_page_result(
+    status,
+    account_id,
+    page_name,
+    category,
+    page_url="",
+    page_id="",
+    reason="",
+    technical_error="",
+    retry_count=0,
+    account_index=None,
+    proxy="",
+):
+    return {
+        "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "account_index": account_index,
+        "account": account_id,
+        "account_id": account_id,
+        "page_name": page_name,
+        "category": category,
+        "page_url": page_url,
+        "page_id": page_id,
+        "proxy": proxy,
+        "status": str(status).upper(),
+        "reason": reason,
+        "technical_error": technical_error,
+        "retry_count": int(retry_count),
+    }
+
+
+def page_identity_keys(page_url="", page_id=""):
+    keys = set()
+    clean_id = str(page_id or "").strip()
+    clean_url = str(page_url or "").strip().rstrip("/").casefold()
+    if clean_id:
+        keys.add(f"id:{clean_id}")
+    if clean_url:
+        keys.add(f"url:{clean_url}")
+    return keys
+
+
+def save_created_page_success(record):
+    """Atomically de-duplicate and write both Create Page success outputs."""
+    fieldnames = [
+        "time", "timestamp", "account_index", "account", "account_id",
+        "page_name", "category", "page_url", "page_id", "proxy", "status",
+        "reason", "technical_error", "retry_count",
+    ]
+    csv_path = output_path("created_pages.csv")
+    success_path = output_path("created_pages_success.txt")
+    candidate_keys = page_identity_keys(record.get("page_url"), record.get("page_id"))
+    if not candidate_keys:
+        return False
+
+    with RESULT_FILE_LOCK:
+        existing_keys = set()
+        if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
+            with open(csv_path, "r", newline="", encoding="utf-8-sig") as handle:
+                for existing in csv.DictReader(handle):
+                    existing_keys.update(page_identity_keys(
+                        existing.get("page_url"), existing.get("page_id")
+                    ))
+        if candidate_keys & existing_keys:
+            return False
+
+        has_content = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
+        with open(csv_path, "a", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            if not has_content:
+                writer.writeheader()
+            writer.writerow(record)
+        with open(success_path, "a", encoding="utf-8") as handle:
+            handle.write(
+                f"{record['account_id']} | {record['page_name']} | "
+                f"{record['page_url'] or record['page_id']} | {record['time']}\n"
+            )
+    return True
+
+
+CREATE_PAGE_RESULT_FIELDS = [
+    "time", "timestamp", "account_index", "account", "account_id",
+    "page_name", "category", "page_url", "page_id", "proxy", "status",
+    "reason", "technical_error", "retry_count",
+]
+
+
+def save_create_page_outcome(record):
+    append_csv_result("create_page_results.csv", CREATE_PAGE_RESULT_FIELDS, record)
+
+
+def append_create_page_account_log(account_index, account_id, message):
+    safe_account = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(account_id or account_index))
+    filename = f"create_page_{int(account_index)}_{safe_account[:48]}.log"
+    with RESULT_FILE_LOCK:
+        with open(output_path(filename), "a", encoding="utf-8") as handle:
+            handle.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
+
+
+def is_transient_create_page_error(exc):
+    text = f"{type(exc).__name__}: {exc}".casefold()
+    return isinstance(exc, (TimeoutError, OSError, ConnectionError)) or any(
+        marker in text for marker in (
+            "timeout", "timed out", "connection", "network", "navigation",
+            "net::err_", "temporarily unavailable",
+        )
+    )
+
+
+async def retry_create_page_operation(operation, max_attempts=3, base_delay=1.0):
+    """Retry transient pre-submit operations with bounded exponential backoff."""
+    last_error = None
+    for attempt in range(1, max(1, int(max_attempts)) + 1):
+        try:
+            return await operation(), attempt - 1
+        except Exception as exc:
+            last_error = exc
+            try:
+                setattr(exc, "create_page_retry_count", attempt - 1)
+            except Exception:
+                pass
+            if attempt >= max_attempts or not is_transient_create_page_error(exc):
+                raise
+            await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
+    raise last_error
+
+
+async def close_browser_resources(context=None, browser=None):
+    """Close isolated resources on success, failure, or cancellation."""
+    errors = []
+    for resource in (context, browser):
+        if resource is None:
+            continue
+        try:
+            await resource.close()
+        except Exception as exc:
+            errors.append(exc)
+    return errors
+
+
+async def wait_for_locator_ready(locator, timeout=10000):
+    """Wait for a visible, enabled action without clicking it."""
+    await locator.wait_for(state="visible", timeout=timeout)
+    for _ in range(10):
+        aria_disabled = (await locator.get_attribute("aria-disabled") or "").casefold()
+        disabled = await locator.get_attribute("disabled")
+        if aria_disabled != "true" and disabled is None:
+            return True
+        await asyncio.sleep(0.25)
+    return False
 
 
 def select_page_admin_job(targets, account_index: int, account_name: str):
@@ -204,6 +655,17 @@ def extract_facebook_page_identity(urls):
     return {"url": "", "id": ""}
 
 
+def is_verified_page_identity(identity):
+    """Return True only when Facebook supplied a stable Page URL or Page ID."""
+    return bool(
+        identity
+        and (
+            str(identity.get("url", "")).strip()
+            or str(identity.get("id", "")).strip()
+        )
+    )
+
+
 def append_csv_result(filename: str, fieldnames, row):
     """Append one durable result row without interleaving concurrent workers."""
     path = output_path(filename)
@@ -224,7 +686,18 @@ def is_trusted_update_url(download_url: str) -> bool:
         and parsed.path.lower().endswith(".exe")
     )
 
-def check_for_updates(self):
+
+def get_self_update_target(executable=None, frozen=None):
+    target = os.path.abspath(executable or sys.executable)
+    is_frozen = getattr(sys, "frozen", False) if frozen is None else bool(frozen)
+    if not is_frozen:
+        return None
+    if os.path.basename(target).casefold() in {"python.exe", "pythonw.exe", "py.exe"}:
+        return None
+    return target
+
+
+def check_for_updates(self, manual=False):
     """Kiểm tra bản mới và hiển thị cửa sổ cập nhật tùy chỉnh có thanh tiến trình"""
     try:
         req = urllib.request.Request(VERSION_CHECK_URL, headers={'User-Agent': 'Mozilla/5.0'})
@@ -245,6 +718,9 @@ def check_for_updates(self):
                         self.log("[-] Bỏ qua bản cập nhật vì thiếu hoặc sai mã SHA-256.")
                         return
 
+                    self_update_target = get_self_update_target()
+                    effective_mandatory = bool(is_mandatory and self_update_target)
+
                     def show_update_dialog():
                         # Tạo cửa sổ Toplevel đồng bộ màu với app
                         dlg = tk.Toplevel(self.root)
@@ -256,7 +732,7 @@ def check_for_updates(self):
                         dlg.transient(self.root)
                         dlg.grab_set()
 
-                        if is_mandatory:
+                        if effective_mandatory:
                             dlg.protocol("WM_DELETE_WINDOW", lambda: None)
 
                         # Tiêu đề
@@ -278,7 +754,7 @@ def check_for_updates(self):
                         # Nút bấm hành động
                         f_btn = tk.Frame(f_footer, bg="#131C2E")
                         f_btn.pack(side="bottom", fill="x")
-                        action_columns = 2 if is_mandatory else 3
+                        action_columns = 1 + int(not effective_mandatory) + int(bool(self_update_target))
                         for column in range(action_columns):
                             f_btn.columnconfigure(column, weight=1, uniform="update_actions")
 
@@ -300,8 +776,16 @@ def check_for_updates(self):
                         txt_changelog.config(state="disabled")
 
                         btn_cancel = None
+                        btn_update = None
 
                         def start_download():
+                            if get_self_update_target() is None:
+                                messagebox.showinfo(
+                                    "Cập nhật thủ công",
+                                    "Chế độ chạy source không hỗ trợ tự cập nhật. Vui lòng dùng TẢI THỦ CÔNG.",
+                                    parent=dlg,
+                                )
+                                return
                             btn_update.config(state="disabled")
                             btn_download.config(state="disabled")
                             if btn_cancel is not None:
@@ -343,8 +827,11 @@ def check_for_updates(self):
                                             os.remove(temp_file)
                                             raise ValueError("Mã xác thực SHA-256 hoặc định dạng tệp không hợp lệ!")
 
-                                    # Tạo file bat thực hiện ghi đè an toàn
-                                    current_exe = sys.executable
+                                    # Kiểm tra lại target ngay trước khi tạo updater/thay EXE.
+                                    current_exe = get_self_update_target()
+                                    if current_exe is None:
+                                        os.remove(temp_file)
+                                        raise RuntimeError("Target tự cập nhật không an toàn hoặc ứng dụng đang chạy source.")
                                     updater_file = output_path("updater.bat")
                                     bat_script = f"""@echo off
 taskkill /f /pid {os.getpid()} >nul 2>&1
@@ -372,17 +859,24 @@ del "%~f0"
                             threading.Thread(target=download_worker, daemon=True).start()
 
                         next_column = 0
-                        if not is_mandatory:
+                        if not effective_mandatory:
                             btn_cancel = tk.Button(f_btn, text="ĐỂ SAU", font=("Segoe UI", 9), bg="#1E293B", fg="#E2E8F0", relief="flat", padx=15, pady=8, cursor="hand2", command=dlg.destroy)
                             btn_cancel.grid(row=0, column=next_column, sticky="ew", padx=(0, 5))
                             next_column += 1
                         btn_download = tk.Button(f_btn, text="TẢI THỦ CÔNG", font=("Segoe UI", 9), bg="#2563EB", fg="#FFFFFF", relief="flat", padx=15, pady=8, cursor="hand2", command=lambda: webbrowser.open(download_url))
                         btn_download.grid(row=0, column=next_column, sticky="ew", padx=5)
                         next_column += 1
-                        btn_update = tk.Button(f_btn, text="CẬP NHẬT NGAY", font=("Segoe UI", 9, "bold"), bg="#10B981", fg="#FFFFFF", relief="flat", padx=15, pady=8, cursor="hand2", command=start_download)
-                        btn_update.grid(row=0, column=next_column, sticky="ew", padx=(5, 0))
+                        if self_update_target:
+                            btn_update = tk.Button(f_btn, text="CẬP NHẬT NGAY", font=("Segoe UI", 9, "bold"), bg="#10B981", fg="#FFFFFF", relief="flat", padx=15, pady=8, cursor="hand2", command=start_download)
+                            btn_update.grid(row=0, column=next_column, sticky="ew", padx=(5, 0))
 
                     self.post_ui(show_update_dialog)
+                elif manual and version_tuple(latest_version) == version_tuple(CURRENT_VERSION):
+                    self.post_ui(lambda: messagebox.showinfo(
+                        "Kiểm tra cập nhật",
+                        f"Bạn đang sử dụng phiên bản mới nhất\n\nPhiên bản hiện tại: v{CURRENT_VERSION}",
+                        parent=self.root,
+                    ))
     except Exception:
         pass
 
@@ -644,111 +1138,132 @@ def send_telegram_alert(bot_token: str, chat_id: str, message: str):
         pass
 
 def parse_any_account_line(raw_line: str, idx: int = 1):
-    """Tự động phân tích và trích xuất mọi định dạng: UID, Pass, 2FA, Cookie, Email, Proxy"""
-    line = re.sub(r'^\d+[\.\-\s]+', '', raw_line.strip()).strip()
-    if not line:
+    """Parse account fields without mutating or discarding the original line."""
+    raw_value = str(raw_line or "").rstrip("\r\n")
+    normalized_line = re.sub(r'^\s*\d+[\.\-]\s*', '', raw_value).strip()
+    if not normalized_line:
         return None
 
-    uid, name, pwd, fa2, cookie, email, proxy, token = "", f"Nick_{idx}", "", "", "", "", "", ""
+    account_line, metadata = split_account_metadata(normalized_line)
+    exact_fields = normalized_line.split("|")
+    parts = [part.strip() for part in account_line.split("|")]
+    recognized_indexes = set()
+    uid = ""
+    name = f"Nick_{idx}"
+    password = ""
+    fa2 = ""
+    cookie = ""
+    token = ""
+    email = ""
+    proxy = ""
 
-    # Prefix rõ ràng để phân biệt loại tài khoản trước khi auto-detect.
-    if line.upper().startswith("COOKIE|"):
-        cookie = line.split("|", 1)[1].strip()
-        match = re.search(r"c_user=(\d+)", cookie)
-        uid = match.group(1) if match else ""
-        return {
-            "type": "COOKIE", "uid": uid, "name": f"FB_{uid}" if uid else f"Nick_{idx}",
-            "pwd": "", "2fa": "", "cookie": cookie, "email": "", "proxy": "", "data": cookie
-        }
+    def is_cookie(value):
+        return any(marker in value for marker in ("c_user=", "sessionid=", "sb=", "datr="))
 
-    if line.upper().startswith("TOKEN|"):
-        token = line.split("|", 1)[1].strip()
-        return {
-            "type": "TOKEN", "uid": token[:15], "name": f"Token_{token[:8]}",
-            "pwd": "", "2fa": "", "cookie": token, "email": "", "proxy": "", "data": token
-        }
-
-    if line.upper().startswith("FACEBOOK|"):
-        parts = [part.strip() for part in line.split("|", 2)]
-        username = parts[1] if len(parts) > 1 else ""
+    prefix = parts[0].upper() if parts else ""
+    if prefix == "COOKIE":
+        recognized_indexes.add(0)
+        cookie = parts[1] if len(parts) > 1 else ""
+        if len(parts) > 1:
+            recognized_indexes.add(1)
+    elif prefix == "TOKEN":
+        recognized_indexes.add(0)
+        token = parts[1] if len(parts) > 1 else ""
+        if len(parts) > 1:
+            recognized_indexes.add(1)
+    elif prefix == "FACEBOOK":
+        recognized_indexes.add(0)
+        uid = parts[1] if len(parts) > 1 else ""
         password = parts[2] if len(parts) > 2 else ""
-        return {
-            "type": "RAW", "uid": username, "name": username or f"Nick_{idx}",
-            "pwd": password, "2fa": "", "cookie": "", "email": username if "@" in username else "",
-            "proxy": "", "data": line
-        }
+        recognized_indexes.update(index for index in (1, 2) if index < len(parts))
+        email = uid if "@" in uid else ""
+    elif len(parts) == 1:
+        value = parts[0]
+        if is_cookie(value):
+            cookie = value
+            recognized_indexes.add(0)
+        elif value.startswith(("EAAB", "EAAA")):
+            token = value
+            recognized_indexes.add(0)
+        else:
+            # Backward compatibility for raw, unclassified account input.
+            cookie = value
+    else:
+        uid = parts[0] if parts else ""
+        password = parts[1] if len(parts) > 1 else ""
+        fa2 = parts[2] if len(parts) > 2 else ""
+        recognized_indexes.update(index for index in (0, 1, 2) if index < len(parts))
 
-    # Trường hợp 1: Token EAAB / EAAA
-    if line.startswith("EAAB") or line.startswith("EAAA"):
-        token = line
-        uid = line[:15]
-        return {
-            "type": "TOKEN", "uid": uid, "name": f"Token_{line[:8]}", 
-            "pwd": "", "2fa": "", "cookie": token, "email": "", "proxy": "", "data": token
-        }
+        cookie_index = -1
+        for field_index, value in enumerate(parts):
+            if not value:
+                continue
+            if cookie_index < 0 and is_cookie(value):
+                cookie = value
+                cookie_index = field_index
+                recognized_indexes.add(field_index)
+            elif not token and value.startswith(("EAAB", "EAAA")):
+                token = value
+                recognized_indexes.add(field_index)
+            elif not email and "@" in value and "." in value:
+                email = value
+                recognized_indexes.add(field_index)
+            elif not proxy and parse_proxy(value):
+                proxy = value
+                recognized_indexes.add(field_index)
 
-    # Trường hợp 2: Cookie trần (Khách dán nguyên chuỗi Cookie có c_user=...)
-    if ("c_user=" in line or "sessionid=" in line or "datr=" in line) and "|" not in line:
-        cookie = line
-        m_fb = re.search(r'c_user=(\d+)', line)
-        m_tt = re.search(r'sessionid=([^;]+)', line)
-        uid = m_fb.group(1) if m_fb else (m_tt.group(1)[:10] if m_tt else "")
-        name = f"FB_{uid}" if uid else f"Nick_{idx}"
-        return {
-            "type": "COOKIE", "uid": uid, "name": name, 
-            "pwd": "", "2fa": "", "cookie": cookie, "email": "", "proxy": "", "data": cookie
-        }
+        # Lossless extended format: UID|PASSWORD|2FA|||COOKIE|TOKEN
+        if cookie_index == 5 and len(parts) > 6 and parts[6]:
+            token = parts[6]
+            recognized_indexes.add(6)
 
-    # Trường hợp 3: Chuỗi định dạng phân cách bởi dấu | (UID|Pass|2FA|Cookie|Email|Proxy)
-    if "|" in line:
-        parts = [p.strip() for p in line.split('|')]
-        for p in parts:
-            if p.startswith("EAAB") or p.startswith("EAAA"):
-                token = p
-            elif "c_user=" in p or "sessionid=" in p or "sb=" in p or "datr=" in p:
-                cookie = p
-                m = re.search(r'c_user=(\d+)', p)
-                if m and not uid: uid = m.group(1)
-            elif "@" in p and "." in p and not email:
-                email = p
-            elif p.isdigit() and len(p) >= 8 and not uid:
-                uid = p
-            elif len(p) in (16, 32) and p.isalnum() and not fa2 and not p.isdigit():
-                fa2 = p
-            elif ":" in p and any(c.isdigit() for c in p) and not proxy:
-                proxy = p
+    cookie_uid = re.search(r"c_user=(\d+)", cookie)
+    if not uid and cookie_uid:
+        uid = cookie_uid.group(1)
+    if prefix == "TOKEN" and not uid:
+        uid = token[:15]
 
-        cookie_index = next(
-            (index for index, part in enumerate(parts)
-             if "c_user=" in part or "sessionid=" in part or "sb=" in part or "datr=" in part),
-            -1,
-        )
-        if cookie_index >= 3:
-            uid = parts[0] or uid
-            pwd = parts[1]
-            fa2 = parts[2] or fa2
-        elif cookie_index == 1 and parts[0].isdigit() and not uid:
-            uid = parts[0]
+    account_type = "COOKIE" if cookie else ("TOKEN" if token else "RAW")
+    if prefix == "FACEBOOK":
+        account_type = "RAW"
+    if uid:
+        name = uid if prefix != "COOKIE" else f"FB_{uid}"
+    elif token:
+        name = f"Token_{token[:8]}"
 
-        # Nếu là dạng cơ bản UID|Pass|2FA
-        if not cookie and not token and len(parts) >= 2:
-            uid = parts[0] if not uid else uid
-            pwd = parts[1] if len(parts) > 1 else ""
-            fa2 = parts[2] if len(parts) > 2 and len(parts[2]) in (16, 32) else fa2
-
-        main_data = cookie or token or line
-        name = parts[0] if parts[0] and not parts[0].startswith("c_user") else (uid or f"Nick_{idx}")
-        return {
-            "type": "COOKIE" if cookie else ("TOKEN" if token else "RAW"),
-            "uid": uid, "name": name, "pwd": pwd, "2fa": fa2, "cookie": cookie or token, 
-            "email": email, "proxy": proxy, "data": main_data
-        }
-
-    # Mặc định dạng RAW
-    return {
-        "type": "RAW", "uid": f"ID_{idx}", "name": f"Nick_{idx}", 
-        "pwd": "", "2fa": "", "cookie": line, "email": "", "proxy": "", "data": line
+    unknown_fields = [
+        {"index": field_index, "value": value}
+        for field_index, value in enumerate(parts)
+        if field_index not in recognized_indexes and value
+    ]
+    result = {
+        "type": account_type,
+        "raw_line": raw_value,
+        "source_line": normalized_line,
+        "fields": exact_fields,
+        "unknown_fields": unknown_fields,
+        "uid": uid,
+        "name": name,
+        "pwd": password,
+        "password": password,
+        "2fa": fa2,
+        "cookie": cookie,
+        "token": token,
+        "email": email,
+        "proxy": proxy,
+        "data": cookie or token or account_line,
     }
+    result.update(metadata)
+    return result
+
+
+def serialize_account_line(account):
+    """Return the exact user-provided account line for lossless UI refresh/export."""
+    return str((account or {}).get("raw_line", ""))
+
+
+def serialize_account_lines(accounts):
+    return "\n".join(serialize_account_line(account) for account in accounts)
 
 class LicenseCheckDialog:
     def __init__(self, root, on_success):
@@ -985,28 +1500,17 @@ class ImportAccountDialog(tk.Toplevel):
 # [ĐOẠN TRƯỚC:]
 class MainToolApp:
     def auto_format_cookie_numbers(self, event=None):
-        """Chỉ chuẩn hóa số thứ tự khi người dùng dán hoặc click ra ngoài ô nhập"""
-        raw_text = self.txt_accounts.get("1.0", "end").strip()
-        if not raw_text:
+        """Refresh the numbered table without rewriting the raw account input."""
+        raw_text = self.txt_accounts.get("1.0", "end")
+        if not raw_text.strip():
             return
-
-        lines = [l.strip() for l in raw_text.splitlines() if l.strip() and not l.startswith("#")]
-        formatted_lines = []
-
-        for idx, line in enumerate(lines, 1):
-            parsed = parse_any_account_line(line, idx)
-            if parsed:
-                # Đảm bảo mỗi dòng có số thứ tự rõ ràng
-                formatted_lines.append(f"{idx}. {parsed['data']}")
-
-        result_text = "\n".join(formatted_lines) + "\n"
-        # Chỉ cập nhật lại nếu định dạng thực sự thay đổi
-        if result_text.strip() != raw_text:
-            self.txt_accounts.delete("1.0", "end")
-            self.txt_accounts.insert("1.0", result_text)
-            if hasattr(self, 'lbl_acc_count'):
-                self.lbl_acc_count.config(text=f"Tổng: {len(formatted_lines)} nick")
-            self.reload_table_from_text()
+        account_count = sum(
+            1 for line in raw_text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        if hasattr(self, 'lbl_acc_count'):
+            self.lbl_acc_count.config(text=f"Tổng: {account_count} nick")
+        self.reload_table_from_text()
 
     def __init__(self, root, expire_date):
         self.root = root
@@ -1027,6 +1531,12 @@ class MainToolApp:
         self.run_config = {}
         self.ui_queue = queue.Queue()
         self.close_requested = False
+        self.account_states = AccountStateStore()
+        self.account_log_context = contextvars.ContextVar("account_log_context", default=None)
+        self.global_logs = []
+        self.global_log_lock = threading.RLock()
+        self.selected_log_account = None
+        self.current_batch = 1
 
         self.theme_name = "Dark Charcoal (Mặc định)"
         self.current_theme = self.theme_name
@@ -1075,15 +1585,23 @@ class MainToolApp:
     def capture_run_config(self):
         """Read every Tk value once on the UI thread before automation starts."""
         checked_indexes = set()
+        resolved_proxies = {}
         for item in self.tree.get_children():
             values = self.tree.item(item, "values")
-            if values and values[0] == "[✔]" and str(values[1]).isdigit():
-                checked_indexes.add(int(values[1]))
+            if values and str(values[1]).isdigit():
+                account_index = int(values[1])
+                resolved_proxies[account_index] = values[8] if len(values) > 8 else ""
+                if values[0] == "[✔]":
+                    checked_indexes.add(account_index)
 
         min_delay = self._bounded_int(self.ent_min_delay.get(), 25, 0, 86400)
         max_delay = self._bounded_int(self.ent_max_delay.get(), 35, 0, 86400)
         min_page_delay = self._bounded_int(self.ent_min_page_delay.get(), 60, 0, 86400)
         max_page_delay = self._bounded_int(self.ent_max_page_delay.get(), 120, 0, 86400)
+        parsed_accounts = {
+            index: self.account_states.get(index)
+            for index in self.account_states.indexes()
+        }
 
         return {
             "accounts": self.txt_accounts.get("1.0", "end").strip(),
@@ -1091,7 +1609,10 @@ class MainToolApp:
             "targets": self.txt_targets.get("1.0", "end").strip(),
             "selected_indexes": self.ent_selected_indexes.get().strip(),
             "checked_indexes": checked_indexes,
+            "resolved_proxies": resolved_proxies,
+            "parsed_accounts": parsed_accounts,
             "threads": self._bounded_int(self.ent_threads.get(), 6, 1, 20),
+            "batch_size": self._bounded_int(self.ent_batch_size.get(), 5, 1, 10000),
             "proxy_ratio": self._bounded_int(self.ent_proxy_ratio.get(), 20, 1, 10000),
             "proxy_mode": self.proxy_mode.get(),
             "proxy_api": self.ent_proxy_api.get().strip(),
@@ -1100,6 +1621,9 @@ class MainToolApp:
             "min_delay": min(min_delay, max_delay),
             "max_delay": max(min_delay, max_delay),
             "page_target": self._bounded_int(self.ent_page_target.get(), 5, 1, 100),
+            "max_create_page_workers": self._bounded_int(
+                self.ent_max_create_page_workers.get(), 3, 1, 10
+            ),
             "min_page_delay": min(min_page_delay, max_page_delay),
             "max_page_delay": max(min_page_delay, max_page_delay),
             "feed_surf_min": self._bounded_int(self.ent_feed_surf_min.get(), 10, 0, 1440),
@@ -1173,7 +1697,7 @@ class MainToolApp:
             relief="flat",
             cursor="hand2",
             command=lambda: threading.Thread(
-                target=lambda: check_for_updates(self),
+                target=lambda: check_for_updates(self, manual=True),
                 daemon=True,
             ).start(),
         ).pack(side="left", padx=5)
@@ -1385,7 +1909,20 @@ class MainToolApp:
         card_log = tk.Frame(paned_left, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
         paned_left.add(card_log, minsize=100, height=180)
 
-        tk.Label(card_log, text="📜 NHẬT KÝ HOẠT ĐỘNG", font=("Segoe UI", 9, "bold"), fg="#38BDF8", bg="#131C2E").pack(anchor="w", pady=(0, 2))
+        f_log_head = tk.Frame(card_log, bg="#131C2E")
+        f_log_head.pack(fill="x", pady=(0, 2))
+        self.lbl_log_scope = tk.Label(f_log_head, text="📜 NHẬT KÝ TỔNG", font=("Segoe UI", 9, "bold"), fg="#38BDF8", bg="#131C2E")
+        self.lbl_log_scope.pack(side="left")
+        tk.Button(
+            f_log_head,
+            text="Log tổng",
+            font=("Segoe UI", 7, "bold"),
+            bg="#1E293B",
+            fg="#CBD5E1",
+            relief="flat",
+            cursor="hand2",
+            command=self.show_global_log,
+        ).pack(side="right")
         self.txt_log = scrolledtext.ScrolledText(card_log, bg="#070B14", fg="#00FF66", font=("Consolas", 9), insertbackground="#38BDF8", relief="solid", bd=1, state="disabled")
         self.txt_log.pack(fill="both", expand=True)
 
@@ -1441,39 +1978,50 @@ class MainToolApp:
         self.lbl_proxy_count.pack(side="left")
         tk.Button(f2_bot, text="🗑 Xóa tất cả", font=("Segoe UI", 8), bg="#131C2E", fg="#F87171", relief="flat", cursor="hand2", command=lambda: self.txt_proxies.delete("1.0", "end")).pack(side="right")
 
-        # R2: Queue and proxy allocation summary
+        # R2: Trạng thái tài khoản và điều hướng theo đợt
         card_reg = tk.Frame(paned_right, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
-        paned_right.add(card_reg, minsize=105, height=120)
+        paned_right.add(card_reg, minsize=180, height=220)
 
         f_reg_head = tk.Frame(card_reg, bg="#131C2E")
-        f_reg_head.pack(fill="x", pady=(0, 4))
-        tk.Label(f_reg_head, text="⇄ 4. HÀNG ĐỢI & PHÂN BỔ PROXY", font=("Segoe UI", 9, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
-        tk.Button(
-            f_reg_head,
-            text="Làm mới ghép proxy",
-            font=("Segoe UI", 8, "bold"),
-            bg="#1E293B",
-            fg="#F8FAFC",
-            relief="flat",
-            cursor="hand2",
-            command=self.reload_table_from_text,
-        ).pack(side="right")
+        f_reg_head.pack(fill="x", pady=(0, 3))
+        tk.Label(f_reg_head, text="⇄ 4. TRẠNG THÁI TÀI KHOẢN", font=("Segoe UI", 9, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
+        tk.Label(f_reg_head, text="Số tài khoản/đợt:", font=("Segoe UI", 8), fg="#94A3B8", bg="#131C2E").pack(side="left", padx=(12, 2))
+        self.ent_batch_size = tk.Entry(f_reg_head, width=4, font=("Segoe UI", 8, "bold"), bg="#070B14", fg="#38BDF8", justify="center", relief="solid", bd=1)
+        self.ent_batch_size.insert(0, "5")
+        self.ent_batch_size.pack(side="left")
+        self.ent_batch_size.bind("<FocusOut>", lambda _event: self.refresh_account_state_table(reset_batch=True))
+
+        f_batch_nav = tk.Frame(card_reg, bg="#131C2E")
+        f_batch_nav.pack(fill="x", pady=(0, 3))
+        tk.Button(f_batch_nav, text="◀ Đợt trước", font=("Segoe UI", 7, "bold"), bg="#1E293B", fg="#E2E8F0", relief="flat", cursor="hand2", command=lambda: self.change_batch(-1)).pack(side="left")
+        self.lbl_batch_info = tk.Label(f_batch_nav, text="Đợt 0 / 0", font=("Segoe UI", 8, "bold"), fg="#FACC15", bg="#131C2E")
+        self.lbl_batch_info.pack(side="left", expand=True)
+        tk.Button(f_batch_nav, text="Đợt sau ▶", font=("Segoe UI", 7, "bold"), bg="#1E293B", fg="#E2E8F0", relief="flat", cursor="hand2", command=lambda: self.change_batch(1)).pack(side="right")
+
+        state_columns = ("stt", "account", "status", "action")
+        self.account_state_tree = ttk.Treeview(card_reg, columns=state_columns, show="headings", selectmode="browse", height=5)
+        self.account_state_tree.heading("stt", text="STT")
+        self.account_state_tree.heading("account", text="Tài khoản")
+        self.account_state_tree.heading("status", text="Trạng thái")
+        self.account_state_tree.heading("action", text="Tác vụ hiện tại")
+        self.account_state_tree.column("stt", width=40, anchor="center", stretch=False)
+        self.account_state_tree.column("account", width=120, anchor="w")
+        self.account_state_tree.column("status", width=105, anchor="center", stretch=False)
+        self.account_state_tree.column("action", width=190, anchor="w")
+        for status, color in ACCOUNT_STATUS_COLORS.items():
+            self.account_state_tree.tag_configure(status, foreground=color)
+        self.account_state_tree.pack(fill="both", expand=True)
+        self.account_state_tree.bind("<<TreeviewSelect>>", self.on_account_state_selected)
+
         self.lbl_queue_info = tk.Label(
             card_reg,
-            text="Danh sách 50–100 tài khoản sẽ chạy theo hàng đợi. Mỗi tài khoản được gắn proxy trước khi bắt đầu.",
-            font=("Segoe UI", 8),
+            text="Tổng: 0 • LIVE: 0 • DIE: 0 • ERROR: 0",
+            font=("Segoe UI", 7),
             fg="#CBD5E1",
             bg="#131C2E",
-            justify="left",
+            anchor="w",
         )
-        self.lbl_queue_info.pack(anchor="w", pady=(8, 2))
-        tk.Label(
-            card_reg,
-            text="Khuyến nghị 4–12 trình duyệt đồng thời; giới hạn bảo vệ của ứng dụng là 20.",
-            font=("Segoe UI", 8, "bold"),
-            fg="#F59E0B",
-            bg="#131C2E",
-        ).pack(anchor="w")
+        self.lbl_queue_info.pack(fill="x", pady=(3, 0))
 
         # R3: Card Nuôi Nick Chống Checkpoint
         card4 = tk.Frame(paned_right, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
@@ -1578,6 +2126,10 @@ class MainToolApp:
         self.ent_watch_review_min = tk.Entry(f5_page_warmup, width=4, font=("Segoe UI", 8), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
         self.ent_watch_review_min.insert(0, "5")
         self.ent_watch_review_min.pack(side="left", padx=2)
+        tk.Label(f5_page_warmup, text="Luồng tạo Page:", font=("Segoe UI", 8), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(10, 2))
+        self.ent_max_create_page_workers = tk.Entry(f5_page_warmup, width=3, font=("Segoe UI", 8), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
+        self.ent_max_create_page_workers.insert(0, "3")
+        self.ent_max_create_page_workers.pack(side="left", padx=2)
         # Ô nhập STT rải rác hoặc dải số (ví dụ: 1, 3, 5-8)
         f_filter_idx = tk.Frame(f_bottom_right, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=6, pady=3)
         f_filter_idx.pack(fill="x", pady=(0, 4))
@@ -1721,6 +2273,152 @@ class MainToolApp:
         total = len(self.tree.get_children())
         self.lbl_footer_status.config(text=f"Tổng số nick: {total} | Sẵn sàng hoạt động.")
 
+    def get_batch_size(self):
+        if not hasattr(self, "ent_batch_size"):
+            return 5
+        return self._bounded_int(self.ent_batch_size.get(), 5, 1, 10000)
+
+    def refresh_account_state_table(self, reset_batch=False):
+        if not hasattr(self, "account_state_tree"):
+            return
+        batches = split_account_batches(self.account_states.indexes(), self.get_batch_size())
+        if reset_batch:
+            self.current_batch = 1
+        total_batches = len(batches)
+        if total_batches == 0:
+            self.current_batch = 1
+            visible_indexes = []
+        else:
+            self.current_batch = max(1, min(self.current_batch, total_batches))
+            visible_indexes = batches[self.current_batch - 1]
+
+        selected_index = self.selected_log_account
+        for item in self.account_state_tree.get_children():
+            self.account_state_tree.delete(item)
+        for index in visible_indexes:
+            state = self.account_states.get(index)
+            if state is None:
+                continue
+            item_id = f"account_state_{index}"
+            self.account_state_tree.insert(
+                "",
+                "end",
+                iid=item_id,
+                values=(
+                    state["stt"],
+                    state["account_id"],
+                    ACCOUNT_STATUS_LABELS[state["status"]],
+                    state["current_action"],
+                ),
+                tags=(state["status"],),
+            )
+            if selected_index == index:
+                self.account_state_tree.selection_set(item_id)
+
+        self.lbl_batch_info.config(
+            text=f"Đợt {self.current_batch if total_batches else 0} / {total_batches}"
+        )
+        self.refresh_state_summary()
+
+    def refresh_account_state_row(self, index):
+        if not hasattr(self, "account_state_tree"):
+            return
+        item_id = f"account_state_{int(index)}"
+        if not self.account_state_tree.exists(item_id):
+            self.refresh_state_summary()
+            return
+        state = self.account_states.get(index)
+        if state is None:
+            return
+        self.account_state_tree.item(
+            item_id,
+            values=(
+                state["stt"],
+                state["account_id"],
+                ACCOUNT_STATUS_LABELS[state["status"]],
+                state["current_action"],
+            ),
+            tags=(state["status"],),
+        )
+        self.refresh_state_summary()
+
+    def refresh_state_summary(self):
+        summary = self.account_states.summary()
+        total = sum(summary.values())
+        if hasattr(self, "lbl_queue_info"):
+            self.lbl_queue_info.config(
+                text=(
+                    f"Tổng: {total} • LIVE: {summary['LIVE']} • "
+                    f"DIE: {summary['DIE']} • ERROR: {summary['ERROR']}"
+                )
+            )
+        if hasattr(self, "lbl_stat_running"):
+            self.lbl_stat_running.config(text=str(summary["CHECKING"]))
+            self.lbl_stat_success.config(text=str(summary["LIVE"]))
+            self.lbl_stat_failed.config(text=str(summary["DIE"] + summary["ERROR"]))
+
+    def change_batch(self, offset):
+        total_batches = len(split_account_batches(self.account_states.indexes(), self.get_batch_size()))
+        if total_batches == 0:
+            return
+        self.current_batch = max(1, min(total_batches, self.current_batch + int(offset)))
+        self.refresh_account_state_table()
+
+    def show_batch(self, batch_number):
+        self.current_batch = max(1, int(batch_number))
+        self.refresh_account_state_table()
+
+    def on_account_state_selected(self, _event=None):
+        selection = self.account_state_tree.selection()
+        if not selection:
+            return
+        match = re.fullmatch(r"account_state_(\d+)", selection[0])
+        if not match:
+            return
+        self.selected_log_account = int(match.group(1))
+        self.render_log_view()
+
+    def show_global_log(self):
+        self.selected_log_account = None
+        if hasattr(self, "account_state_tree"):
+            selection = self.account_state_tree.selection()
+            if selection:
+                self.account_state_tree.selection_remove(*selection)
+        self.render_log_view()
+
+    def render_log_view(self):
+        if not hasattr(self, "txt_log"):
+            return
+        if self.selected_log_account is None:
+            with self.global_log_lock:
+                lines = list(self.global_logs)
+            title = "📜 NHẬT KÝ TỔNG"
+        else:
+            state = self.account_states.get(self.selected_log_account)
+            lines = state["logs"] if state else []
+            account_label = state["account_id"] if state else str(self.selected_log_account)
+            title = f"📜 NHẬT KÝ: {account_label}"
+
+        self.lbl_log_scope.config(text=title)
+        self.txt_log.config(state="normal")
+        self.txt_log.delete("1.0", "end")
+        if lines:
+            self.txt_log.insert("1.0", "\n".join(lines) + "\n")
+        self.txt_log.see("end")
+        self.txt_log.config(state="disabled")
+
+    def set_account_state(self, index, status=None, current_action=None):
+        self.account_states.update(index, status=status, current_action=current_action)
+        self.post_ui(lambda idx=int(index): self.refresh_account_state_row(idx))
+
+    def set_account_failure(self, index, failure_kind, reason):
+        status = self.account_states.set_failure(index, failure_kind, reason)
+        self.post_ui(lambda idx=int(index): [
+            self.refresh_account_state_row(idx),
+            self.render_log_view() if self.selected_log_account == idx else None,
+        ])
+        return status
+
     def get_targets_for_mode(self, targets, mode, known_modes=None):
         """Lọc target theo prefix mode, vẫn hỗ trợ danh sách cũ không có prefix."""
         scoped_targets = []
@@ -1740,12 +2438,17 @@ class MainToolApp:
             if self.tree.exists(item_id):
                 vals = list(self.tree.item(item_id, "values"))
                 msg_parts = []
+                account_state = None
+                if str(item_id).isdigit():
+                    account_state = self.account_states.get(int(item_id))
+                if account_state:
+                    msg_parts.append(ACCOUNT_STATUS_LABELS[account_state["status"]])
                 # Gom các thông tin phụ vào chung cột Status để không đè lên Cookie/Email/Proxy
                 if current_friends is not None:
                     msg_parts.append(f"Bạn bè: {current_friends}")
                 if sent_today is not None:
                     msg_parts.append(f"Đã gửi: {sent_today}")
-                if status is not None:
+                if status is not None and not account_state:
                     msg_parts.append(status)
                 
                 if msg_parts:
@@ -1753,18 +2456,31 @@ class MainToolApp:
                 self.tree.item(item_id, values=vals)
         self.post_ui(_update)
 
-    def log(self, text):
-        """Ghi log an toàn từ các luồng"""
-        def _append():
-            self.txt_log.config(state="normal")
-            self.txt_log.insert("end", f"{text}\n")
-            line_count = int(self.txt_log.index("end-1c").split(".")[0])
-            if line_count > 5000:
-                self.txt_log.delete("1.0", f"{line_count - 4500}.0")
-            self.txt_log.see("end")
-            self.txt_log.config(state="disabled")
+    def log(self, text, account_index=None):
+        """Route log vào đúng tài khoản hiện tại hoặc nhật ký tổng."""
+        resolved_index = account_index
+        if resolved_index is None:
+            resolved_index = self.account_log_context.get()
+        message = str(text)
 
-        self.post_ui(_append)
+        if resolved_index is not None and self.account_states.get(resolved_index) is not None:
+            current_action = None
+            stripped = message.lstrip()
+            if stripped.startswith(("[*]", "[🚀]", "[⏳]")):
+                current_action = re.sub(r"^\[[^\]]+\]\s*", "", stripped)
+                current_action = re.sub(r"^\[[^\]]+\]\s*", "", current_action)[:160]
+            self.account_states.append_log(resolved_index, message, current_action=current_action)
+            self.post_ui(lambda idx=int(resolved_index): [
+                self.refresh_account_state_row(idx),
+                self.render_log_view() if self.selected_log_account == idx else None,
+            ])
+            return
+
+        with self.global_log_lock:
+            self.global_logs.append(message)
+            if len(self.global_logs) > 5000:
+                del self.global_logs[:-4500]
+        self.post_ui(lambda: self.render_log_view() if self.selected_log_account is None else None)
 
 
     async def take_error_snapshot(self, page, acc_name, reason):
@@ -1870,11 +2586,13 @@ class MainToolApp:
             "proxy_mode": self.proxy_mode.get(),
             "proxy_ratio": self.ent_proxy_ratio.get(),
             "threads": self.ent_threads.get(),
+            "batch_size": self.ent_batch_size.get(),
             "headless": self.chk_headless.get(),
             "warmup": self.chk_warmup.get(),
             "cancel_old": self.chk_cancel_old.get(),
             "target": self.ent_target.get(),
             "page_target": self.ent_page_target.get() if hasattr(self, 'ent_page_target') else "5",
+            "max_create_page_workers": self.ent_max_create_page_workers.get() if hasattr(self, 'ent_max_create_page_workers') else "3",
             "min_page_delay": self.ent_min_page_delay.get() if hasattr(self, 'ent_min_page_delay') else "60",
             "max_page_delay": self.ent_max_page_delay.get() if hasattr(self, 'ent_max_page_delay') else "120",
             "min_delay": self.ent_min_delay.get(),
@@ -1914,6 +2632,7 @@ class MainToolApp:
             if "proxy_mode" in data: self.proxy_mode.set(data["proxy_mode"])
             if "proxy_ratio" in data: self.ent_proxy_ratio.delete(0, "end"); self.ent_proxy_ratio.insert(0, data["proxy_ratio"])
             if "threads" in data: self.ent_threads.delete(0, "end"); self.ent_threads.insert(0, data["threads"])
+            if "batch_size" in data: self.ent_batch_size.delete(0, "end"); self.ent_batch_size.insert(0, data["batch_size"])
             if "headless" in data: self.chk_headless.set(data["headless"])
             if "warmup" in data: self.chk_warmup.set(data["warmup"])
             if "cancel_old" in data: self.chk_cancel_old.set(data["cancel_old"])
@@ -1921,6 +2640,9 @@ class MainToolApp:
             if "page_target" in data and hasattr(self, 'ent_page_target'):
                 self.ent_page_target.delete(0, "end")
                 self.ent_page_target.insert(0, data["page_target"])
+            if "max_create_page_workers" in data and hasattr(self, 'ent_max_create_page_workers'):
+                self.ent_max_create_page_workers.delete(0, "end")
+                self.ent_max_create_page_workers.insert(0, data["max_create_page_workers"])
 
             if "min_page_delay" in data and hasattr(self, 'ent_min_page_delay'):
                 self.ent_min_page_delay.delete(0, "end")
@@ -2017,14 +2739,28 @@ class MainToolApp:
         for item in self.tree.get_children():
             self.tree.delete(item)
 
-        raw_acc_lines = [l.strip() for l in self.txt_accounts.get("1.0", "end").splitlines() if l.strip() and not l.startswith("#")]
+        raw_acc_lines = [
+            line for line in self.txt_accounts.get("1.0", "end").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
         proxy_lines = [p.strip() for p in self.txt_proxies.get("1.0", "end").splitlines() if p.strip() and not p.startswith("#")]
         ratio = int(self.ent_proxy_ratio.get()) if self.ent_proxy_ratio.get().isdigit() else 20
+        account_records = []
 
         for idx, line in enumerate(raw_acc_lines, 1):
             parsed = parse_any_account_line(line, idx)
             if not parsed:
                 continue
+            account_record = dict(parsed)
+            account_record.update({
+                "stt": idx,
+                "account_id": parsed["uid"] or parsed["name"] or f"Tài khoản {idx}",
+                "country": parsed.get("country", ""),
+                "locale": parsed.get("locale", "AUTO"),
+                "timezone": parsed.get("timezone", ""),
+                "proxy": "",
+            })
+            account_records.append(account_record)
 
             assigned_proxy = parsed["proxy"] or "Không dùng"
             if assigned_proxy == "Không dùng" and proxy_lines:
@@ -2041,6 +2777,8 @@ class MainToolApp:
                     proxy_idx = (idx - 1) // ratio
                     assigned_proxy = proxy_lines[proxy_idx] if proxy_idx < len(proxy_lines) else proxy_lines[-1]
 
+            account_records[-1]["proxy"] = "" if assigned_proxy == "Không dùng" else assigned_proxy
+
             # Điền đúng thứ tự 10 cột: Checkbox, STT, UID, Tên, Password, 2FA Key, Cookie, Email, Proxy, Status
             # Thêm cột đầu tiên là checkbox [✔] mặc định
             self.tree.insert("", "end", iid=str(idx), values=(
@@ -2053,19 +2791,24 @@ class MainToolApp:
                 parsed["cookie"], 
                 parsed["email"], 
                 assigned_proxy, 
-                "Sẵn sàng"
+                "CHƯA KIỂM TRA"
             ))
+
+        self.account_states.sync(account_records)
+        for index in self.account_states.indexes():
+            item_id = str(index)
+            state = self.account_states.get(index)
+            if self.tree.exists(item_id) and state:
+                values = list(self.tree.item(item_id, "values"))
+                values[9] = ACCOUNT_STATUS_LABELS[state["status"]]
+                self.tree.item(item_id, values=values)
+        self.refresh_account_state_table(reset_batch=True)
         
         if hasattr(self, 'lbl_stat_total'):
             self.lbl_stat_total.config(text=str(len(self.tree.get_children())))
         if hasattr(self, 'lbl_proxy_count'):
             valid_proxy_count = sum(1 for proxy in proxy_lines if parse_proxy(proxy))
             self.lbl_proxy_count.config(text=f"Tổng: {len(proxy_lines)} proxy • Hợp lệ: {valid_proxy_count}")
-        if hasattr(self, 'lbl_queue_info'):
-            self.lbl_queue_info.config(
-                text=f"Hàng đợi: {len(raw_acc_lines)} tài khoản • Proxy: {len(proxy_lines)} • "
-                     f"Chế độ: {self.proxy_mode.get()}"
-            )
         if hasattr(self, "lbl_tree_empty"):
             if self.tree.get_children():
                 self.lbl_tree_empty.place_forget()
@@ -2311,31 +3054,61 @@ class MainToolApp:
             settings_url = page_url.rstrip('/') + "/settings/?tab=profile_access"
             await page.goto(settings_url, wait_until="domcontentloaded", timeout=40000)
             await asyncio.sleep(4)
+            if not page_reference_matches(page_url, page.url):
+                self.log(
+                    f"[-] [{acc_name}] Trang cài đặt không khớp Page được giao; dừng để tránh ghép nhầm."
+                )
+                return 0
 
             # Bấm Thêm người mới (Add new)
-            add_btn = page.locator('div[role="button"]:has-text("Thêm mới"), div[role="button"]:has-text("Add new"), div[aria-label="Thêm mới"]').first
+            add_btn = page.locator(
+                'div[role="main"] button[data-testid*="profile_access" i][data-testid*="add" i], '
+                'div[role="main"] [role="button"][data-action*="profile_access" i][data-action*="add" i]'
+            ).first
+            if await add_btn.count() == 0:
+                add_btn = page.get_by_role(
+                    "button", name=ADD_PAGE_ADMIN_BUTTON_PATTERN
+                ).first
             if await add_btn.count() > 0 and await add_btn.is_visible():
                 await add_btn.click()
                 await asyncio.sleep(2)
                 
-                next_btn = page.locator('div[role="button"]:has-text("Tiếp"), div[role="button"]:has-text("Next")').first
+                next_btn = page.locator(
+                    'div[role="dialog"] button[type="submit"]:visible'
+                ).first
+                if await next_btn.count() == 0:
+                    next_btn = page.get_by_role("button", name=NEXT_BUTTON_PATTERN).first
                 if await next_btn.count() > 0: await next_btn.click()
                 await asyncio.sleep(2)
 
                 # Tìm và chọn UID/Tên cần phân quyền
-                search_input = page.locator('input[placeholder*="Tìm kiếm"], input[placeholder*="Search"]').first
+                search_input = page.locator(
+                    'div[role="dialog"] input[type="search"], '
+                    'div[role="dialog"] input[role="combobox"], '
+                    'div[role="dialog"] input[type="text"]'
+                ).first
                 if await search_input.count() > 0:
                     await search_input.fill(target_uid_or_name)
                     await asyncio.sleep(3)
                     
                     user_res = page.locator('div[role="listbox"] div[role="option"]').first
                     if await user_res.count() == 0:
-                        user_res = page.get_by_text(target_uid_or_name, exact=False).first
-                    if await user_res.count() > 0:
+                        user_res = page.get_by_text(target_uid_or_name, exact=True).first
+                    target_verified = (
+                        await user_res.count() > 0
+                        and await locator_matches_account_target(user_res, target_uid_or_name)
+                    )
+                    if target_verified:
                         await user_res.click()
                         await asyncio.sleep(2)
 
-                        give_access = page.locator('div[role="button"]:has-text("Cấp quyền truy cập"), div[role="button"]:has-text("Give access")').first
+                        give_access = page.locator(
+                            'div[role="dialog"] button[type="submit"]:visible'
+                        ).first
+                        if await give_access.count() == 0:
+                            give_access = page.get_by_role(
+                                "button", name=GIVE_ACCESS_BUTTON_PATTERN
+                            ).first
                         if await give_access.count() > 0:
                             await give_access.click()
                             await asyncio.sleep(3)
@@ -2358,6 +3131,32 @@ class MainToolApp:
                                 )
                                 return 0
 
+                            action_completed = False
+                            try:
+                                action_completed = (
+                                    await give_access.count() == 0
+                                    or not await give_access.is_visible()
+                                )
+                            except Exception:
+                                action_completed = False
+
+                            if str(target_uid_or_name).isdigit():
+                                escaped_target = re.escape(str(target_uid_or_name))
+                                target_evidence = page.locator(
+                                    f'a[href*="id={escaped_target}"], '
+                                    f'a[href*="/{escaped_target}"]'
+                                ).first
+                            else:
+                                target_evidence = page.get_by_text(
+                                    target_uid_or_name, exact=True
+                                ).first
+                            target_still_verified = (
+                                await target_evidence.count() > 0
+                                and await locator_matches_account_target(
+                                    target_evidence, target_uid_or_name
+                                )
+                            )
+                            page_still_matches = page_reference_matches(page_url, page.url)
                             result_text = ""
                             feedback = page.locator('[role="alert"], [role="status"], [role="dialog"]')
                             if await feedback.count() > 0:
@@ -2365,9 +3164,14 @@ class MainToolApp:
                                     result_text = (await feedback.last.inner_text(timeout=1500)).casefold()
                                 except Exception:
                                     result_text = ""
-                            confirmed = any(message in result_text for message in (
+                            text_confirmed = any(message in result_text for message in (
                                 "đã gửi lời mời", "invitation sent", "đang chờ", "pending"
                             ))
+                            confirmed = bool(
+                                page_still_matches
+                                and target_still_verified
+                                and (action_completed or text_confirmed)
+                            )
                             append_csv_result(
                                 "page_admin_jobs.csv",
                                 ["time", "account", "page_url", "admin", "status"],
@@ -2387,6 +3191,11 @@ class MainToolApp:
                                 "đã lưu để kiểm tra."
                             )
                             return 0
+                    else:
+                        self.log(
+                            f"[-] [{acc_name}] Kết quả tìm kiếm không khớp account đích "
+                            f"'{target_uid_or_name}'; không cấp quyền."
+                        )
             self.log(f"[-] [{acc_name}] Không tìm thấy mục quản lý quyền Page.")
         except Exception as e:
             self.log(f"[-] [{acc_name}] Lỗi phân quyền Admin Page: {e}")
@@ -2789,10 +3598,10 @@ class MainToolApp:
 # [KẾT THÚC DÁN HÀM REG]
 
 
-    async def login_facebook_user_pass(self, page, username, password):
+    async def login_facebook_user_pass(self, page, context, username, password):
         """Đăng nhập Facebook bằng tài khoản và mật khẩu đã được parse."""
         if not username or not password:
-            return False
+            return LOGIN_TECHNICAL_ERROR, "Thiếu tài khoản hoặc mật khẩu"
 
         self.log(f"[*] Đang đăng nhập Facebook cho tài khoản: {username}...")
         try:
@@ -2803,20 +3612,20 @@ class MainToolApp:
             login_btn = page.locator('button[name="login"], button[type="submit"]').first
             if await login_btn.count() == 0:
                 self.log(f"[-] [{username}] Không tìm thấy nút đăng nhập Facebook.")
-                return False
+                return LOGIN_TECHNICAL_ERROR, "Không tìm thấy nút đăng nhập Facebook"
 
             await login_btn.click()
             await page.wait_for_timeout(5000)
-            final_url = page.url.lower()
-            if "login" in final_url or "checkpoint" in final_url:
-                self.log(f"[-] [{username}] Đăng nhập Facebook thất bại hoặc cần xác minh.")
-                return False
+            is_valid_session, session_detail = await self.verify_facebook_session(page, context)
+            if not is_valid_session:
+                self.log(f"[-] [{username}] Đăng nhập Facebook chưa hợp lệ: {session_detail}.")
+                return LOGIN_INVALID, session_detail
 
-            self.log(f"[✔] [{username}] Đăng nhập Facebook thành công.")
-            return True
+            self.log(f"[✔] [{username}] {session_detail}.")
+            return LOGIN_SUCCESS, session_detail
         except Exception as e:
             self.log(f"[-] [{username}] Lỗi đăng nhập Facebook: {e}")
-            return False
+            return LOGIN_TECHNICAL_ERROR, f"{type(e).__name__}: {e}"
 
     async def login_tiktok_user_pass(self, page, username, password):
         """Tự động đăng nhập TikTok bằng Username/Email và Password"""
@@ -3000,7 +3809,15 @@ class MainToolApp:
         # Thống kê cuối phiên
         self.log(f"[SUMMARY] [{acc_name}] Ngâm Feed hoàn tất: Cuộn={stats['scrolls']} lần, Thích={stats['likes']} bài, Lỗi={stats['errors']}.")
 
-    async def create_browser_page(self, playwright_instance, idx, proxy_cfg=None, is_headless=False):
+    async def create_browser_page(
+        self,
+        playwright_instance,
+        idx,
+        proxy_cfg=None,
+        is_headless=False,
+        account_locale="AUTO",
+        account_timezone="",
+    ):
         """
         Khởi tạo Browser + Context + Page.
         Tính năng: Tự động chia khung Grid, Retry khởi tạo, Health check.
@@ -3039,6 +3856,7 @@ class MainToolApp:
         # 2. CHUẨN BỊ THAM SỐ LAUNCH & ẨN DANH
         # ==================================================
         browser_exe = get_installed_browser_path()
+        locale_options = browser_locale_options(account_locale)
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--disable-dev-shm-usage",
@@ -3048,11 +3866,12 @@ class MainToolApp:
             "--disable-features=TranslateUI",
             "--no-default-browser-check",
             "--no-first-run",
-            "--lang=vi",  # Ép ngôn ngữ trình duyệt là tiếng Việt
             "--enable-translate",
             f"--window-position={pos_x},{pos_y}",
             f"--window-size={win_w},{win_h}",
         ]
+        if locale_options["lang_arg"]:
+            launch_args.append(f"--lang={locale_options['lang_arg']}")
 
         launch_kwargs = {
             "headless": is_headless,
@@ -3078,15 +3897,16 @@ class MainToolApp:
 
         try:
             # Dùng no_viewport=True để Facebook nhận diện đây là cửa sổ thật
-            context = await browser.new_context(
-                no_viewport=True,
-                locale="vi-VN",
-                timezone_id="Asia/Ho_Chi_Minh",
-                extra_http_headers={
-                    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"  # Ưu tiên tiếng Việt hàng đầu
-                },
-                ignore_https_errors=False,
-            )
+            context_options = {"no_viewport": True, "ignore_https_errors": False}
+            if locale_options["locale"]:
+                context_options["locale"] = locale_options["locale"]
+                context_options["extra_http_headers"] = {
+                    "Accept-Language": locale_options["accept_language"]
+                }
+            normalized_timezone = normalize_account_timezone(account_timezone)
+            if normalized_timezone:
+                context_options["timezone_id"] = normalized_timezone
+            context = await browser.new_context(**context_options)
             page = await context.new_page()
 
             # Test a real HTTPS route so a dead/auth-failed proxy cannot pass on about:blank.
@@ -3396,34 +4216,56 @@ class MainToolApp:
             "tạm thời bị chặn", "temporarily blocked",
         )
         before_count = await page.locator(FRIEND_REQUEST_SENT_SELECTORS).count()
+        before_state = []
+        for attribute in ("aria-label", "aria-pressed", "aria-disabled", "data-testid"):
+            try:
+                before_state.append(await button.get_attribute(attribute) or "")
+            except Exception:
+                before_state.append("")
+        try:
+            before_state.append(await button.inner_text(timeout=500) or "")
+        except Exception:
+            before_state.append("")
+        before_state = tuple(before_state)
         await button.click(timeout=5000)
 
+        stable_changed_polls = 0
         for _ in range(8):
             await asyncio.sleep(0.5)
-            try:
-                label = " ".join(filter(None, [
-                    await button.get_attribute("aria-label"),
-                    await button.inner_text(timeout=500),
-                ])).casefold()
-                if any(text in label for text in (
-                    "hủy lời mời", "hủy yêu cầu", "cancel request", "request sent"
-                )):
-                    return True, "Facebook đã đổi trạng thái nút"
-            except Exception:
-                pass
-
-            after_count = await page.locator(FRIEND_REQUEST_SENT_SELECTORS).count()
-            if after_count > before_count:
-                return True, "Facebook đã hiển thị trạng thái đã gửi"
-
+            has_feedback_overlay = False
             alerts = page.locator('[role="alert"], [role="dialog"]')
             if await alerts.count() > 0:
+                has_feedback_overlay = True
                 try:
                     alert_text = (await alerts.last.inner_text(timeout=500)).casefold()
                     if any(phrase in alert_text for phrase in blocked_phrases):
                         return False, alert_text[:160]
                 except Exception:
                     pass
+
+            try:
+                if await button.count() == 0 or not await button.is_visible():
+                    if not has_feedback_overlay:
+                        return True, "Facebook đã thay thế nút gửi lời mời"
+                    continue
+
+                current_state = []
+                for attribute in ("aria-label", "aria-pressed", "aria-disabled", "data-testid"):
+                    current_state.append(await button.get_attribute(attribute) or "")
+                current_state.append(await button.inner_text(timeout=500) or "")
+                current_state = tuple(current_state)
+                if current_state != before_state and any(current_state):
+                    stable_changed_polls += 1
+                    if stable_changed_polls >= 2 and not has_feedback_overlay:
+                        return True, "Facebook đã đổi trạng thái nút"
+                else:
+                    stable_changed_polls = 0
+            except Exception:
+                pass
+
+            after_count = await page.locator(FRIEND_REQUEST_SENT_SELECTORS).count()
+            if after_count > before_count:
+                return True, "Facebook đã hiển thị trạng thái đã gửi"
 
         return False, "không thấy trạng thái xác nhận sau khi bấm"
 
@@ -3513,13 +4355,47 @@ class MainToolApp:
                 await asyncio.sleep(random.uniform(1.0, 1.5))
 
         return False
-    async def run_create_page(self, page, context, acc_name, idx, targets=None, max_pages=5, min_page_del=60, max_page_del=120):
+    async def run_create_page(
+        self,
+        page,
+        context,
+        acc_name,
+        idx,
+        targets=None,
+        max_pages=5,
+        min_page_del=60,
+        max_page_del=120,
+        resolved_proxy="",
+    ):
         """
         Tạo Fanpage: Tích hợp check Checkpoint, đa tầng Selector, xử lý Stale Element (DOM refresh), 
         kiểm tra iframe, focus trước khi gõ và chụp ảnh debug.
         """
         created_count = 0
-        created_pages = []
+        results = []
+
+        def record_result(result):
+            results.append(result)
+            try:
+                save_create_page_outcome(result)
+                append_create_page_account_log(
+                    idx,
+                    acc_name,
+                    f"[{result['status']}][PAGE_FLOW] "
+                    f"{result['page_name']} | {result['reason'] or result['technical_error'] or result['page_url'] or result['page_id']}",
+                )
+            except OSError as exc:
+                self.log(f"[ERROR] [{acc_name}] Không ghi được kết quả Create Page: {exc}")
+            return result
+
+        valid_targets, validation_error = validate_create_page_targets(targets, max_pages)
+        if not valid_targets:
+            record_result(build_create_page_result(
+                "FAILED", acc_name, "", "", reason=validation_error,
+                account_index=idx, proxy=resolved_proxy,
+            ))
+            self.log(f"[FAILED] [{acc_name}] {validation_error}")
+            return results
 
         self.log(f"[*] [{acc_name}] Bắt đầu tiến trình tạo {max_pages} Fanpage...")
 
@@ -3530,6 +4406,7 @@ class MainToolApp:
             page_plan = parse_page_plan(targets[p_idx] if targets and len(targets) > p_idx else "")
             page_name = page_plan["name"]
             category_name = page_plan["category"]
+            retry_count = 0
 
             self.log(f"[*] [{acc_name}] [{created_count + 1}/{max_pages}] Đang tải trang tạo Page: '{page_name}'...")
 
@@ -3538,12 +4415,27 @@ class MainToolApp:
                 # BƯỚC 1: TRUY CẬP VÀ ĐỢI REACT LOAD XONG
                 # ======================================================
                 try:
-                    # Dùng networkidle để đảm bảo các script nặng của React đã tải xong thay vì chỉ HTML
-                    await page.goto("https://www.facebook.com/pages/creation/", wait_until="domcontentloaded", timeout=45000)
+                    async def navigate_to_creation():
+                        return await page.goto(
+                            "https://www.facebook.com/pages/creation/",
+                            wait_until="domcontentloaded",
+                            timeout=45000,
+                        )
+
+                    _response, retry_count = await retry_create_page_operation(
+                        navigate_to_creation, max_attempts=3, base_delay=1.0
+                    )
                 except Exception as e:
-                    self.log(f"[DEBUG] [{acc_name}] Lỗi khi truy cập trang tạo Page: {e}")
-                    # Bỏ qua lỗi Timeout ngầm của networkidle nếu FB có pixel tracking chạy liên tục
-                    continue  
+                    retry_count = getattr(e, "create_page_retry_count", retry_count)
+                    record_result(build_create_page_result(
+                        "ERROR", acc_name, page_name, category_name,
+                        technical_error=f"{type(e).__name__}: {e}",
+                        retry_count=retry_count,
+                        account_index=idx,
+                        proxy=resolved_proxy,
+                    ))
+                    self.log(f"[ERROR] [{acc_name}] Lỗi tải trang tạo Page: {e}")
+                    continue
                 await asyncio.sleep(random.uniform(3,5))
 
                 cur_url = page.url.lower()
@@ -3567,6 +4459,11 @@ class MainToolApp:
                 )
                 if any(x in cur_url for x in ["checkpoint", "challenge", "disabled", "suspended"]):
                     self.log(f"[!] [{acc_name}] Tài khoản dính Checkpoint ngay lúc vào trang tạo Page!")
+                    record_result(build_create_page_result(
+                        "FAILED", acc_name, page_name, category_name,
+                        reason="Session invalid/checkpoint khi mở trang tạo Page.",
+                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    ))
                     break
                 if "/pages/creation" not in cur_url:
                     self.log(
@@ -3574,6 +4471,11 @@ class MainToolApp:
                         "Tài khoản có thể chưa được cấp quyền tạo Trang hoặc giao diện đã thay đổi."
                     )
                     await self.take_error_snapshot(page, acc_name, "create_page_redirect")
+                    record_result(build_create_page_result(
+                        "FAILED", acc_name, page_name, category_name,
+                        reason=f"Facebook chuyển khỏi trang tạo Page: {page.url}",
+                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    ))
                     break
 
                 # ======================================================
@@ -3581,6 +4483,7 @@ class MainToolApp:
                 # ======================================================
                 # Đã gỡ bỏ form input[type="text"] chung chung để tránh bắt nhầm ô Search
                 name_selectors = (
+                    'div[role="main"] input[type="text"]:not([role="combobox"]):not([type="search"]), '
                     'label:has-text("Tên trang") input, '
                     'label:has-text("Page name") input, '
                     'label:has-text("Nom de la Page") input, '
@@ -3626,6 +4529,12 @@ class MainToolApp:
                         self.log(f"[-] [{acc_name}] Vẫn không load được form. Bỏ qua lượt này.")
                         if hasattr(self, 'take_error_snapshot'):
                             await self.take_error_snapshot(page, acc_name, "create_page_fail_2")
+                        record_result(build_create_page_result(
+                            "ERROR", acc_name, page_name, category_name,
+                            technical_error="Form tạo Page không xuất hiện sau retry.",
+                            retry_count=retry_count + 1,
+                            account_index=idx, proxy=resolved_proxy,
+                        ))
                         continue
 
                 # ======================================================
@@ -3642,6 +4551,11 @@ class MainToolApp:
                     self.log(f"[!] [{acc_name}] Lỗi focus ô tên trang. Chụp ảnh debug...")
                     if hasattr(self, 'take_error_snapshot'):
                         await self.take_error_snapshot(page, acc_name, "create_page_focus_fail")
+                    record_result(build_create_page_result(
+                        "ERROR", acc_name, page_name, category_name,
+                        technical_error="Không focus được ô page_name.",
+                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    ))
                     continue
                 
                 await page.keyboard.press("Control+A")
@@ -3674,6 +4588,7 @@ class MainToolApp:
                 # BƯỚC 4: ĐIỀN HẠNG MỤC (CHỐNG NHẦM THANH TÌM KIẾM FACEBOOK)
                 # ======================================================
                 cat_selectors = (
+                    'div[role="main"] input[role="combobox"], '
                     'label:has-text("Hạng mục") input, '
                     'label:has-text("Category") input, '
                     'label:has-text("Catégorie") input, '
@@ -3711,8 +4626,8 @@ class MainToolApp:
                     await page.keyboard.press("Backspace")
                     await asyncio.sleep(0.5)
 
-                    self.log(f"[*] [{acc_name}] Đang chọn hạng mục Blog...")
-                    for char in "Blog":
+                    self.log(f"[*] [{acc_name}] Đang chọn hạng mục {category_name}...")
+                    for char in category_name:
                         await page.keyboard.type(char, delay=random.randint(80, 130))
                     
                     # Chờ 2.5s để Facebook gửi request tải danh sách gợi ý (Listbox)
@@ -3730,30 +4645,69 @@ class MainToolApp:
                     await asyncio.sleep(1.5)
                 else:
                     self.log(f"[!] [{acc_name}] Không tìm thấy ô nhập Hạng mục.")
+                    record_result(build_create_page_result(
+                        "ERROR", acc_name, page_name, category_name,
+                        technical_error="Không tìm thấy combobox category.",
+                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    ))
+                    continue
 
                 # ======================================================
                 # BƯỚC 5: BẤM TẠO VÀ CHỜ KẾT QUẢ TỪ SERVER
                 # ======================================================
-                create_btn = page.get_by_role("button", name=CREATE_PAGE_BUTTON_PATTERN).first
+                create_btn = page.locator(
+                    'div[role="main"] form button[type="submit"]:visible, '
+                    'div[role="main"] button[type="submit"]:visible'
+                ).first
+                if await create_btn.count() == 0:
+                    create_btn = page.get_by_role(
+                        "button", name=CREATE_PAGE_BUTTON_PATTERN
+                    ).first
                 
                 if await create_btn.count() == 0 or not await create_btn.is_visible():
                     self.log(f"[-] [{acc_name}] Không tìm thấy nút Tạo Trang.")
                     if hasattr(self, 'take_error_snapshot'):
                         await self.take_error_snapshot(page, acc_name, "no_create_btn")
+                    record_result(build_create_page_result(
+                        "ERROR", acc_name, page_name, category_name,
+                        technical_error="Không tìm thấy nút Submit tạo Page.",
+                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    ))
+                    continue
+
+                try:
+                    if not await wait_for_locator_ready(create_btn, timeout=10000):
+                        record_result(build_create_page_result(
+                            "ERROR", acc_name, page_name, category_name,
+                            technical_error="Nút Submit không chuyển sang trạng thái khả dụng.",
+                            retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                        ))
+                        continue
+                except Exception as e:
+                    record_result(build_create_page_result(
+                        "ERROR", acc_name, page_name, category_name,
+                        technical_error=f"Không chờ được nút Submit: {type(e).__name__}: {e}",
+                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    ))
                     continue
 
                 try:
                     await create_btn.scroll_into_view_if_needed()
                     await create_btn.click()
-                except Exception:
+                except Exception as e:
                     self.log(f"[!] [{acc_name}] Lỗi click nút Tạo Trang. Chụp ảnh debug...")
                     if hasattr(self, 'take_error_snapshot'):
                         await self.take_error_snapshot(page, acc_name, "create_page_create_btn_click_fail")
+                    record_result(build_create_page_result(
+                        "ERROR", acc_name, page_name, category_name,
+                        technical_error=f"Submit failed: {type(e).__name__}: {e}",
+                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    ))
                     continue
 
                 self.log(f"[*] [{acc_name}] Đã bấm Tạo, chờ Facebook xử lý...")
 
-                is_created_success = False
+                verified_page_identity = {"url": "", "id": ""}
                 for _ in range(10):
                     await asyncio.sleep(2)
                     cur_url = page.url.lower()
@@ -3761,8 +4715,9 @@ class MainToolApp:
                         self.log(f"[!] [{acc_name}] Bị Checkpoint ngay sau khi ấn Tạo!")
                         break
 
-                    if extract_facebook_page_identity([page.url])["url"]:
-                        is_created_success = True
+                    candidate_identity = await self.get_current_page_identity(page)
+                    if is_verified_page_identity(candidate_identity):
+                        verified_page_identity = candidate_identity
                         break
 
                     body_text = (await page.inner_text("body")).lower()
@@ -3773,12 +4728,15 @@ class MainToolApp:
                             await self.take_error_snapshot(page, acc_name, "rate_limit_page")
                         break
                     
-                    if any(succ in body_text for succ in ["đã tạo trang", "page created", "manage page", "quản lý trang"]):
-                        is_created_success = True
-                        break
-
-                if not is_created_success:
-                    self.log(f"[-] [{acc_name}] Tạo trang thất bại hoặc không nhận được phản hồi.")
+                if not is_verified_page_identity(verified_page_identity):
+                    self.log(
+                        f"[-] [{acc_name}] Tạo trang thất bại hoặc chưa xác minh được Page URL/ID."
+                    )
+                    record_result(build_create_page_result(
+                        "FAILED", acc_name, page_name, category_name,
+                        reason="Không xác minh được Page URL/ID sau khi Submit.",
+                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    ))
                     continue
 
                 # ======================================================
@@ -3788,12 +4746,14 @@ class MainToolApp:
                 for _ in range(12):
                     if not self.is_running: break
                     cur_url = page.url.lower()
-                    if "profile.php?id=" in cur_url or "facebook.com/pages/creation" not in cur_url:
-                        if await page.locator('text="Công cụ chuyên nghiệp", text="Quản lý trang", text="Chỉnh sửa"').count() > 0:
-                            self.log(f"[✔] [{acc_name}] Đã vào đến giao diện Trang chính (Hình 2)!")
+                    if "facebook.com/pages/creation" not in cur_url:
+                        current_identity = await self.get_current_page_identity(page)
+                        if is_verified_page_identity(current_identity):
+                            self.log(f"[✔] [{acc_name}] Đã vào đến giao diện Trang chính!")
                             break
 
                     btn_selectors = (
+                        'div[role="dialog"] button[type="submit"]:visible, '
                         'div[role="button"]:has-text("Tiếp"), div[role="button"]:has-text("Next"), '
                         'div[role="button"]:has-text("Xong"), div[role="button"]:has-text("Done"), '
                         'div[role="button"]:has-text("Hoàn tất"), '
@@ -3813,40 +4773,42 @@ class MainToolApp:
                 await page.keyboard.press("Escape")
                 await asyncio.sleep(1)
 
-                created_count += 1
-                now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 page_identity = await self.get_current_page_identity(page)
-                page_record = {
-                    "time": now_str,
-                    "account_index": idx,
-                    "account": acc_name,
-                    "page_name": page_name,
-                    "category": category_name,
-                    "page_url": page_identity["url"],
-                    "page_id": page_identity["id"],
-                    "status": "created" if page_identity["url"] else "created_needs_identity_check",
-                }
-                created_pages.append(page_record)
-                append_csv_result(
-                    "created_pages.csv",
-                    ["time", "account_index", "account", "page_name", "category", "page_url", "page_id", "status"],
-                    page_record,
+                if not is_verified_page_identity(page_identity):
+                    page_identity = verified_page_identity
+                if not is_verified_page_identity(page_identity):
+                    self.log(
+                        f"[-] [{acc_name}] Không xác minh được Page URL/ID sau khi tạo; "
+                        "không ghi nhận thành công."
+                    )
+                    record_result(build_create_page_result(
+                        "FAILED", acc_name, page_name, category_name,
+                        reason="Page URL/ID không còn xác minh được sau wizard.",
+                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    ))
+                    continue
+
+                page_record = build_create_page_result(
+                    "SUCCESS", acc_name, page_name, category_name,
+                    page_url=page_identity["url"], page_id=page_identity["id"],
+                    retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
                 )
-                with RESULT_FILE_LOCK:
-                    with open(output_path("created_pages_success.txt"), "a", encoding="utf-8") as f:
-                        f.write(
-                            f"{acc_name} | {page_name} | {page_identity['url'] or 'CHUA_XAC_DINH_URL'} | {now_str}\n"
-                        )
-                if page_identity["url"]:
-                    self.log(
-                        f"[✔] [{acc_name}] Tạo Page {created_count}/{max_pages}: "
-                        f"'{page_name}' | {page_identity['url']}"
-                    )
-                else:
-                    self.log(
-                        f"[!] [{acc_name}] Page '{page_name}' đã được tạo nhưng chưa đọc được URL/ID; "
-                        "đã đánh dấu cần kiểm tra."
-                    )
+                if not save_created_page_success(page_record):
+                    record_result(build_create_page_result(
+                        "FAILED", acc_name, page_name, category_name,
+                        page_url=page_identity["url"], page_id=page_identity["id"],
+                        reason="Page URL/ID đã tồn tại trong file kết quả.",
+                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    ))
+                    self.log(f"[FAILED] [{acc_name}] Bỏ qua Page trùng URL/ID.")
+                    continue
+
+                created_count += 1
+                record_result(page_record)
+                self.log(
+                    f"[✔] [{acc_name}] Tạo Page {created_count}/{max_pages}: "
+                    f"'{page_name}' | {page_identity['url'] or page_identity['id']}"
+                )
 
                 # ======================================================
                 # BƯỚC 7: NUÔI NICK THEO CẤU HÌNH NGƯỜI DÙNG (NHẬP 0 SẼ BỎ QUA)
@@ -3874,10 +4836,17 @@ class MainToolApp:
 
             except Exception as e:
                 self.log(f"[-] [{acc_name}] Lỗi vòng lặp tạo Page: {e}")
+                record_result(build_create_page_result(
+                    "ERROR", acc_name, page_name, category_name,
+                    technical_error=f"{type(e).__name__}: {e}",
+                    retry_count=retry_count,
+                    account_index=idx,
+                    proxy=resolved_proxy,
+                ))
                 if hasattr(self, 'take_error_snapshot'):
                     await self.take_error_snapshot(page, acc_name, "create_page_fatal")
 
-        return created_pages
+        return results
 
     async def run_add_by_group(self, page, acc_name, idx, targets, target_total, min_del, max_del):
         """Kết bạn theo danh sách thành viên nhóm"""
@@ -4165,6 +5134,14 @@ class MainToolApp:
         except Exception as e:
             self.log(f"[-] [{acc_name}] Lỗi seeding livestream: {e}")
     
+    async def process_account_scoped(self, *args, **kwargs):
+        account_index = int(args[1])
+        context_token = self.account_log_context.set(account_index)
+        try:
+            return await self.process_account(*args, **kwargs)
+        finally:
+            self.account_log_context.reset(context_token)
+
     async def process_account(
         self,
         playwright_instance,
@@ -4176,6 +5153,9 @@ class MainToolApp:
         account_type="",
         login_user="",
         login_password="",
+        account_country="",
+        account_locale="AUTO",
+        account_timezone="",
     ):
         async with semaphore:
             if not self.is_running: return
@@ -4184,16 +5164,22 @@ class MainToolApp:
             modes = config.get("modes", {})
             options = config.get("options", {})
 
-            self.update_tree_row(str(idx), status="Đang chạy...")
+            self.set_account_state(idx, status="CHECKING", current_action="Khởi tạo tài khoản")
+            self.update_tree_row(str(idx), status="ĐANG KIỂM TRA")
             self.log(f"\n[🚀 LUỒNG BẮT ĐẦU] Nick {idx}: {acc_name} (Proxy: {assigned_proxy_str or 'None'})")
+            self.log(
+                f"[*] [{acc_name}] Context: locale={normalize_account_locale(account_locale)}; "
+                f"country={account_country or 'N/A'}; timezone={account_timezone or 'AUTO'}"
+            )
 
             cookies = parse_cookies(cookie_str)
             proxy_cfg = parse_proxy(assigned_proxy_str)
             is_headless = config.get("headless", False)
 
             if assigned_proxy_str and not proxy_cfg:
-                self.log(f"[-] [{acc_name}] Proxy sai định dạng, dừng để tránh chạy nhầm IP thật.")
-                self.update_tree_row(str(idx), status="Proxy sai định dạng")
+                reason = f"[{acc_name}] Proxy sai định dạng, dừng để tránh chạy nhầm IP thật."
+                self.set_account_failure(idx, "proxy", reason)
+                self.update_tree_row(str(idx), status="ERROR")
                 return
 
             target_total = config.get("target", 25)
@@ -4215,25 +5201,30 @@ class MainToolApp:
                     assigned_proxy_str = fresh_proxy
                     proxy_cfg = parse_proxy(assigned_proxy_str)
                     if not proxy_cfg:
-                        self.log(f"[-] [{acc_name}] API trả về proxy sai định dạng.")
-                        self.update_tree_row(str(idx), status="Proxy API không hợp lệ")
+                        reason = f"[{acc_name}] API trả về proxy sai định dạng."
+                        self.set_account_failure(idx, "proxy", reason)
+                        self.update_tree_row(str(idx), status="ERROR")
                         return
                     self.log(f"[✔] [{acc_name}] Đã cấp IP SuiProxy mới: {assigned_proxy_str}")
                     await asyncio.sleep(2)
                 else:
-                    self.log(f"[-] [{acc_name}] API proxy không trả về IP; dừng để tránh dùng IP thật.")
-                    self.update_tree_row(str(idx), status="Không lấy được proxy")
+                    reason = f"[{acc_name}] API proxy không trả về IP; dừng để tránh dùng IP thật."
+                    self.set_account_failure(idx, "proxy", reason)
+                    self.update_tree_row(str(idx), status="ERROR")
                     return
             
             browser = None
             context = None
             try:
+                self.set_account_state(idx, status="CHECKING", current_action="Mở trình duyệt và kiểm tra đăng nhập")
                 # Gọi Helper khởi tạo trình duyệt siêu cấp (GPM Layout, Anti-Detect)
                 browser, context, page = await self.create_browser_page(
                     playwright_instance,
                     idx,
                     proxy_cfg=proxy_cfg,
-                    is_headless=is_headless
+                    is_headless=is_headless,
+                    account_locale=account_locale,
+                    account_timezone=account_timezone,
                 )
 
                 # --- BẮT ĐẦU LOGIC ĐĂNG NHẬP CHUẨN XÁC ---
@@ -4251,23 +5242,39 @@ class MainToolApp:
                     
                     is_valid_session, session_detail = await self.verify_facebook_session(page, context)
                     if not is_valid_session:
-                        self.log(f"[-] [{acc_name}] Phiên Cookie không hợp lệ: {session_detail}")
-                        self.update_tree_row(str(idx), status=session_detail)
+                        reason = f"[{acc_name}] Phiên Cookie không hợp lệ: {session_detail}"
+                        self.set_account_failure(idx, "invalid_cookie", reason)
+                        self.update_tree_row(str(idx), status="DIE")
                         return
                     self.log(f"[✔] [{acc_name}] {session_detail}")
 
                 # Đăng nhập Facebook bằng UID/email và mật khẩu
                 elif account_type == "RAW" and login_user and login_password:
-                    is_valid_session = await self.login_facebook_user_pass(
-                        page, login_user, login_password
+                    login_result, login_detail = await self.login_facebook_user_pass(
+                        page, context, login_user, login_password
                     )
+                    if login_result == LOGIN_TECHNICAL_ERROR:
+                        reason = f"[{acc_name}] Lỗi kỹ thuật khi đăng nhập: {login_detail}"
+                        self.set_account_failure(idx, "automation", reason)
+                        self.update_tree_row(str(idx), status="ERROR")
+                        return
+                    is_valid_session = login_result == LOGIN_SUCCESS
+                else:
+                    reason = f"[{acc_name}] Thiếu dữ liệu đăng nhập hợp lệ."
+                    self.set_account_failure(idx, "input", reason)
+                    self.update_tree_row(str(idx), status="ERROR")
+                    return
                 
                 # Chốt chặn: Nếu không đăng nhập thành công thì thoát luôn, không chạy tác vụ bên dưới
                 if not is_valid_session:
-                    self.log(f"[-] [{acc_name}] Không có Cookie hợp lệ hoặc đăng nhập thất bại.")
-                    self.update_tree_row(str(idx), status="Lỗi Login")
+                    reason = f"[{acc_name}] Đăng nhập không hợp lệ: {login_detail}"
+                    self.set_account_failure(idx, "invalid_login", reason)
+                    self.update_tree_row(str(idx), status="DIE")
                     return  
                 # --- KẾT THÚC LOGIC ĐĂNG NHẬP ---
+
+                self.set_account_state(idx, status="LIVE", current_action="Đăng nhập Facebook hợp lệ")
+                self.update_tree_row(str(idx), status="LIVE")
 
                 if options.get("browse_web"): await self.browse_external_web(page, acc_name)
                 if options.get("warmup"): await self.warm_up_feed(page, acc_name)
@@ -4333,12 +5340,17 @@ class MainToolApp:
                     p_min_del = config.get("min_page_delay", 60)
                     p_max_del = config.get("max_page_delay", 120)
                     
-                    created_pages = await self.run_create_page(
+                    create_page_results = await self.run_create_page(
                         page, context, acc_name, idx, targets_by_mode["create_page"],
                         max_pages=page_target_num, 
                         min_page_del=p_min_del, 
-                        max_page_del=p_max_del
+                        max_page_del=p_max_del,
+                        resolved_proxy=assigned_proxy_str or "",
                     )
+                    created_pages = [
+                        result for result in create_page_results
+                        if result.get("status") == "SUCCESS"
+                    ]
                     total_sent += len(created_pages)
                 # 13. Đăng bài lên Fanpage
                 if modes.get("post_page", False):
@@ -4441,16 +5453,23 @@ class MainToolApp:
                 if modes.get("scrape_contacts", False):
                     await self.run_scrape_contact_info(page, acc_name, idx, targets_by_mode["scrape_contacts"])
 
-                self.update_tree_row(str(idx), sent_today=total_sent, status="Hoàn thành")
+                self.set_account_state(idx, status="LIVE", current_action="Hoàn thành")
+                self.update_tree_row(str(idx), sent_today=total_sent, status="LIVE")
                 self.log(f"[✔ XONG] Nick {acc_name} đã hoàn thành ({total_sent} kết quả đã xác nhận).")
 
             except asyncio.CancelledError:
-                self.update_tree_row(str(idx), status="Đã dừng")
+                current_state = self.account_states.get(idx)
+                if current_state and current_state["status"] == "CHECKING":
+                    self.set_account_state(idx, status="ERROR", current_action="Đã dừng khi đang kiểm tra")
+                    self.update_tree_row(str(idx), status="ERROR")
+                else:
+                    self.set_account_state(idx, current_action="Đã dừng")
                 self.log(f"[!] Đã dừng nick {acc_name} theo yêu cầu.")
                 raise
             except Exception as e:
-                self.update_tree_row(str(idx), status="Lỗi/Checkpoint")
-                self.log(f"[-] Lỗi nick {acc_name}: {e}")
+                reason = f"Lỗi nick {acc_name}: {e}"
+                self.set_account_failure(idx, "automation", reason)
+                self.update_tree_row(str(idx), status="ERROR")
                 # Bắn cảnh báo về Telegram
                 t_token = config.get("tele_token", "")
                 t_id = config.get("tele_chatid", "")
@@ -4459,13 +5478,7 @@ class MainToolApp:
             
             finally:
                 # --- SIÊU NĂNG LỰC: DÙ LỖI HAY KHÔNG CŨNG BẮT BUỘC ĐÓNG TRÌNH DUYỆT ĐỂ CHỐNG TREO RAM ---
-                try:
-                    if 'context' in locals() and context:
-                        await context.close()
-                    if 'browser' in locals() and browser:
-                        await browser.close()
-                except Exception:
-                    pass
+                await close_browser_resources(context, browser)
     def parse_range_string(self, range_str: str) -> set:
         """Tự động phân tách chuỗi số phức hợp dạng '1, 3, 5-9' thành danh sách STT"""
         selected = set()
@@ -4488,9 +5501,9 @@ class MainToolApp:
         self.worker_loop = asyncio.get_running_loop()
         self.proxy_api_lock = asyncio.Lock()
         raw_acc_lines = [
-            line.strip()
+            line
             for line in config.get("accounts", "").splitlines()
-            if line.strip() and not line.startswith("#")
+            if line.strip() and not line.lstrip().startswith("#")
         ]
         proxy_lines = [
             line.strip()
@@ -4503,8 +5516,7 @@ class MainToolApp:
             self.stop_bot()
             return
 
-        # Làm sạch hoàn toàn tiền tố '1. ', '2. '
-        acc_lines = [re.sub(r'^\d+[\.\-\s]+', '', line) for line in raw_acc_lines]
+        parsed_accounts = config.get("parsed_accounts", {})
         # 1. ƯU TIÊN 1: LẤY THEO CÚ PHÁP Ô NHẬP (VD: 1, 3, 5-9)
         manual_syntax = config.get("selected_indexes", "")
         target_indexes = self.parse_range_string(manual_syntax)
@@ -4514,75 +5526,151 @@ class MainToolApp:
             target_indexes = set(config.get("checked_indexes", set()))
 
         threads_count = config.get("threads", 3)
+        modes = config.get("modes", {})
+        if modes.get("create_page", False):
+            max_create_workers = max(1, int(config.get("max_create_page_workers", 3)))
+            threads_count = effective_account_worker_count(
+                threads_count, modes, max_create_workers
+            )
+            raw_targets = [
+                line.strip() for line in config.get("targets", "").splitlines()
+                if line.strip()
+            ]
+            create_targets = self.get_targets_for_mode(raw_targets, "create_page", modes)
+            valid_targets, validation_error = validate_create_page_targets(
+                create_targets, config.get("page_target", 5)
+            )
+            if not valid_targets:
+                self.log(f"[FAILED][CREATE_PAGE][PRE-FLIGHT] {validation_error}")
+                for index in target_indexes or range(1, len(raw_acc_lines) + 1):
+                    self.set_account_state(
+                        index,
+                        current_action=f"Create Page FAILED: {validation_error}",
+                    )
+                return
+        batch_size = config.get("batch_size", 5)
         ratio = config.get("proxy_ratio", 20)
+        resolved_proxies = config.get("resolved_proxies", {})
         semaphore = asyncio.Semaphore(threads_count)
+        account_jobs = []
+        for idx, line in enumerate(raw_acc_lines, 1):
+            if target_indexes and idx not in target_indexes:
+                continue
+            parsed = parsed_accounts.get(idx) or parsed_accounts.get(str(idx))
+            if not parsed:
+                parsed = parse_any_account_line(line, idx)
+            if not parsed:
+                continue
 
-        self.log(f"\n{'='*55}\n[⚡] BẮT ĐẦU TIẾN TRÌNH VỚI {threads_count} LUỒNG SONG SONG\n{'='*55}")
+            acc_name = parsed["name"]
+            cookie_str = parsed.get("cookie", "")
+            if parsed["type"] == "TOKEN":
+                self.set_account_failure(
+                    idx,
+                    "input",
+                    f"[{acc_name}] Token EAAB/EAAA không thể thay thế Cookie đăng nhập.",
+                )
+                continue
+            has_raw_login = bool(
+                parsed["type"] == "RAW"
+                and parsed.get("uid")
+                and (parsed.get("password") or parsed.get("pwd"))
+            )
+            if not cookie_str and not has_raw_login:
+                self.set_account_failure(idx, "input", f"[{acc_name}] Thiếu dữ liệu đăng nhập.")
+                continue
+
+            assigned_proxy_str = resolve_account_proxy(
+                parsed.get("proxy"), resolved_proxies, idx
+            ) or None
+            if (
+                not assigned_proxy_str
+                and config.get("proxy_mode") != "rotating_api"
+                and proxy_lines
+            ):
+                # Compatibility for non-UI callers without a captured proxy map.
+                if config.get("proxy_mode") in {"round_robin", "random"}:
+                    assigned_proxy_str = proxy_lines[(idx - 1) % len(proxy_lines)]
+                else:
+                    proxy_index = (idx - 1) // ratio
+                    assigned_proxy_str = proxy_lines[proxy_index] if proxy_index < len(proxy_lines) else proxy_lines[-1]
+
+            account_jobs.append({
+                "idx": idx,
+                "acc_name": acc_name,
+                "cookie_str": cookie_str,
+                "assigned_proxy_str": assigned_proxy_str,
+                "account_type": parsed["type"],
+                "login_user": parsed.get("uid", ""),
+                "login_password": parsed.get("password") or parsed.get("pwd", ""),
+                "two_factor": parsed.get("2fa", ""),
+                "token": parsed.get("token", ""),
+                "raw_line": parsed.get("raw_line", line),
+                "country": parsed.get("country", ""),
+                "locale": parsed.get("locale", "AUTO"),
+                "timezone": parsed.get("timezone", ""),
+            })
+
+        batches = split_account_batches(account_jobs, batch_size)
+        self.log(
+            f"[BẮT ĐẦU ĐỢT CHẠY] {len(account_jobs)} tài khoản • "
+            f"{len(batches)} đợt • {threads_count} luồng đồng thời"
+        )
+        unexpected_errors = []
 
         async with async_playwright() as p:
-            tasks = []
-            for idx, line in enumerate(acc_lines, 1):
-                # NẾU CÓ CHỌN NICK MÀ STT NÀY KHÔNG NẰM TRONG DANH SÁCH THÌ BỎ QUA
-                if target_indexes and idx not in target_indexes:
-                    continue
-                parsed = parse_any_account_line(line, idx)
-                if not parsed:
-                    continue
+            for batch_number, batch_jobs in enumerate(batches, start=1):
+                if self.stop_requested:
+                    break
+                self.post_ui(lambda number=batch_number: self.show_batch(number))
+                batch_indexes = [job["idx"] for job in batch_jobs]
+                self.log(f"[BẮT ĐẦU ĐỢT] Đợt {batch_number}/{len(batches)} • {len(batch_jobs)} tài khoản")
 
-                acc_name = parsed["name"]
-                cookie_str = parsed["data"]
+                tasks = []
+                for job in batch_jobs:
+                    tasks.append(asyncio.create_task(self.process_account_scoped(
+                        p,
+                        job["idx"],
+                        job["acc_name"],
+                        job["cookie_str"],
+                        job["assigned_proxy_str"],
+                        semaphore,
+                        account_type=job["account_type"],
+                        login_user=job["login_user"],
+                        login_password=job["login_password"],
+                        account_country=job["country"],
+                        account_locale=job["locale"],
+                        account_timezone=job["timezone"],
+                    )))
 
-                # Access Token không phải session cookie và không thể dùng để đăng nhập trình duyệt.
-                if parsed["type"] == "TOKEN":
-                    self.log(
-                        f"[-] [{acc_name}] Token EAAB/EAAA không thể thay thế Cookie đăng nhập. "
-                        "Vui lòng nhập Cookie Facebook hợp lệ."
-                    )
-                    continue
+                self.worker_tasks = tasks
+                task_results = await asyncio.gather(*tasks, return_exceptions=True)
+                for job, result in zip(batch_jobs, task_results):
+                    if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
+                        unexpected_errors.append(result)
+                        self.set_account_failure(
+                            job["idx"],
+                            "automation",
+                            f"Lỗi worker chưa xử lý: {type(result).__name__}: {result}",
+                        )
+                self.worker_tasks = []
 
-                if not cookie_str:
-                    continue
-                # Gán Proxy
-                assigned_proxy_str = parsed.get("proxy") or None
-                if not assigned_proxy_str and config.get("proxy_mode") != "rotating_api" and proxy_lines:
-                    if config.get("proxy_mode") == "random":
-                        assigned_proxy_str = random.choice(proxy_lines)
-                    elif config.get("proxy_mode") == "round_robin":
-                        assigned_proxy_str = proxy_lines[(idx - 1) % len(proxy_lines)]
-                    else:
-                        p_idx = (idx - 1) // ratio
-                        assigned_proxy_str = proxy_lines[p_idx] if p_idx < len(proxy_lines) else proxy_lines[-1]
-
-                tasks.append(asyncio.create_task(self.process_account(
-                    p,
-                    idx,
-                    acc_name,
-                    cookie_str,
-                    assigned_proxy_str,
-                    semaphore,
-                    account_type=parsed["type"],
-                    login_user=parsed.get("uid", ""),
-                    login_password=parsed.get("pwd", ""),
-                )))
-
-            self.worker_tasks = tasks
-            task_results = await asyncio.gather(*tasks, return_exceptions=True)
-            unexpected_errors = [
-                result for result in task_results
-                if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError)
-            ]
-            for error in unexpected_errors:
-                self.log(f"[-] Lỗi luồng chưa được xử lý: {type(error).__name__}: {error}")
-            self.worker_tasks = []
+                batch_summary = self.account_states.summary(batch_indexes)
+                self.log(
+                    f"[KẾT THÚC ĐỢT] Đợt {batch_number}/{len(batches)} • "
+                    f"LIVE: {batch_summary['LIVE']} • DIE: {batch_summary['DIE']} • "
+                    f"ERROR: {batch_summary['ERROR']}"
+                )
 
         if self.stop_requested:
             self.log("\n[!] Tiến trình đã dừng; các luồng đang chạy đã được đóng an toàn.")
             return
 
-        if unexpected_errors:
-            self.log(f"\n[!] ĐÃ CHẠY XONG NHƯNG CÓ {len(unexpected_errors)} LUỒNG LỖI.")
-        else:
-            self.log("\n[🎉] TOÀN BỘ CÁC LUỒNG ĐÃ HOÀN TẤT.")
+        final_summary = self.account_states.summary([job["idx"] for job in account_jobs])
+        self.log(
+            f"[KẾT THÚC ĐỢT CHẠY] LIVE: {final_summary['LIVE']} • "
+            f"DIE: {final_summary['DIE']} • ERROR: {final_summary['ERROR']}"
+        )
         t_token = config.get("tele_token", "")
         t_id = config.get("tele_chatid", "")
         if t_token and t_id:
@@ -4598,21 +5686,39 @@ class MainToolApp:
             (item, str(self.tree.item(item, "values")[2]).strip())
             for item in selected
         ]
+        for item, _uid in selected_accounts:
+            if str(item).isdigit():
+                self.set_account_state(int(item), status="CHECKING", current_action="Kiểm tra UID")
+                self.update_tree_row(item, status="ĐANG KIỂM TRA")
 
         def worker():
             for item, uid in selected_accounts:
-
-                # Chỉ check Live/Die nếu UID là một chuỗi số (Facebook ID)
+                account_index = int(item) if str(item).isdigit() else None
                 if uid and uid.isdigit():
                     try:
                         url = f"https://graph.facebook.com/{uid}/picture?type=normal"
                         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                         with urllib.request.urlopen(req, timeout=5) as resp:
-                            status_live = "Live" if "static.xx.fbcdn.net" not in resp.geturl() else "Checkpoint/Die"
-                    except Exception:
-                        status_live = "Checkpoint/Die"
+                            response_url = resp.geturl()
+                        action = "UID có phản hồi; cần đăng nhập để xác nhận LIVE/DIE"
+                        if "static.xx.fbcdn.net" in response_url:
+                            action = "UID không xác định; cần đăng nhập để kết luận"
+                        if account_index is not None:
+                            self.set_account_state(account_index, status="UNKNOWN", current_action=action)
+                            self.log(f"[*] [{uid}] {action}", account_index=account_index)
+                        status_live = "CHƯA KIỂM TRA"
+                    except Exception as error:
+                        if account_index is not None:
+                            self.set_account_failure(
+                                account_index,
+                                "network",
+                                f"Không thể kiểm tra UID do lỗi mạng: {error}",
+                            )
+                        status_live = "ERROR"
                 else:
-                    status_live = "Không hỗ trợ check Live ID này"
+                    if account_index is not None:
+                        self.set_account_failure(account_index, "input", "Không có UID hợp lệ để kiểm tra.")
+                    status_live = "ERROR"
 
                 self.update_tree_row(item, status=status_live)
             self.post_ui(lambda: messagebox.showinfo("Hoàn tất", "Đã kiểm tra xong tình trạng Live/Die."))
