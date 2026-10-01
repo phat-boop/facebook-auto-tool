@@ -37,7 +37,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.2.0"
+CURRENT_VERSION = "2.2.1"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -1238,9 +1238,48 @@ def unprotect_setting(value):
 
 # [ĐOẠN TRƯỚC GIỮ NGUYÊN:]
 # [THAY THẾ TOÀN BỘ HÀM parse_cookies]:
+def normalize_cookie_input(value: str):
+    """Normalize login cookies without changing the stored account input."""
+    value = str(value or "").strip()
+    value = re.sub(r'^Cookie\s*:\s*', '', value, flags=re.IGNORECASE)
+    if value.startswith(('[', '{')):
+        try:
+            payload = json.loads(value)
+        except (ValueError, TypeError):
+            return ""
+        if isinstance(payload, dict):
+            payload = payload.get("cookies", payload)
+        if isinstance(payload, dict):
+            if "name" in payload and "value" in payload:
+                payload = [payload]
+            else:
+                payload = [{"name": key, "value": val} for key, val in payload.items()]
+        if not isinstance(payload, list):
+            return ""
+        pairs = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            val = item.get("value")
+            if isinstance(name, str) and isinstance(val, (str, int)):
+                pairs.append(f"{name.strip()}={val}")
+        value = "; ".join(pairs)
+    if not re.search(r'(?:^|;)\s*(?:c_user|xs|sessionid|sb|datr)\s*=', value):
+        return ""
+    return value
+
+
 def parse_cookies(cookie_raw: str, default_domain: str = ".facebook.com"):
     """Tự động phân tách chuỗi cookie chuẩn định dạng Playwright"""
     clean_cookie = re.sub(r'^\d+[\.\-\s\|]+', '', cookie_raw.strip()).strip()
+    if "|" in clean_cookie:
+        clean_cookie = "; ".join(
+            normalized.rstrip("; ") for field in clean_cookie.split("|")
+            if (normalized := normalize_cookie_input(field))
+        )
+    else:
+        clean_cookie = normalize_cookie_input(clean_cookie) or clean_cookie
     
     domain_val = default_domain
 
@@ -1424,7 +1463,7 @@ def parse_any_account_line(raw_line: str, idx: int = 1):
     proxy = ""
 
     def is_cookie(value):
-        return any(marker in value for marker in ("c_user=", "sessionid=", "sb=", "datr="))
+        return bool(normalize_cookie_input(value))
 
     prefix = parts[0].upper() if parts else ""
     if prefix == "COOKIE":
@@ -1483,14 +1522,24 @@ def parse_any_account_line(raw_line: str, idx: int = 1):
             token = parts[6]
             recognized_indexes.add(6)
 
-    cookie_uid = re.search(r"c_user=(\d+)", cookie)
-    if not uid and cookie_uid:
+    # Prefixes describe the import format; cookies anywhere in it take priority.
+    cookie_fields = []
+    for field_index, value in enumerate(parts):
+        if is_cookie(value):
+            cookie_fields.append(value)
+            recognized_indexes.add(field_index)
+    if cookie_fields:
+        cookie = cookie_fields[0] if len(cookie_fields) == 1 else "; ".join(
+            normalize_cookie_input(value).rstrip("; ") for value in cookie_fields
+        )
+    cookie_uid = re.search(r"(?:^|;)\s*c_user\s*=\s*(\d+)", normalize_cookie_input(cookie))
+    if cookie_uid and (not uid or is_cookie(uid)):
         uid = cookie_uid.group(1)
     if prefix == "TOKEN" and not uid:
         uid = token[:15]
 
     account_type = "COOKIE" if cookie else ("TOKEN" if token else "RAW")
-    if prefix == "FACEBOOK":
+    if prefix == "FACEBOOK" and not cookie:
         account_type = "RAW"
     if uid:
         name = uid if prefix != "COOKIE" else f"FB_{uid}"
@@ -5865,10 +5914,8 @@ class MainToolApp:
                 is_valid_session = False
                 
                 # Nạp Cookie Facebook
-                if "=" in cookie_str:
-                    c_list = parse_cookies(cookie_str)
-                    if c_list:
-                        await context.add_cookies(c_list)
+                if cookies:
+                    await context.add_cookies(cookies)
                     
                     self.log(f"[*] [{acc_name}] Đang mở trang chủ để kích hoạt Cookie...")
                     await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=40000)

@@ -12,6 +12,45 @@ import client_app
 
 
 class CoreHelpersTest(unittest.TestCase):
+    def test_cookie_login_accepts_supported_import_formats(self):
+        header = "c_user = 123456789; xs = abc=def;"
+        cookie_json = json.dumps([
+            {"name": "c_user", "value": "123456789"},
+            {"name": "xs", "value": "abc=def"},
+        ])
+        cases = [
+            header,
+            "Cookie: " + header,
+            "123456789|SecretPass|ABCDEFGHIJKLMNOP|||" + header + "|EAAB_TOKEN",
+            "FACEBOOK|123456789|SecretPass|" + header,
+            "COOKIE|" + header,
+            "TOKEN|EAAB_TOKEN|" + header,
+            cookie_json,
+            json.dumps({"cookies": json.loads(cookie_json)}),
+            json.dumps({"c_user": "123456789", "xs": "abc=def"}),
+            "123456789|SecretPass|ABCDEFGHIJKLMNOP|" + cookie_json,
+            header + "|127.0.0.1:8080:user:pass",
+            "123456789|SecretPass|ABCDEFGHIJKLMNOP|sb=other;|" + header,
+        ]
+        for raw in cases:
+            with self.subTest(format=cases.index(raw)):
+                parsed = client_app.parse_any_account_line(raw)
+                self.assertEqual(parsed["type"], "COOKIE")
+                self.assertEqual(parsed["uid"], "123456789")
+                cookies = {c["name"]: c["value"] for c in client_app.parse_cookies(parsed["cookie"])}
+                self.assertEqual(cookies["c_user"], "123456789")
+                self.assertEqual(cookies["xs"], "abc=def")
+                self.assertEqual(client_app.serialize_account_line(parsed), raw)
+                self.assertEqual(parsed["fields"], raw.split("|"))
+                direct = {c["name"]: c["value"] for c in client_app.parse_cookies(raw)}
+                self.assertEqual(direct["c_user"], "123456789")
+
+    def test_cookie_detection_does_not_match_password_substrings(self):
+        parsed = client_app.parse_any_account_line("FACEBOOK|123456789|not_c_user=secret")
+        self.assertEqual(parsed["type"], "RAW")
+        self.assertEqual(parsed["password"], "not_c_user=secret")
+        self.assertFalse(client_app.normalize_cookie_input("invalid JSON {"))
+
     def test_version_comparison_is_numeric(self):
         self.assertGreater(client_app.version_tuple("2.10.0"), client_app.version_tuple("2.9.9"))
 
@@ -402,6 +441,9 @@ class CoreHelpersTest(unittest.TestCase):
                 return None
 
         class FakeContext:
+            async def add_cookies(self, cookies):
+                self.loaded_cookies = cookies
+
             async def cookies(self, _url):
                 return [{"name": "c_user", "value": "123456789"}]
 
@@ -412,7 +454,7 @@ class CoreHelpersTest(unittest.TestCase):
             async def close(self):
                 return None
 
-        async def run_login_case(final_url, login_error=None):
+        async def run_login_case(final_url, login_error=None, cookie_input=""):
             app = client_app.MainToolApp.__new__(client_app.MainToolApp)
             app.is_running = True
             app.stop_requested = False
@@ -442,11 +484,20 @@ class CoreHelpersTest(unittest.TestCase):
 
             app.create_browser_page = create_browser_page
             app.get_current_friends_count = get_current_friends_count
+            if cookie_input:
+                app.login_facebook_user_pass = mock.AsyncMock(
+                    side_effect=AssertionError("Cookie login must take priority")
+                )
             await app.process_account_scoped(
-                object(), 1, "raw-user", "FACEBOOK|raw-user|secret", "",
+                object(), 1, "raw-user", cookie_input or "FACEBOOK|raw-user|secret", "",
                 asyncio.Semaphore(1), account_type="RAW",
                 login_user="raw-user", login_password="secret",
             )
+            if cookie_input:
+                app.login_facebook_user_pass.assert_not_called()
+                self.assertIn(
+                    "c_user", {cookie["name"] for cookie in context.loaded_cookies}
+                )
             return app.account_states.get(1)
 
         login_cases = [
@@ -465,6 +516,14 @@ class CoreHelpersTest(unittest.TestCase):
                 self.assertEqual(state["status"], expected_status)
                 if expected_status != "LIVE":
                     self.assertNotEqual(state["current_action"], "Hoàn thành")
+
+        cookie_json = json.dumps([
+            {"name": "c_user", "value": "123456789"},
+            {"name": "xs", "value": "abc=def"},
+        ])
+        with mock.patch.object(client_app.asyncio, "sleep", new=mock.AsyncMock()):
+            state = asyncio.run(run_login_case("https://www.facebook.com/", cookie_input=cookie_json))
+        self.assertEqual(state["status"], "LIVE")
 
         class FriendButton:
             def __init__(self):
