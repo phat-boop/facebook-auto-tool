@@ -885,7 +885,7 @@ class CoreHelpersTest(unittest.TestCase):
                 if self._count == 0:
                     raise TimeoutError("not visible")
 
-            async def scroll_into_view_if_needed(self):
+            async def scroll_into_view_if_needed(self, **_kwargs):
                 return None
 
             async def click(self, **_kwargs):
@@ -919,6 +919,12 @@ class CoreHelpersTest(unittest.TestCase):
                 return True
 
         class FakeMouse:
+            def __init__(self, page):
+                self.page = page
+
+            async def click(self, *_args, **_kwargs):
+                self.page.margin_click_steps.append(self.page.wizard_steps)
+
             async def move(self, *_args, **_kwargs):
                 return None
 
@@ -932,7 +938,7 @@ class CoreHelpersTest(unittest.TestCase):
                 return None
 
         class FakePage:
-            def __init__(self, result_url=None, body_text="", click_error=None):
+            def __init__(self, result_url=None, body_text="", click_error=None, inline_setup=False):
                 self.url = "https://www.facebook.com/pages/creation/"
                 self.frames = []
                 self.active_field = ""
@@ -944,10 +950,15 @@ class CoreHelpersTest(unittest.TestCase):
                 self.body_text = body_text
                 self.click_error = click_error
                 self.requested_name = ""
-                self.mouse = FakeMouse()
+                self.mouse = FakeMouse(self)
                 self.submitted = False
+                self.inline_setup = inline_setup
+                self.wizard_steps = 0
+                self.margin_click_steps = []
 
             async def evaluate(self, script):
+                if script == client_app.PAGE_BLANK_MARGIN_POINT:
+                    return {"x": 480, "y": 240}
                 if script != client_app.PAGE_CREATION_EVIDENCE:
                     return False
                 identity = client_app.extract_facebook_page_identity([self.url])
@@ -995,12 +1006,25 @@ class CoreHelpersTest(unittest.TestCase):
             def get_by_role(self, role, **_kwargs):
                 if role != "button":
                     return FakeLocator(count=0)
+                pattern = _kwargs.get("name")
+                if pattern is not client_app.CREATE_PAGE_BUTTON_PATTERN:
+                    label = "Done" if self.wizard_steps == 4 else "Next"
+                    if (self.inline_setup and self.submitted and self.wizard_steps < 5
+                            and pattern.search(label)):
+                        def advance_setup():
+                            self.wizard_steps += 1
+                            if self.wizard_steps == 5 and self.result_urls[self.create_index - 1]:
+                                self.url = self.result_urls[self.create_index - 1]
+                        return FakeLocator(count=1, text=label, on_click=advance_setup)
+                    return FakeLocator(count=0)
 
                 def finish_create():
                     result_url = self.result_urls[self.create_index]
                     self.create_index += 1
                     self.submitted = True
-                    if result_url:
+                    if self.inline_setup:
+                        self.body_text = f"Finish setting up your Page. Success! You've created {self.requested_name}. Now add more details."
+                    elif result_url:
                         self.url = result_url
 
                 return FakeLocator(
@@ -1016,6 +1040,7 @@ class CoreHelpersTest(unittest.TestCase):
             targets=None,
             running=True,
             wait_result=None,
+            inline_setup=False,
         ):
             app = client_app.MainToolApp.__new__(client_app.MainToolApp)
             app.is_running = running
@@ -1052,7 +1077,7 @@ class CoreHelpersTest(unittest.TestCase):
                 return True
 
             app.ensure_personal_profile = ensure_personal_profile
-            fake_page = FakePage(result_url, body_text, click_error)
+            fake_page = FakePage(result_url, body_text, click_error, inline_setup)
             page_targets = targets or ["Trang kiểm thử"]
             with (
                 mock.patch.object(client_app.asyncio, "sleep", new=mock.AsyncMock()),
@@ -1071,6 +1096,10 @@ class CoreHelpersTest(unittest.TestCase):
                     )
                 except client_app.FacebookCheckpointStopped:
                     records = []
+            if inline_setup:
+                self.assertEqual(fake_page.create_index, 1)
+                self.assertEqual(fake_page.wizard_steps, 5)
+                self.assertEqual(fake_page.margin_click_steps, [0, 5])
             return (
                 records,
                 save_result.call_count,
@@ -1171,6 +1200,25 @@ class CoreHelpersTest(unittest.TestCase):
         self.assertEqual(len(stopped_records), 1)
         self.assertEqual(stopped_records[0]["status"], "SUCCESS")
         self.assertEqual(stopped_saves, 1)
+
+        inline_records, inline_saves, categories, _status = asyncio.run(
+            run_create_case(
+                "https://www.facebook.com/profile.php?id=723456789",
+                targets=["Ngô Hải Bảo Góc Nhỏ|Local service"], inline_setup=True,
+            )
+        )
+        self.assertEqual(inline_records[0]["status"], "SUCCESS")
+        self.assertEqual(inline_records[0]["page_id"], "723456789")
+        self.assertEqual(inline_saves, 1)
+        self.assertEqual(categories, ["Local service"])
+
+        unverified_records, unverified_saves, _categories, _status = asyncio.run(
+            run_create_case(targets=["Trang A|Spa", "Trang B|Spa"], inline_setup=True)
+        )
+        self.assertEqual(len(unverified_records), 1)
+        self.assertEqual(unverified_records[0]["status"], "FAILED")
+        self.assertIn("chưa xác minh được Page URL/ID", unverified_records[0]["reason"])
+        self.assertEqual(unverified_saves, 0)
 
         cancelled_records, cancelled_saves, _categories, _status = asyncio.run(
             run_create_case(
@@ -1659,6 +1707,132 @@ class RunLifecycleTests(unittest.TestCase):
             self.assertEqual(app.set_account_failure.call_args.args[:2], (1, "automation"))
             app.guard_facebook_checkpoint.assert_not_awaited()
         asyncio.run(run())
+
+
+class PageSetupRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.app = client_app.MainToolApp.__new__(client_app.MainToolApp)
+        self.page = mock.Mock()
+        self.page.locator.return_value.count = mock.AsyncMock(return_value=0)
+
+    async def test_creation_notice_on_same_url_allows_setup_not_success(self):
+        name = "Ngô Hải Bảo Góc Nhỏ"
+        for text in (
+            f"{name} was created. Now you can add images or go to your Page to add more details.",
+            f"Finish setting up your Page. Success! You've created {name}. Now add more details.",
+            f"{name} đã được tạo.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(await self.app.page_setup_transition_detected(self.page, name, text, []))
+        self.assertFalse(client_app.is_verified_page_identity({"url": "", "id": ""}))
+
+    async def test_other_page_notice_and_manage_text_are_not_accepted(self):
+        for text in ("Trang B was created.", "Success! You've created Trang AB.", "manage page / quản lý trang"):
+            with self.subTest(text=text):
+                self.assertFalse(await self.app.page_setup_transition_detected(self.page, "Trang A", text, []))
+
+    async def test_toast_and_structural_contact_fields_are_supported(self):
+        self.assertTrue(await self.app.page_setup_transition_detected(self.page, "Spa", "", ["Spa was created."]))
+        self.page.locator.return_value.count.return_value = 1
+        self.assertTrue(await self.app.page_setup_transition_detected(self.page, "Spa", "", []))
+        self.page.locator.assert_called_with(client_app.PAGE_SETUP_FIELDS_SELECTOR)
+        self.assertIn('autocomplete="street-address"', client_app.PAGE_SETUP_FIELDS_SELECTOR)
+        self.assertIn('placeholder="Address"', client_app.PAGE_SETUP_FIELDS_SELECTOR)
+        self.assertIn(':visible', client_app.PAGE_SETUP_FIELDS_SELECTOR)
+
+    def make_button(self, visible=True, enabled=True, aria_disabled=None):
+        button = mock.Mock()
+        button.is_visible = mock.AsyncMock(return_value=visible)
+        button.is_enabled = mock.AsyncMock(return_value=enabled)
+        button.get_attribute = mock.AsyncMock(return_value=aria_disabled)
+        return button
+
+    async def test_inline_next_button_skips_hidden_and_disabled_controls(self):
+        hidden = self.make_button(visible=False)
+        disabled = self.make_button(aria_disabled="true")
+        active = self.make_button()
+        empty = mock.Mock()
+        empty.count = mock.AsyncMock(return_value=0)
+        buttons = mock.Mock()
+        buttons.count = mock.AsyncMock(return_value=3)
+        buttons.nth.side_effect = [hidden, disabled, active]
+        self.page.get_by_role.side_effect = lambda role, name: buttons if name is client_app.NEXT_BUTTON_PATTERN else empty
+        self.assertIs(await self.app.get_page_setup_button(self.page), active)
+
+    async def test_done_precedes_next_and_missing_controls_are_not_clicked(self):
+        done = self.make_button()
+        buttons = mock.Mock()
+        buttons.count = mock.AsyncMock(return_value=1)
+        buttons.nth.return_value = done
+        self.page.get_by_role.return_value = buttons
+        self.assertIs(await self.app.get_page_setup_button(self.page), done)
+        self.page.get_by_role.assert_called_once_with("button", name=client_app.PAGE_SETUP_FINISH_PATTERN)
+        buttons.count.return_value = 0
+        self.assertIsNone(await self.app.get_page_setup_button(self.page))
+
+
+class PageMarginClickTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.app = client_app.MainToolApp.__new__(client_app.MainToolApp)
+        self.app.is_running = True
+        self.app.stop_requested = False
+        self.app.log = mock.Mock()
+        self.app.guard_facebook_checkpoint = mock.AsyncMock()
+        self.app.set_account_failure = mock.Mock()
+        self.page = mock.Mock()
+        self.page.evaluate = mock.AsyncMock(return_value={"x": 480, "y": 240})
+        self.page.mouse.click = mock.AsyncMock()
+
+    async def test_clicks_only_the_checked_blank_point(self):
+        self.assertTrue(await self.app.click_page_blank_margin(self.page, "A", 1))
+        self.page.evaluate.assert_awaited_once_with(client_app.PAGE_BLANK_MARGIN_POINT)
+        self.page.mouse.click.assert_awaited_once_with(480, 240)
+        self.app.guard_facebook_checkpoint.assert_awaited_once_with(self.page, 1)
+
+    async def test_no_safe_margin_skips_click(self):
+        self.page.evaluate.return_value = None
+        self.assertFalse(await self.app.click_page_blank_margin(self.page, "A", 1))
+        self.page.mouse.click.assert_not_awaited()
+        self.app.set_account_failure.assert_not_called()
+
+    async def test_stopped_run_does_not_click(self):
+        self.app.stop_requested = True
+        self.assertFalse(await self.app.click_page_blank_margin(self.page, "A", 1))
+        self.page.evaluate.assert_not_awaited()
+        self.page.mouse.click.assert_not_awaited()
+
+    async def test_stop_after_point_selection_does_not_click(self):
+        async def select_then_stop(*_args):
+            self.app.stop_requested = True
+            return {"x": 480, "y": 240}
+        self.page.evaluate.side_effect = select_then_stop
+        self.assertFalse(await self.app.click_page_blank_margin(self.page, "A", 1))
+        self.page.mouse.click.assert_not_awaited()
+
+    async def test_optional_click_failure_does_not_change_account_status(self):
+        self.page.mouse.click.side_effect = RuntimeError("browser closed")
+        self.assertFalse(await self.app.click_page_blank_margin(self.page, "A", 1))
+        self.app.set_account_failure.assert_not_called()
+        self.app.log.assert_called_once()
+
+    async def test_checkpoint_cancels_without_click(self):
+        self.app.guard_facebook_checkpoint.side_effect = client_app.FacebookCheckpointStopped()
+        with self.assertRaises(client_app.FacebookCheckpointStopped):
+            await self.app.click_page_blank_margin(self.page, "A", 1)
+        self.page.evaluate.assert_not_awaited()
+        self.page.mouse.click.assert_not_awaited()
+
+    async def test_concurrent_accounts_use_their_own_page(self):
+        other_page = mock.Mock()
+        other_page.evaluate = mock.AsyncMock(return_value={"x": 980, "y": 400})
+        other_page.mouse.click = mock.AsyncMock()
+        results = await asyncio.gather(
+            self.app.click_page_blank_margin(self.page, "A", 1),
+            self.app.click_page_blank_margin(other_page, "B", 2),
+        )
+        self.assertEqual(results, [True, True])
+        self.page.mouse.click.assert_awaited_once_with(480, 240)
+        other_page.mouse.click.assert_awaited_once_with(980, 400)
 
 
 class PageWaitTests(unittest.IsolatedAsyncioTestCase):
