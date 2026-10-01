@@ -36,6 +36,25 @@ class CoreHelpersTest(unittest.TestCase):
             client_app.get_self_update_target(packaged_target, frozen=True),
             packaged_target,
         )
+        restart_script = client_app.build_windows_update_restart_script(
+            4321,
+            r"C:\Users\Test User\AppData\Local\FacebookAutoTool\update_temp.exe",
+            packaged_target,
+            r"C:\Users\Test User\AppData\Local\FacebookAutoTool\update_restart_error.log",
+        )
+        copy_position = restart_script.index('copy /y ')
+        copy_check_position = restart_script.index('if errorlevel 1 goto replace_failed')
+        reset_position = restart_script.index('set "PYINSTALLER_RESET_ENVIRONMENT=1"')
+        restart_position = restart_script.index(
+            'start "" /d "C:\\Apps\\FacebookTool" "C:\\Apps\\FacebookTool\\client_app.exe"'
+        )
+        self.assertLess(copy_position, copy_check_position)
+        self.assertLess(copy_check_position, reset_position)
+        self.assertLess(reset_position, restart_position)
+        self.assertIn('if errorlevel 1 goto restart_failed', restart_script)
+        self.assertIn(':restart_failed', restart_script)
+        self.assertIn('Vui long mo lai ung dung thu cong.', restart_script)
+        self.assertIn('del /q "%~f0"', restart_script)
 
         class FakeResponse:
             status = 200
@@ -544,6 +563,146 @@ class CoreHelpersTest(unittest.TestCase):
             ["Cửa hàng B|Nhà hàng"],
         )
 
+    def test_page_context_requires_verified_identity_for_success(self):
+        context = client_app.build_page_context(
+            "account-A", "Trang A", "Spa", proxy="10.0.0.1:8001", locale="th-TH"
+        )
+        self.assertEqual(context["creation_status"], "PENDING")
+        client_app.transition_page_context(context, "VALIDATING")
+        client_app.transition_page_context(context, "VERIFYING")
+        with self.assertRaises(ValueError):
+            client_app.transition_page_context(context, "SUCCESS", {"url": "", "id": ""})
+        client_app.transition_page_context(
+            context,
+            "SUCCESS",
+            {"url": "https://www.facebook.com/profile.php?id=123456789", "id": "123456789"},
+        )
+        self.assertEqual(context["owner_account_id"], "account-A")
+        self.assertEqual(context["requested_category"], "Spa")
+        self.assertEqual(context["locale"], "th-TH")
+        self.assertEqual(context["verification_status"], "VERIFIED")
+
+    def test_page_count_semantics_one_five_and_fifteen(self):
+        with mock.patch.object(client_app, "generate_random_person_name", return_value="Auto Page"):
+            for requested in (1, 5, 15):
+                plans = client_app.build_create_page_plans([], requested)
+                self.assertEqual(len(plans), requested)
+                self.assertTrue(client_app.validate_create_page_targets(plans, requested)[0])
+
+    def test_page_access_feedback_is_not_false_success(self):
+        self.assertEqual(client_app.classify_page_access_feedback("Invitation sent"), "INVITED")
+        self.assertEqual(client_app.classify_page_access_feedback("กำลังรอดำเนินการ"), "PENDING")
+        self.assertEqual(client_app.classify_page_access_feedback("대기 중"), "PENDING")
+        self.assertEqual(client_app.classify_page_access_feedback("Button clicked"), "FAILED")
+
+    def test_page_access_result_keeps_owner_page_and_target(self):
+        result = client_app.build_page_access_result(
+            "account-A", "https://www.facebook.com/page-a", "10002", "PENDING"
+        )
+        self.assertEqual(result["account_id"], "account-A")
+        self.assertEqual(result["page_id"], "page-a")
+        self.assertEqual(result["target_user"], "10002")
+        self.assertEqual(result["business_id"], "")
+
+    def test_page_and_access_worker_limits(self):
+        self.assertEqual(
+            client_app.effective_account_worker_count(
+                20, {"create_page": True, "add_page_admin": True}, 3, 2
+            ),
+            2,
+        )
+        self.assertEqual(
+            client_app.effective_account_worker_count(
+                20, {"create_page": False, "add_page_admin": True}, 3, 2
+            ),
+            2,
+        )
+
+    def test_page_duplicate_keys_use_verified_identity(self):
+        first = client_app.page_identity_keys(
+            "https://www.facebook.com/Page-A/", "123456789"
+        )
+        second = client_app.page_identity_keys(
+            "https://www.facebook.com/page-a", "123456789"
+        )
+        self.assertTrue(first & second)
+        self.assertFalse(client_app.page_identity_keys("", ""))
+
+    def test_page_url_without_numeric_id_is_verified(self):
+        identity = client_app.extract_facebook_page_identity(
+            ["https://www.facebook.com/my-valid-page"]
+        )
+        self.assertEqual(identity["url"], "https://www.facebook.com/my-valid-page")
+        self.assertTrue(client_app.is_verified_page_identity(identity))
+
+    def test_page_missing_identity_cannot_be_success(self):
+        context = client_app.build_page_context("account-A", "Page A", "Spa")
+        with self.assertRaises(ValueError):
+            client_app.transition_page_context(context, "SUCCESS", None)
+        self.assertNotEqual(context["creation_status"], "SUCCESS")
+
+    def test_create_page_transient_retry_uses_bounded_backoff(self):
+        calls = []
+
+        async def operation():
+            calls.append(len(calls) + 1)
+            if len(calls) < 3:
+                raise TimeoutError("temporary navigation timeout")
+            return "ok"
+
+        with mock.patch.object(client_app.asyncio, "sleep", new=mock.AsyncMock()) as sleep:
+            result, retry_count = asyncio.run(
+                client_app.retry_create_page_operation(operation, max_attempts=3, base_delay=1)
+            )
+        self.assertEqual(result, "ok")
+        self.assertEqual(retry_count, 2)
+        self.assertEqual(calls, [1, 2, 3])
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [1, 2])
+
+    def test_create_page_permanent_error_is_not_retried(self):
+        calls = []
+
+        async def operation():
+            calls.append(1)
+            raise ValueError("invalid page name")
+
+        with mock.patch.object(client_app.asyncio, "sleep", new=mock.AsyncMock()) as sleep:
+            with self.assertRaises(ValueError):
+                asyncio.run(client_app.retry_create_page_operation(operation, max_attempts=3))
+        self.assertEqual(len(calls), 1)
+        sleep.assert_not_awaited()
+
+    def test_create_page_network_errors_are_technical(self):
+        self.assertTrue(client_app.is_transient_create_page_error(TimeoutError("timeout")))
+        self.assertTrue(client_app.is_transient_create_page_error(OSError("DNS failure")))
+        self.assertFalse(client_app.is_transient_create_page_error(ValueError("invalid category")))
+        self.assertEqual(client_app.account_status_for_failure("proxy"), "ERROR")
+
+    def test_parallel_page_contexts_do_not_cross_account(self):
+        context_a = client_app.build_page_context("A", "Page A", "Spa", proxy="proxy-A")
+        context_b = client_app.build_page_context("B", "Page B", "Restaurant", proxy="proxy-B")
+        client_app.transition_page_context(
+            context_a, "SUCCESS", {"url": "https://www.facebook.com/page-a", "id": "11111"}
+        )
+        self.assertEqual(context_a["page_id"], "11111")
+        self.assertEqual(context_b["page_id"], "")
+        self.assertEqual(context_b["proxy"], "proxy-B")
+        self.assertEqual(context_b["requested_category"], "Restaurant")
+
+    def test_cancelled_page_context_is_never_verified(self):
+        context = client_app.build_page_context("A", "Page A", "Spa")
+        client_app.transition_page_context(context, "CANCELLED")
+        self.assertEqual(context["creation_status"], "CANCELLED")
+        self.assertEqual(context["verification_status"], "NOT_VERIFIED")
+
+    def test_page_admin_mapping_rejects_other_owner(self):
+        jobs = ["1|https://www.facebook.com/page-a|10001"]
+        self.assertIsNone(client_app.select_page_admin_job(jobs, 2, "account-B"))
+        self.assertFalse(client_app.page_reference_matches(
+            "https://www.facebook.com/page-a",
+            "https://www.facebook.com/page-b/settings/?tab=profile_access",
+        ))
+
     def test_page_admin_job_is_scoped_to_account(self):
         targets = [
             "1|https://www.facebook.com/page-one|10001",
@@ -613,10 +772,14 @@ class CoreHelpersTest(unittest.TestCase):
                 return None
 
         class FakeLocator:
-            def __init__(self, count=0, on_click=None, on_focus=None, click_error=None):
+            def __init__(
+                self, count=0, on_click=None, on_focus=None,
+                on_fill=None, click_error=None,
+            ):
                 self._count = count
                 self._on_click = on_click
                 self._on_focus = on_focus
+                self._on_fill = on_fill
                 self._click_error = click_error
 
             @property
@@ -648,6 +811,11 @@ class CoreHelpersTest(unittest.TestCase):
             async def focus(self):
                 if self._on_focus:
                     self._on_focus()
+                return None
+
+            async def fill(self, value):
+                if self._on_fill:
+                    self._on_fill(value)
                 return None
 
             async def get_attribute(self, _name):
@@ -686,7 +854,11 @@ class CoreHelpersTest(unittest.TestCase):
                         self.active_field = "category"
                         self.category_buffer = ""
 
-                    return FakeLocator(count=1, on_focus=focus_category)
+                    return FakeLocator(
+                        count=1,
+                        on_focus=focus_category,
+                        on_fill=lambda value: setattr(self, "category_buffer", value),
+                    )
                 if 'role="listbox"' in selector:
                     return FakeLocator(
                         count=1,
@@ -717,9 +889,10 @@ class CoreHelpersTest(unittest.TestCase):
             body_text="",
             click_error=None,
             targets=None,
+            running=True,
         ):
             app = client_app.MainToolApp.__new__(client_app.MainToolApp)
-            app.is_running = True
+            app.is_running = running
             app.run_config = {
                 "feed_surf_min": 0,
                 "watch_review_min": 0,
@@ -842,6 +1015,15 @@ class CoreHelpersTest(unittest.TestCase):
         )
         self.assertEqual(categories, ["Nhà hàng", "Spa"])
         self.assertEqual([record["category"] for record in records], ["Nhà hàng", "Spa"])
+
+        cancelled_records, cancelled_saves, _categories, _status = asyncio.run(
+            run_create_case(
+                "https://www.facebook.com/profile.php?id=623456789",
+                running=False,
+            )
+        )
+        self.assertEqual(cancelled_records, [])
+        self.assertEqual(cancelled_saves, 0)
 
         self.assertEqual(
             client_app.validate_create_page_targets(["Trang A|Spa"], 1),

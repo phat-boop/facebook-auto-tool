@@ -177,9 +177,16 @@ try {
 
     $testOutput = Invoke-NativeChecked $python @('-m', 'unittest', 'discover', '-s', 'tests', '-v') 'Chạy unit test'
     $testText = $testOutput -join "`n"
-    if ($testText -notmatch 'Ran\s+10\s+tests?\s+in' -or $testText -notmatch '(?m)^OK\s*$') {
-        throw 'Unit test không xác nhận đúng 10/10 bài test thành công.'
+    $testSummary = [regex]::Matches($testText, '(?m)^Ran\s+(\d+)\s+tests?\s+in\b')
+    if ($testSummary.Count -ne 1) {
+        throw 'Unit test không có duy nhất một bản tổng kết số test đã chạy.'
     }
+    $testsRun = [long]$testSummary[0].Groups[1].Value
+    if ($testsRun -lt 1 -or $testText -notmatch '(?m)^OK\s*$' -or $testText -match '\b(?:FAILED|ERROR)\b') {
+        throw 'Unit test không xác nhận thành công hoặc không chạy được test nào.'
+    }
+    Write-Host "Tests run: $testsRun"
+    Write-Host 'Result: PASS' -ForegroundColor Green
 
     if (Test-Path -LiteralPath $exePath) {
         Remove-Item -LiteralPath $exePath -Force

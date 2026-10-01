@@ -37,7 +37,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.1.9"
+CURRENT_VERSION = "2.2.0"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -139,6 +139,13 @@ LOGIN_SUCCESS = "SUCCESS"
 LOGIN_INVALID = "INVALID"
 LOGIN_TECHNICAL_ERROR = "TECHNICAL_ERROR"
 
+PAGE_FLOW_STATES = {
+    "PENDING", "VALIDATING", "SESSION_CHECK", "OPEN_CREATE_PAGE",
+    "FILL_PAGE_NAME", "SELECT_CATEGORY", "SUBMITTING", "VERIFYING",
+    "SUCCESS", "FAILED", "ERROR", "CANCELLED",
+}
+PAGE_ACCESS_STATUSES = {"ASSIGNED", "INVITED", "PENDING", "FAILED", "ERROR"}
+
 
 def split_account_batches(items, batch_size):
     size = max(1, int(batch_size))
@@ -146,11 +153,17 @@ def split_account_batches(items, batch_size):
     return [values[index:index + size] for index in range(0, len(values), size)]
 
 
-def effective_account_worker_count(requested_threads, modes, max_create_page_workers=3):
+def effective_account_worker_count(
+    requested_threads, modes, max_create_page_workers=3, max_bm_workers=None
+):
     requested = max(1, int(requested_threads))
+    limits = [requested]
     if (modes or {}).get("create_page", False):
-        return min(requested, max(1, int(max_create_page_workers)))
-    return requested
+        limits.append(max(1, int(max_create_page_workers)))
+    if (modes or {}).get("add_page_admin", False):
+        bm_limit = max_create_page_workers if max_bm_workers is None else max_bm_workers
+        limits.append(max(1, int(bm_limit)))
+    return min(limits)
 
 
 def account_status_for_failure(failure_kind):
@@ -597,6 +610,7 @@ def build_create_page_result(
     retry_count=0,
     account_index=None,
     proxy="",
+    flow_state="",
 ):
     return {
         "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -613,7 +627,82 @@ def build_create_page_result(
         "reason": reason,
         "technical_error": technical_error,
         "retry_count": int(retry_count),
+        "flow_state": str(flow_state or status).upper(),
     }
+
+
+def build_page_context(account_id, page_name, category, proxy="", locale="AUTO"):
+    return {
+        "owner_account_id": str(account_id or ""),
+        "requested_page_name": str(page_name or ""),
+        "requested_category": str(category or ""),
+        "proxy": str(proxy or ""),
+        "locale": normalize_account_locale(locale),
+        "page_id": "",
+        "page_url": "",
+        "creation_status": "PENDING",
+        "verification_status": "PENDING",
+        "created_at": "",
+    }
+
+
+def transition_page_context(page_context, state, page_identity=None):
+    normalized_state = str(state or "").upper()
+    if normalized_state not in PAGE_FLOW_STATES:
+        raise ValueError(f"Create Page state không hợp lệ: {state}")
+    if normalized_state == "SUCCESS" and not is_verified_page_identity(page_identity or {}):
+        raise ValueError("Không thể chuyển SUCCESS khi chưa có Page URL/ID hợp lệ.")
+    page_context["creation_status"] = normalized_state
+    if normalized_state == "VERIFYING":
+        page_context["verification_status"] = "VERIFYING"
+    elif normalized_state == "SUCCESS":
+        identity = page_identity or {}
+        page_context["page_url"] = str(identity.get("url") or "")
+        page_context["page_id"] = str(identity.get("id") or "")
+        page_context["verification_status"] = "VERIFIED"
+        page_context["created_at"] = datetime.now().isoformat(timespec="seconds")
+    elif normalized_state in {"FAILED", "ERROR", "CANCELLED"}:
+        page_context["verification_status"] = "NOT_VERIFIED"
+    return page_context
+
+
+def classify_page_access_feedback(text):
+    normalized = str(text or "").casefold()
+    marker_groups = (
+        ("ASSIGNED", ("has facebook access", "đã có quyền truy cập", "ได้รับสิทธิ์", "アクセス権", "액세스 권한")),
+        ("INVITED", ("invitation sent", "đã gửi lời mời", "ส่งคำเชิญแล้ว", "undangan dikirim", "招待を送信", "초대를 보냈")),
+        ("PENDING", ("pending", "đang chờ", "รอดำเนินการ", "menunggu", "保留中", "대기 중")),
+    )
+    for status, markers in marker_groups:
+        if any(marker in normalized for marker in markers):
+            return status
+    return "FAILED"
+
+
+def build_page_access_result(account_id, page_url, target_user, status, reason=""):
+    normalized_status = str(status or "").upper()
+    if normalized_status not in PAGE_ACCESS_STATUSES:
+        raise ValueError(f"Trạng thái Page Access không hợp lệ: {status}")
+    return {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "account_id": str(account_id or ""),
+        "page_id": facebook_page_reference(page_url),
+        "page_url": str(page_url or ""),
+        "business_id": "",
+        "target_user": str(target_user or ""),
+        "assignment_status": normalized_status,
+        "reason": str(reason or ""),
+    }
+
+
+PAGE_ACCESS_RESULT_FIELDS = [
+    "timestamp", "account_id", "business_id", "page_id", "page_url",
+    "target_user", "assignment_status", "reason",
+]
+
+
+def save_page_access_result(result):
+    append_csv_result("page_admin_jobs.csv", PAGE_ACCESS_RESULT_FIELDS, result)
 
 
 def page_identity_keys(page_url="", page_id=""):
@@ -632,7 +721,7 @@ def save_created_page_success(record):
     fieldnames = [
         "time", "timestamp", "account_index", "account", "account_id",
         "page_name", "category", "page_url", "page_id", "proxy", "status",
-        "reason", "technical_error", "retry_count",
+        "reason", "technical_error", "retry_count", "flow_state",
     ]
     csv_path = output_path("created_pages.csv")
     success_path = output_path("created_pages_success.txt")
@@ -668,7 +757,7 @@ def save_created_page_success(record):
 CREATE_PAGE_RESULT_FIELDS = [
     "time", "timestamp", "account_index", "account", "account_id",
     "page_name", "category", "page_url", "page_id", "proxy", "status",
-    "reason", "technical_error", "retry_count",
+    "reason", "technical_error", "retry_count", "flow_state",
 ]
 
 
@@ -835,6 +924,49 @@ def get_self_update_target(executable=None, frozen=None):
     return target
 
 
+def build_windows_update_restart_script(process_id, temp_file, current_exe, error_log):
+    """Build the updater script that replaces and starts a fresh PyInstaller app."""
+    def batch_path(value):
+        return os.path.abspath(str(value)).replace("%", "%%")
+
+    temp_path = batch_path(temp_file)
+    executable_path = batch_path(current_exe)
+    executable_dir = batch_path(os.path.dirname(current_exe))
+    error_log_path = batch_path(error_log)
+    return f"""@echo off
+setlocal
+del /q "{error_log_path}" >nul 2>&1
+taskkill /f /pid {int(process_id)} >nul 2>&1
+timeout /t 3 /nobreak >nul
+copy /y "{temp_path}" "{executable_path}" >nul
+if errorlevel 1 goto replace_failed
+del /q "{temp_path}" >nul 2>&1
+
+rem Start a new top-level PyInstaller instance instead of inheriting the old archive context.
+set "PYINSTALLER_RESET_ENVIRONMENT=1"
+start "" /d "{executable_dir}" "{executable_path}"
+if errorlevel 1 goto restart_failed
+goto cleanup
+
+:replace_failed
+>"{error_log_path}" echo Khong the thay the file EXE. Vui long thu cap nhat lai.
+set "UPDATE_FAILURE_MESSAGE=Khong the thay the file cap nhat. Vui long thu lai."
+goto notify_failure
+
+:restart_failed
+>"{error_log_path}" echo EXE moi da duoc thay thanh cong nhung khong the tu khoi dong.
+set "UPDATE_FAILURE_MESSAGE=EXE moi da duoc cai dat nhung khong the tu khoi dong. Vui long mo lai ung dung thu cong."
+
+:notify_failure
+start "" powershell.exe -NoProfile -WindowStyle Hidden -Command "Add-Type -AssemblyName PresentationFramework; [System.Windows.MessageBox]::Show('%UPDATE_FAILURE_MESSAGE%', 'Cap nhat phan mem')"
+
+:cleanup
+del /q "{temp_path}" >nul 2>&1
+endlocal
+del /q "%~f0" >nul 2>&1
+"""
+
+
 def check_for_updates(self, manual=False):
     """Kiểm tra bản mới và hiển thị cửa sổ cập nhật tùy chỉnh có thanh tiến trình"""
     try:
@@ -971,14 +1103,10 @@ def check_for_updates(self, manual=False):
                                         os.remove(temp_file)
                                         raise RuntimeError("Target tự cập nhật không an toàn hoặc ứng dụng đang chạy source.")
                                     updater_file = output_path("updater.bat")
-                                    bat_script = f"""@echo off
-taskkill /f /pid {os.getpid()} >nul 2>&1
-timeout /t 3 /nobreak >nul
-copy /y "{temp_file}" "{current_exe}"
-start "" "{current_exe}"
-del "{temp_file}"
-del "%~f0"
-"""
+                                    restart_error_log = output_path("update_restart_error.log")
+                                    bat_script = build_windows_update_restart_script(
+                                        os.getpid(), temp_file, current_exe, restart_error_log
+                                    )
                                     with open(updater_file, "w", encoding="utf-8") as f_bat:
                                         f_bat.write(bat_script)
 
@@ -1456,21 +1584,23 @@ def get_installed_browser_path():
 # ==================== BẢNG MÀU CHUYÊN NGHIỆP (THEMES) ====================
 THEMES = {
     "Dark Charcoal (Mặc định)": {
-        "bg": "#18191A",
-        "card": "#242526",
-        "primary": "#2D88FF",
-        "text": "#E4E6EB",
-        "border": "#3E4042",
-        "entry_bg": "#3A3B3C",
-        "entry_fg": "#FFFFFF",
-        "log_bg": "#121212",
-        "log_fg": "#00FF66"
+        "bg": "#10151B",
+        "card": "#1A222B",
+        "primary": "#43BEB2",
+        "text": "#E7EDF2",
+        "muted": "#A9B6C2",
+        "border": "#32404C",
+        "entry_bg": "#0D1319",
+        "entry_fg": "#F5F8FA",
+        "log_bg": "#0B1015",
+        "log_fg": "#79D5CB"
     },
     "Cyberpunk Neon": {
         "bg": "#0D1117",
         "card": "#161B22",
         "primary": "#00F0FF",
         "text": "#F0F6FC",
+        "muted": "#9BA9B7",
         "border": "#30363D",
         "entry_bg": "#21262D",
         "entry_fg": "#00F0FF",
@@ -1482,6 +1612,7 @@ THEMES = {
         "card": "#172A45",
         "primary": "#64FFDA",
         "text": "#CCD6F6",
+        "muted": "#9CAECC",
         "border": "#233554",
         "entry_bg": "#0F2038",
         "entry_fg": "#FFFFFF",
@@ -1493,6 +1624,7 @@ THEMES = {
         "card": "#FFFFFF",
         "primary": "#1877F2",
         "text": "#050505",
+        "muted": "#52606D",
         "border": "#CED0D4",
         "entry_bg": "#FFFFFF",
         "entry_fg": "#000000",
@@ -1941,6 +2073,34 @@ class MainToolApp:
         # Style Progressbar
         self.style.configure("Horizontal.TProgressbar", troughcolor=t["border"], background=t["primary"], bordercolor=t["card"])
 
+        # Recolor legacy hard-coded neutral surfaces while preserving semantic
+        # green/red/orange action and status colors.
+        color_map = {
+            "#0a0e1a": t["bg"], "#0b0f19": t["bg"], "#0b1117": t["bg"],
+            "#131c2e": t["card"], "#101820": t["card"],
+            "#070b14": t["entry_bg"], "#1e293b": t["border"],
+            "#0254f8": t["card"], "#38bdf8": t["primary"],
+            "#e2e8f0": t["text"], "#f8fafc": t["text"],
+            "#94a3b8": t.get("muted", t["text"]),
+            "#64748b": t.get("muted", t["text"]),
+        }
+
+        def recolor_widget(widget):
+            for option in (
+                "background", "foreground", "activebackground", "activeforeground",
+                "highlightbackground", "insertbackground", "selectcolor",
+            ):
+                try:
+                    current = str(widget.cget(option)).casefold()
+                    if current in color_map:
+                        widget.configure(**{option: color_map[current]})
+                except (tk.TclError, KeyError):
+                    pass
+            for child in widget.winfo_children():
+                recolor_widget(child)
+
+        recolor_widget(self.root)
+
         # Cập nhật màu các ô ScrolledText
         for txt in [self.txt_accounts, self.txt_proxies, self.txt_targets]:
             txt.configure(bg=t["entry_bg"], fg=t["entry_fg"], insertbackground=t["primary"], relief="solid", bd=1)
@@ -2268,7 +2428,7 @@ class MainToolApp:
         self.ent_watch_review_min = tk.Entry(f5_page_warmup, width=4, font=("Segoe UI", 8), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
         self.ent_watch_review_min.insert(0, "5")
         self.ent_watch_review_min.pack(side="left", padx=2)
-        tk.Label(f5_page_warmup, text="Luồng tạo Page:", font=("Segoe UI", 8), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(10, 2))
+        tk.Label(f5_page_warmup, text="Luồng Page/BM:", font=("Segoe UI", 8), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(10, 2))
         self.ent_max_create_page_workers = tk.Entry(f5_page_warmup, width=3, font=("Segoe UI", 8), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
         self.ent_max_create_page_workers.insert(0, "3")
         self.ent_max_create_page_workers.pack(side="left", padx=2)
@@ -3479,19 +3639,33 @@ class MainToolApp:
         return 0
     async def run_add_page_admin(self, page, acc_name, idx, page_url, target_uid_or_name):
         """Tự động cấp quyền Quản trị viên / Biên tập viên cho Fanpage Profile"""
+        def finish(status, reason):
+            result = build_page_access_result(
+                acc_name, page_url, target_uid_or_name, status, reason
+            )
+            save_page_access_result(result)
+            self.set_account_state(
+                idx,
+                current_action=f"Page Access [{result['assignment_status']}]: {reason}",
+            )
+            self.log(
+                f"[PAGE_ACCESS][{result['assignment_status']}] [{acc_name}] "
+                f"page_id={result['page_id'] or 'N/A'} target={target_uid_or_name} | {reason}"
+            )
+            return result
+
         if not page_url or not target_uid_or_name:
-            self.log(f"[-] [{acc_name}] Thiếu Link Page hoặc UID/Tên nick cần thêm Admin!")
-            return 0
-        self.log(f"[*] [{acc_name}] Đang mở cài đặt cấp quyền Page: {page_url}...")
+            return finish("FAILED", "Thiếu Link Page hoặc UID/Tên cần thêm quyền.")
+        self.log(f"[PAGE_ACCESS][START] [{acc_name}] page={page_url} target={target_uid_or_name}")
         try:
             settings_url = page_url.rstrip('/') + "/settings/?tab=profile_access"
             await page.goto(settings_url, wait_until="domcontentloaded", timeout=40000)
             await asyncio.sleep(4)
             if not page_reference_matches(page_url, page.url):
-                self.log(
-                    f"[-] [{acc_name}] Trang cài đặt không khớp Page được giao; dừng để tránh ghép nhầm."
+                return finish(
+                    "FAILED",
+                    "Trang cài đặt không khớp Page được giao; đã dừng để tránh ghép nhầm.",
                 )
-                return 0
 
             # Bấm Thêm người mới (Add new)
             add_btn = page.locator(
@@ -3547,22 +3721,10 @@ class MainToolApp:
                             await asyncio.sleep(3)
                             password_prompt = page.locator('input[type="password"]:visible')
                             if await password_prompt.count() > 0:
-                                self.log(
-                                    f"[!] [{acc_name}] Facebook yêu cầu xác nhận mật khẩu; "
-                                    "chưa ghi nhận ghép Page thành công."
+                                return finish(
+                                    "PENDING",
+                                    "Facebook yêu cầu xác nhận mật khẩu; chưa xác minh cấp quyền.",
                                 )
-                                append_csv_result(
-                                    "page_admin_jobs.csv",
-                                    ["time", "account", "page_url", "admin", "status"],
-                                    {
-                                        "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                        "account": acc_name,
-                                        "page_url": page_url,
-                                        "admin": target_uid_or_name,
-                                        "status": "password_confirmation_required",
-                                    },
-                                )
-                                return 0
 
                             action_completed = False
                             try:
@@ -3597,42 +3759,29 @@ class MainToolApp:
                                     result_text = (await feedback.last.inner_text(timeout=1500)).casefold()
                                 except Exception:
                                     result_text = ""
-                            text_confirmed = any(message in result_text for message in (
-                                "đã gửi lời mời", "invitation sent", "đang chờ", "pending"
-                            ))
+                            assignment_status = classify_page_access_feedback(result_text)
                             confirmed = bool(
                                 page_still_matches
                                 and target_still_verified
-                                and (action_completed or text_confirmed)
-                            )
-                            append_csv_result(
-                                "page_admin_jobs.csv",
-                                ["time", "account", "page_url", "admin", "status"],
-                                {
-                                    "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                    "account": acc_name,
-                                    "page_url": page_url,
-                                    "admin": target_uid_or_name,
-                                    "status": "confirmed" if confirmed else "submitted_needs_review",
-                                },
+                                and assignment_status in {"ASSIGNED", "INVITED", "PENDING"}
                             )
                             if confirmed:
-                                self.log(f"[✔] [{acc_name}] Facebook xác nhận đã mời Admin: {target_uid_or_name}")
-                                return 1
-                            self.log(
-                                f"[!] [{acc_name}] Đã gửi thao tác ghép Page nhưng chưa thấy xác nhận; "
-                                "đã lưu để kiểm tra."
+                                return finish(
+                                    assignment_status,
+                                    "Đã xác minh đúng Page, đúng target và trạng thái phản hồi.",
+                                )
+                            return finish(
+                                "FAILED",
+                                "Đã click cấp quyền nhưng chưa xác minh được Page/target/trạng thái.",
                             )
-                            return 0
                     else:
-                        self.log(
-                            f"[-] [{acc_name}] Kết quả tìm kiếm không khớp account đích "
-                            f"'{target_uid_or_name}'; không cấp quyền."
+                        return finish(
+                            "FAILED",
+                            f"Kết quả tìm kiếm không khớp target '{target_uid_or_name}'.",
                         )
-            self.log(f"[-] [{acc_name}] Không tìm thấy mục quản lý quyền Page.")
+            return finish("FAILED", "Không tìm thấy mục quản lý quyền Page.")
         except Exception as e:
-            self.log(f"[-] [{acc_name}] Lỗi phân quyền Admin Page: {e}")
-        return 0
+            return finish("ERROR", f"{type(e).__name__}: {e}")
 
     async def run_update_page_info(self, page, acc_name, idx, page_url, new_page_name):
         """Tự động đổi tên Fanpage theo yêu cầu"""
@@ -4809,6 +4958,18 @@ class MainToolApp:
 
         def record_result(result):
             results.append(result)
+            result_status = str(result.get("status") or "ERROR").upper()
+            detail = (
+                result.get("reason")
+                or result.get("technical_error")
+                or result.get("page_url")
+                or result.get("page_id")
+                or result.get("page_name")
+            )
+            self.set_account_state(
+                idx,
+                current_action=f"Create Page [{result_status}]: {str(detail)[:140]}",
+            )
             try:
                 save_create_page_outcome(result)
                 append_create_page_account_log(
@@ -4848,14 +5009,36 @@ class MainToolApp:
             page_name = page_plan["name"]
             category_name = page_plan["category"]
             retry_count = 0
+            page_context = build_page_context(
+                acc_name, page_name, category_name,
+                proxy=resolved_proxy,
+                locale=self.account_states.get(idx).get("locale", "AUTO")
+                if self.account_states.get(idx) else "AUTO",
+            )
 
-            self.log(f"[*] [{acc_name}] [{created_count + 1}/{effective_max_pages}] Đang tải trang tạo Page: '{page_name}'...")
+            def set_page_flow_state(state, detail=""):
+                transition_page_context(page_context, state)
+                action = f"Create Page [{state}]"
+                if detail:
+                    action += f": {detail}"
+                self.set_account_state(idx, current_action=action)
+                self.log(f"[PAGE][{state}] [{acc_name}] {detail}".rstrip())
+
+            set_page_flow_state("PENDING", f"{page_name} ({p_idx + 1}/{effective_max_pages})")
+            set_page_flow_state("VALIDATING", f"category={category_name}")
 
             try:
                 # ======================================================
                 # BƯỚC 1: TRUY CẬP VÀ ĐỢI REACT LOAD XONG
                 # ======================================================
                 try:
+                    set_page_flow_state("SESSION_CHECK")
+                    if is_invalid_facebook_account_url(page.url):
+                        reason = f"Session không hợp lệ trước Create Page: {page.url}"
+                        set_page_flow_state("FAILED", reason)
+                        self.set_account_failure(idx, "invalid_login", reason)
+                        return results
+                    set_page_flow_state("OPEN_CREATE_PAGE", page_name)
                     async def navigate_to_creation():
                         return await page.goto(
                             "https://www.facebook.com/pages/creation/",
@@ -4877,7 +5060,7 @@ class MainToolApp:
                     ))
                     self.log(f"[ERROR] [{acc_name}] Lỗi tải trang tạo Page: {e}")
                     continue
-                await asyncio.sleep(random.uniform(3,5))
+                await asyncio.sleep(3)
 
                 cur_url = page.url.lower()
                 self.log(
@@ -4983,7 +5166,7 @@ class MainToolApp:
                 # ======================================================
                 # BƯỚC 3: GÕ TÊN TRANG (THÊM LỆNH FOCUS TRƯỚC KHI GÕ)
                 # ======================================================
-                self.log(f"[*] [{acc_name}] Đang focus và tự tay gõ tên: '{page_name}'...")
+                set_page_flow_state("FILL_PAGE_NAME", page_name)
                 await name_input.scroll_into_view_if_needed()
                 await name_input.click(timeout=3000)
                 
@@ -5001,13 +5184,8 @@ class MainToolApp:
                     ))
                     continue
                 
-                await page.keyboard.press("Control+A")
-                await page.keyboard.press("Backspace")
-                await asyncio.sleep(0.5)
-
-                for char in page_name:
-                    await page.keyboard.type(char, delay=random.randint(80, 150))
-                await asyncio.sleep(1.5)
+                await name_input.fill(page_name)
+                await asyncio.sleep(1)
                 # Tự động bắt lỗi tên không hợp lệ từ Facebook và tự sửa
                 await asyncio.sleep(1.0)
                 err_notice = page.locator('div[role="alert"], div:has-text("không hợp lệ"), div:has-text("đề xuất")')
@@ -5017,14 +5195,8 @@ class MainToolApp:
                     # Lọc lấy tên thuần (bỏ các từ nối, hậu tố)
                     clean_name = page_name.split(" -")[0].split(" Official")[0].split(" Review")[0].strip()
                     
-                    await name_input.click()
-                    await page.keyboard.press("Control+A")
-                    await page.keyboard.press("Backspace")
-                    await asyncio.sleep(0.5)
-                    
-                    for char in clean_name:
-                        await page.keyboard.type(char, delay=random.randint(60, 110))
-                    await asyncio.sleep(1.5)
+                    await name_input.fill(clean_name)
+                    await asyncio.sleep(1)
 
                 # ======================================================
                 # ======================================================
@@ -5060,18 +5232,11 @@ class MainToolApp:
                         break
 
                 if cat_input:
+                    set_page_flow_state("SELECT_CATEGORY", category_name)
                     await cat_input.scroll_into_view_if_needed()
                     await cat_input.click()
                     await cat_input.focus()
-                    
-                    # Xóa ký tự rác nếu có
-                    await page.keyboard.press("Control+A")
-                    await page.keyboard.press("Backspace")
-                    await asyncio.sleep(0.5)
-
-                    self.log(f"[*] [{acc_name}] Đang chọn hạng mục {category_name}...")
-                    for char in category_name:
-                        await page.keyboard.type(char, delay=random.randint(80, 130))
+                    await cat_input.fill(category_name)
                     
                     # Chờ 2.5s để Facebook gửi request tải danh sách gợi ý (Listbox)
                     await asyncio.sleep(2.5)
@@ -5135,6 +5300,10 @@ class MainToolApp:
                     continue
 
                 try:
+                    if not self.is_running or getattr(self, "stop_requested", False):
+                        set_page_flow_state("CANCELLED", "Dừng trước khi Submit")
+                        return results
+                    set_page_flow_state("SUBMITTING", page_name)
                     await create_btn.scroll_into_view_if_needed()
                     await create_btn.click()
                 except Exception as e:
@@ -5148,11 +5317,14 @@ class MainToolApp:
                     ))
                     continue
 
-                self.log(f"[*] [{acc_name}] Đã bấm Tạo, chờ Facebook xử lý...")
+                set_page_flow_state("VERIFYING", page_name)
 
                 verified_page_identity = {"url": "", "id": ""}
                 invalid_session_reason = ""
                 for _ in range(10):
+                    if not self.is_running or getattr(self, "stop_requested", False):
+                        set_page_flow_state("CANCELLED", "Dừng trong khi xác minh")
+                        return results
                     await asyncio.sleep(2)
                     cur_url = page.url.lower()
                     if is_invalid_facebook_account_url(cur_url):
@@ -5220,7 +5392,7 @@ class MainToolApp:
                     if await wiz_btn.count() > 0 and await wiz_btn.is_visible():
                         try:
                             await wiz_btn.click(timeout=3000)
-                            await asyncio.sleep(random.uniform(2.5, 4.0))
+                            await asyncio.sleep(3)
                         except Exception:
                             pass
                     else:
@@ -5244,10 +5416,15 @@ class MainToolApp:
                     ))
                     continue
 
+                if not self.is_running or getattr(self, "stop_requested", False):
+                    set_page_flow_state("CANCELLED", "Không ghi success sau lệnh Stop")
+                    return results
+                transition_page_context(page_context, "SUCCESS", page_identity)
                 page_record = build_create_page_result(
                     "SUCCESS", acc_name, page_name, category_name,
                     page_url=page_identity["url"], page_id=page_identity["id"],
                     retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    flow_state=page_context["creation_status"],
                 )
                 if not save_created_page_success(page_record):
                     record_result(build_create_page_result(
@@ -5261,10 +5438,11 @@ class MainToolApp:
 
                 created_count += 1
                 record_result(page_record)
-                self.log(
-                    f"[✔] [{acc_name}] Tạo Page {created_count}/{effective_max_pages}: "
-                    f"'{page_name}' | {page_identity['url'] or page_identity['id']}"
+                self.set_account_state(
+                    idx,
+                    current_action=f"Create Page [SUCCESS]: {created_count}/{effective_max_pages}",
                 )
+                self.log(f"[PAGE][SUCCESS] [{acc_name}] page_id={page_identity['id'] or 'N/A'} page_url={page_identity['url']}")
 
                 # ======================================================
                 # BƯỚC 7: NUÔI NICK THEO CẤU HÌNH NGƯỜI DÙNG (NHẬP 0 SẼ BỎ QUA)
@@ -5285,7 +5463,7 @@ class MainToolApp:
                             f"[!] [{acc_name}] Dừng tạo thêm Page để tránh thao tác nhầm bằng danh tính Page."
                         )
                         break
-                    page_delay = random.randint(int(min_page_del), int(max_page_del))
+                    page_delay = (int(min_page_del) + int(max_page_del)) // 2
                     if page_delay > 0:
                         self.log(f"[*] [{acc_name}] Chờ {page_delay} giây trước Page tiếp theo...")
                         await asyncio.sleep(page_delay)
@@ -5808,6 +5986,18 @@ class MainToolApp:
                         result for result in create_page_results
                         if result.get("status") == "SUCCESS"
                     ]
+                    page_metrics = {
+                        status: sum(
+                            1 for result in create_page_results
+                            if result.get("status") == status
+                        )
+                        for status in ("SUCCESS", "FAILED", "ERROR")
+                    }
+                    self.log(
+                        f"[PAGE][SUMMARY] [{acc_name}] requested={page_target_num} "
+                        f"success={page_metrics['SUCCESS']} failed={page_metrics['FAILED']} "
+                        f"error={page_metrics['ERROR']}"
+                    )
                     total_sent += len(created_pages)
                     current_state = self.account_states.get(idx)
                     if current_state and current_state["status"] == "DIE":
@@ -5886,8 +6076,12 @@ class MainToolApp:
                                 f"[-] [{acc_name}] Không có URL Page để ghép; xem created_pages.csv."
                             )
                         else:
-                            await self.run_add_page_admin(
+                            page_access_result = await self.run_add_page_admin(
                                 page, acc_name, idx, target_page, admin_job["admin"]
+                            )
+                            self.log(
+                                f"[PAGE_ACCESS][SUMMARY] [{acc_name}] "
+                                f"status={page_access_result['assignment_status']}"
                             )
 
                 # 19. Đổi tên Fanpage
@@ -6017,11 +6211,12 @@ class MainToolApp:
 
         threads_count = config.get("threads", 3)
         modes = config.get("modes", {})
-        if modes.get("create_page", False):
+        if modes.get("create_page", False) or modes.get("add_page_admin", False):
             max_create_workers = max(1, int(config.get("max_create_page_workers", 3)))
             threads_count = effective_account_worker_count(
                 threads_count, modes, max_create_workers
             )
+        if modes.get("create_page", False):
             raw_targets = [
                 line.strip() for line in config.get("targets", "").splitlines()
                 if line.strip()
