@@ -849,6 +849,8 @@ class CoreHelpersTest(unittest.TestCase):
             async def type(self, value, **_kwargs):
                 if self.page.active_field == "category":
                     self.page.category_buffer += value
+                elif self.page.active_field == "name":
+                    self.page.requested_name += value
                 return None
 
         class FakeLocator:
@@ -902,11 +904,29 @@ class CoreHelpersTest(unittest.TestCase):
             async def get_attribute(self, _name):
                 return None
 
+            async def bounding_box(self):
+                if self._on_click:
+                    return None
+                return {"x": 0, "y": 0, "width": 100, "height": 40}
+
             async def inner_text(self):
                 return self._text() if callable(self._text) else self._text
 
             async def evaluate(self, _script, _requested):
                 return True
+
+        class FakeMouse:
+            async def move(self, *_args, **_kwargs):
+                return None
+
+            async def down(self):
+                return None
+
+            async def up(self):
+                return None
+
+            async def wheel(self, *_args, **_kwargs):
+                return None
 
         class FakePage:
             def __init__(self, result_url=None, body_text="", click_error=None):
@@ -921,6 +941,8 @@ class CoreHelpersTest(unittest.TestCase):
                 self.body_text = body_text
                 self.click_error = click_error
                 self.requested_name = ""
+                self.mouse = FakeMouse()
+                self.submitted = False
 
             async def evaluate(self, script):
                 if script != client_app.PAGE_CREATION_EVIDENCE:
@@ -939,6 +961,8 @@ class CoreHelpersTest(unittest.TestCase):
                 return self.body_text
 
             def locator(self, selector):
+                if self.submitted and "textarea" in selector:
+                    return FakeLocator(count=1)
                 if "Tên trang" in selector or "Page name" in selector:
                     return FakeLocator(
                         count=1,
@@ -972,6 +996,7 @@ class CoreHelpersTest(unittest.TestCase):
                 def finish_create():
                     result_url = self.result_urls[self.create_index]
                     self.create_index += 1
+                    self.submitted = True
                     if result_url:
                         self.url = result_url
 

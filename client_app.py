@@ -43,7 +43,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.2.2"
+CURRENT_VERSION = "2.2.3"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -3413,7 +3413,7 @@ class MainToolApp:
         try:
             while not worker.done():
                 await self.guard_facebook_checkpoint(page, index)
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(2.5)
         except FacebookCheckpointStopped:
             worker.cancel()
         except Exception as exc:
@@ -4969,6 +4969,19 @@ class MainToolApp:
                 context_options["timezone_id"] = normalized_timezone
             context = await browser.new_context(**context_options)
             page = await context.new_page()
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                delete navigator.__proto__.webdriver;
+                window.chrome = {
+                    app: { isInstalled: false },
+                    runtime: {},
+                    loadTimes: function() {},
+                    csi: function() {}
+                };
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
+            """)
 
             # Test a real HTTPS route so a dead/auth-failed proxy cannot pass on about:blank.
             health_response = await page.goto(
@@ -5412,23 +5425,91 @@ class MainToolApp:
         return False, "CATEGORY_NOT_FOUND"
 
     async def ensure_personal_profile(self, context, page, acc_name):
-        """Clear Facebook's Page-profile selector cookie before another Page job."""
+        """Chuyển đổi danh tính từ Fanpage về lại tài khoản cá nhân trên giao diện."""
         cookies = await context.cookies("https://www.facebook.com/")
-        if not any(cookie.get("name") == "i_user" for cookie in cookies):
-            return True
+        has_page_cookie = any(cookie.get("name") == "i_user" for cookie in cookies)
+        
         try:
-            await context.clear_cookies(name="i_user")
-            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=40000)
-            await asyncio.sleep(2)
-            remaining = await context.cookies("https://www.facebook.com/")
-            is_personal = not any(cookie.get("name") == "i_user" for cookie in remaining)
-            if not is_personal:
-                self.log(f"[!] [{acc_name}] Chưa chuyển chắc chắn về hồ sơ cá nhân.")
-            return is_personal
-        except Exception as exc:
-            self.log(f"[!] [{acc_name}] Không thể chuyển về hồ sơ cá nhân: {exc}")
-            return False
+            # 1. Thao tác chuyển profile trên giao diện UI
+            profile_btn = page.locator(
+                'div[role="navigation"] [aria-label*="Trang cá nhân của bạn" i], '
+                'div[role="navigation"] [aria-label*="Your profile" i], '
+                'div[role="banner"] [aria-label*="Trang cá nhân của bạn" i], '
+                'div[role="banner"] [aria-label*="Your profile" i], '
+                'div[aria-label*="Tài khoản" i][role="button"], '
+                'div[aria-label*="Account" i][role="button"]'
+            ).first
 
+            if await profile_btn.count() > 0 and await profile_btn.is_visible():
+                await self.human_click(page, profile_btn)
+                await asyncio.sleep(2.0)
+
+                # Tìm nút chuyển sang trang cá nhân chính
+                switch_btn = page.locator(
+                    'div[role="dialog"] div[role="button"][aria-label*="chuyển sang" i], '
+                    'div[role="dialog"] div[role="button"][aria-label*="switch to" i], '
+                    'div[role="dialog"] [data-nocookies="true"], '
+                    'div[role="menu"] div[role="menuitem"]:has-text("Chuyển sang"), '
+                    'div[role="menu"] div[role="menuitem"]:has-text("Switch to")'
+                ).first
+
+                if await switch_btn.count() > 0 and await switch_btn.is_visible():
+                    await self.human_click(page, switch_btn)
+                    await asyncio.sleep(4.0)
+
+            # 2. Xóa triệt để cookie i_user kèm theo domain chuẩn
+            await context.clear_cookies(name="i_user", domain=".facebook.com")
+            
+            # 3. Reload về trang chủ kiểm tra trạng thái
+            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=40000)
+            await asyncio.sleep(3.0)
+
+            updated_cookies = await context.cookies("https://www.facebook.com/")
+            is_personal = not any(cookie.get("name") == "i_user" for cookie in updated_cookies)
+            if is_personal:
+                self.log(f"[✔] [{acc_name}] Đã chuyển về tài khoản cá nhân thành công.")
+            else:
+                self.log(f"[!] [{acc_name}] Cảnh báo: Vẫn còn giữ cookie quyền Page.")
+            return is_personal
+
+        except Exception as exc:
+            self.log(f"[!] [{acc_name}] Lỗi khi chuyển về hồ sơ cá nhân: {exc}")
+            # Phương án dự phòng: cố gắng xóa cookie và về lại trang chủ
+            try:
+                await context.clear_cookies(name="i_user")
+                await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=30000)
+                fallback_cookies = await context.cookies("https://www.facebook.com/")
+                return not any(cookie.get("name") == "i_user" for cookie in fallback_cookies)
+            except Exception:
+                return False
+    async def human_type(self, page, locator, text: str, error_rate=0.03):
+        """Gõ từng ký tự với độ trễ biến thiên, mô phỏng gõ nhầm và sửa lại."""
+        await locator.click()
+        await asyncio.sleep(random.uniform(0.3, 0.6))
+        for char in text:
+            if random.random() < error_rate:
+                wrong_char = random.choice("abcdefghijklmnopqrstuvwxyz")
+                await page.keyboard.press(wrong_char)
+                await asyncio.sleep(random.uniform(0.12, 0.22))
+                await page.keyboard.press("Backspace")
+                await asyncio.sleep(random.uniform(0.08, 0.16))
+            await page.keyboard.type(char, delay=random.randint(55, 140))
+            if char == " " and random.random() < 0.35:
+                await asyncio.sleep(random.uniform(0.25, 0.5))
+
+    async def human_click(self, page, locator):
+        """Di chuyển chuột có quỹ đạo mềm và click lệch tâm tự nhiên."""
+        box = await locator.bounding_box()
+        if not box:
+            await locator.click()
+            return
+        target_x = box["x"] + box["width"] * random.uniform(0.2, 0.8)
+        target_y = box["y"] + box["height"] * random.uniform(0.25, 0.75)
+        await page.mouse.move(target_x, target_y, steps=random.randint(6, 12))
+        await asyncio.sleep(random.uniform(0.12, 0.28))
+        await page.mouse.down()
+        await asyncio.sleep(random.uniform(0.05, 0.12))
+        await page.mouse.up()
     async def safe_action_click(self, page, selector, acc_name, action_name="Click", retries=3):
         """
         Click an toàn khi DOM thay đổi, tự động retry khi bị Stale Element.
@@ -5724,7 +5805,7 @@ class MainToolApp:
                     ))
                     continue
                 
-                await name_input.fill(page_name)
+                await self.human_type(page, name_input, page_name)
                 await asyncio.sleep(1)
                 # Tự động bắt lỗi tên không hợp lệ từ Facebook và tự sửa
                 await asyncio.sleep(1.0)
@@ -5776,29 +5857,38 @@ class MainToolApp:
                     await cat_input.scroll_into_view_if_needed()
                     await cat_input.click()
                     await cat_input.focus()
-                    await cat_input.fill(category_name)
                     
-                    # Chờ 2.5s để Facebook gửi request tải danh sách gợi ý (Listbox)
-                    await asyncio.sleep(2.5)
+                    # Gõ mô phỏng người dùng để kích hoạt dropdown gợi ý
+                    await self.human_type(page, cat_input, category_name)
+                    await asyncio.sleep(2.0)
 
-                    category_selected, category_reason = await self.select_page_category(page, cat_input, category_name)
-                    if not category_selected:
-                        record_result(build_create_page_result(
-                            "FAILED", acc_name, page_name, category_name,
-                            reason=category_reason, account_index=idx, proxy=resolved_proxy,
-                        ))
-                        continue
+                    # Sử dụng phím mũi tên xuống + Enter để chọn gợi ý chắc chắn
+                    await page.keyboard.press("ArrowDown")
+                    await asyncio.sleep(0.5)
+                    await page.keyboard.press("Enter")
+                    await asyncio.sleep(1.5)
+
+                    # Kiểm tra xem hạng mục đã được chọn thành công hay chưa
+                    has_selected_tag = await page.locator(
+                        'div[role="main"] [aria-label*="xóa" i], '
+                        'div[role="main"] [aria-label*="remove" i], '
+                        'div[role="main"] span:has-text("' + category_name + '")'
+                    ).count() > 0
+
+                    if not has_selected_tag:
+                        # Thử phương án dự phòng gọi select_page_category nếu phím Enter chưa bắt được
+                        category_selected, category_reason = await self.select_page_category(page, cat_input, category_name)
+                        if not category_selected:
+                            record_result(build_create_page_result(
+                                "FAILED", acc_name, page_name, category_name,
+                                reason=category_reason, account_index=idx, proxy=resolved_proxy,
+                            ))
+                            continue
                 else:
                     self.log(f"[!] [{acc_name}] Không tìm thấy ô nhập Hạng mục.")
                     record_result(build_create_page_result(
                         "FAILED", acc_name, page_name, category_name,
                         reason="CATEGORY_INPUT_NOT_FOUND", account_index=idx, proxy=resolved_proxy,
-                    ))
-                    continue
-                    record_result(build_create_page_result(
-                        "ERROR", acc_name, page_name, category_name,
-                        technical_error="Không tìm thấy combobox category.",
-                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
                     ))
                     continue
 
@@ -5850,7 +5940,7 @@ class MainToolApp:
                     if before_identity.get("id"):
                         current_page_job["prior_page_ids"].add(before_identity["id"])
                     await create_btn.scroll_into_view_if_needed()
-                    await create_btn.click()
+                    await self.human_click(page, create_btn)
                     current_page_job["submitted"] = True
                     await self.guard_facebook_checkpoint(page, idx)
                 except Exception as e:
@@ -5866,48 +5956,42 @@ class MainToolApp:
 
                 set_page_flow_state("VERIFYING", page_name)
 
-                verified_page_identity = {"url": "", "id": ""}
                 invalid_session_reason = ""
                 policy_rejected = False
-                for _ in range(10):
+                rate_limited = False
+                submission_accepted = False
+
+                # Chờ Facebook phản hồi sau khi ấn Submit (tối đa 16 giây)
+                for _ in range(8):
                     if not self.is_running or getattr(self, "stop_requested", False):
-                        set_page_flow_state("CANCELLED", "Dừng trong khi xác minh")
+                        set_page_flow_state("CANCELLED", "Dừng trong khi gửi tạo Page")
                         return results
                     await asyncio.sleep(2)
                     await self.guard_facebook_checkpoint(page, idx)
+
                     cur_url = page.url.lower()
                     if is_invalid_facebook_account_url(cur_url):
-                        invalid_session_reason = (
-                            f"Tài khoản mất phiên đăng nhập sau khi gửi tạo Page: {page.url}"
-                        )
-                        self.log(f"[!] [{acc_name}] Bị Checkpoint ngay sau khi ấn Tạo!")
+                        invalid_session_reason = f"Tài khoản mất phiên đăng nhập sau khi gửi tạo Page: {page.url}"
                         break
 
                     body_text = (await page.inner_text("body")).lower()
-                    await self.guard_facebook_checkpoint(page, idx)
+
                     if is_page_policy_rejected(body_text):
                         policy_rejected = True
                         break
-                    candidate_identity = await self.verify_created_page(page, idx, current_page_job)
-                    if is_verified_page_identity(candidate_identity):
-                        verified_page_identity = candidate_identity
+
+                    if any(err in body_text for err in ["quá nhiều trang", "too many pages", "xảy ra lỗi", "went wrong", "giới hạn"]):
+                        rate_limited = True
                         break
 
-                    
-                    if any(err in body_text for err in ["quá nhiều trang", "too many pages", "xảy ra lỗi", "went wrong"]):
-                        self.log(f"[-] [{acc_name}] Bị chặn tạo: Đã tạo quá nhiều Trang / Lỗi server.")
-                        if hasattr(self, 'take_error_snapshot'):
-                            await self.take_error_snapshot(page, acc_name, "rate_limit_page")
+                    # Dấu hiệu tạo thành công: Form Wizard xuất hiện (có textarea tiểu sử hoặc các nút Next/Done/Skip)
+                    wizard_indicators = page.locator(
+                        'div[role="dialog"], textarea, button:has-text("Tiếp"), button:has-text("Next"), '
+                        'button:has-text("Xong"), button:has-text("Done"), button:has-text("Bỏ qua"), button:has-text("Skip")'
+                    )
+                    if await wizard_indicators.count() > 0:
+                        submission_accepted = True
                         break
-                    
-                if policy_rejected:
-                    record_result(build_create_page_result(
-                        "FAILED", acc_name, page_name, category_name,
-                        reason="PAGE_POLICY_REJECTED",
-                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
-                    ))
-                    self.log("[PAGE][FAILED] Facebook từ chối tạo Page theo Page policies.")
-                    continue
 
                 if invalid_session_reason:
                     record_result(build_create_page_result(
@@ -5918,50 +6002,102 @@ class MainToolApp:
                     self.set_account_failure(idx, "invalid_login", invalid_session_reason)
                     return results
 
-                if not is_verified_page_identity(verified_page_identity):
-                    self.log(
-                        f"[-] [{acc_name}] Tạo trang thất bại hoặc chưa xác minh được Page URL/ID."
-                    )
+                if policy_rejected:
                     record_result(build_create_page_result(
                         "FAILED", acc_name, page_name, category_name,
-                        reason="Không xác minh được Page URL/ID sau khi Submit.",
+                        reason="PAGE_POLICY_REJECTED",
+                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    ))
+                    self.log(f"[-] [{acc_name}] Facebook từ chối tạo Page theo chính sách (Page policies).")
+                    continue
+
+                if rate_limited:
+                    record_result(build_create_page_result(
+                        "FAILED", acc_name, page_name, category_name,
+                        reason="Bị giới hạn tạo Trang (Too many pages / Rate limited)",
+                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    ))
+                    self.log(f"[-] [{acc_name}] Bị giới hạn: Đã tạo quá nhiều Trang gần đây.")
+                    if hasattr(self, 'take_error_snapshot'):
+                        await self.take_error_snapshot(page, acc_name, "rate_limit_page")
+                    break
+
+                if not submission_accepted:
+                    self.log(f"[-] [{acc_name}] Không nhận được phản hồi tạo trang từ Facebook.")
+                    record_result(build_create_page_result(
+                        "FAILED", acc_name, page_name, category_name,
+                        reason="Không xuất hiện giao diện thiết lập sau khi bấm Tạo.",
                         retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
                     ))
                     continue
 
                 # ======================================================
-                # BƯỚC 6: BẤM "TIẾP" LIÊN TỤC CHO ĐẾN HÌNH 2 (GIAO DIỆN TRANG CHÍNH)
+                # BƯỚC 6: XỬ LÝ WIZARD THIẾT LẬP (MÔ PHỎNG NGƯỜI THẬT TỪNG BƯỚC)
                 # ======================================================
-                self.log(f"[*] [{acc_name}] Đang bấm 'Tiếp/Xong' liên tục để chuyển sang Trang chính...")
-                for _ in range(12):
-                    if not self.is_running: break
+                self.log(f"[*] [{acc_name}] Bắt đầu hoàn thiện các bước thiết lập Page (Bio, Tiếp, Xong)...")
+                
+                # 6.1. Điền Tiểu sử (Bio) ngẫu nhiên nếu có form
+                bio_samples = [
+                    "Chào mừng mọi người đến với kênh của mình! ✨",
+                    "Nơi chia sẻ những khoảnh khắc và trải nghiệm thú vị mỗi ngày.",
+                    "Trang cá nhân cập nhật tin tức và kiến thức hữu ích 🌿",
+                    "Góc nhỏ lưu giữ kỷ niệm và kết nối những người bạn mới.",
+                    "Học hỏi, chia sẻ và lan tỏa năng lượng tích cực 🌟"
+                ]
+                bio_input = page.locator('div[role="dialog"] textarea, textarea[aria-label*="tiểu sử" i], textarea[aria-label*="bio" i]').first
+                if await bio_input.count() > 0 and await bio_input.is_visible():
+                    try:
+                        chosen_bio = random.choice(bio_samples)
+                        await self.human_type(page, bio_input, chosen_bio)
+                        await asyncio.sleep(random.uniform(1.2, 2.0))
+                    except Exception:
+                        pass
+
+                # 6.2. Vòng lặp duyệt qua các bước Next / Done có nhịp dừng và cuộn trang
+                wizard_step = 1
+                for _ in range(15):
+                    if not self.is_running or getattr(self, "stop_requested", False):
+                        break
+
+                    # Nếu đã điều hướng khỏi màn hình tạo trang và tới Page chính
                     cur_url = page.url.lower()
                     if "facebook.com/pages/creation" not in cur_url:
                         current_identity = await self.get_current_page_identity(page)
                         if is_verified_page_identity(current_identity):
-                            self.log(f"[✔] [{acc_name}] Đã vào đến giao diện Trang chính!")
+                            self.log(f"[✔] [{acc_name}] Đã vào giao diện Trang chính!")
                             break
 
+                    # Mô phỏng người đọc: thi thoảng cuộn nhẹ chuột trong dialog
+                    if random.random() < 0.4:
+                        await page.mouse.wheel(0, random.randint(120, 250))
+                        await asyncio.sleep(random.uniform(0.6, 1.2))
+
+                    # Ưu tiên tìm nút Xong/Done trước, sau đó tới Tiếp/Next/Bỏ qua
                     btn_selectors = (
-                        'div[role="dialog"] button[type="submit"]:visible, '
-                        'div[role="button"]:has-text("Tiếp"), div[role="button"]:has-text("Next"), '
-                        'div[role="button"]:has-text("Xong"), div[role="button"]:has-text("Done"), '
-                        'div[role="button"]:has-text("Hoàn tất"), '
-                        'div[aria-label="Tiếp"], div[aria-label="Next"], '
-                        'div[aria-label="Xong"], div[aria-label="Done"]'
+                        'div[role="dialog"] button:has-text("Xong"), div[role="dialog"] [role="button"]:has-text("Xong"), '
+                        'div[role="dialog"] button:has-text("Done"), div[role="dialog"] [role="button"]:has-text("Done"), '
+                        'div[role="dialog"] button:has-text("Hoàn tất"), div[role="dialog"] [role="button"]:has-text("Hoàn tất"), '
+                        'div[role="dialog"] button:has-text("Bỏ qua"), div[role="dialog"] [role="button"]:has-text("Bỏ qua"), '
+                        'div[role="dialog"] button:has-text("Skip"), div[role="dialog"] [role="button"]:has-text("Skip"), '
+                        'div[role="dialog"] button:has-text("Tiếp"), div[role="dialog"] [role="button"]:has-text("Tiếp"), '
+                        'div[role="dialog"] button:has-text("Next"), div[role="dialog"] [role="button"]:has-text("Next"), '
+                        'div[role="dialog"] button[type="submit"]:visible'
                     )
+                    
                     wiz_btn = page.locator(btn_selectors).first
                     if await wiz_btn.count() > 0 and await wiz_btn.is_visible():
-                        try:
-                            await wiz_btn.click(timeout=3000)
-                            await asyncio.sleep(3)
-                        except Exception:
-                            pass
+                        btn_name = (await wiz_btn.inner_text()).strip()
+                        self.log(f"[*] [{acc_name}] [Bước {wizard_step}] Bấm '{btn_name}'...")
+                        await self.human_click(page, wiz_btn)
+                        wizard_step += 1
+                        # Giữ nhịp dừng tự nhiên từ 3.5s đến 6s cho mỗi bước chuyển
+                        await asyncio.sleep(random.uniform(3.5, 6.0))
                     else:
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(2.0)
 
+                # Đóng các popup chào mừng/giới thiệu nếu còn sót lại
                 await page.keyboard.press("Escape")
-                await asyncio.sleep(1)
+                await asyncio.sleep(1.5)
 
                 page_identity = await self.verify_created_page(page, idx, current_page_job)
                 if not is_verified_page_identity(page_identity):
