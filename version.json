@@ -1,7 +1,7 @@
 {
-    "version":  "2.2.2",
-    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.2.2/client_app.exe",
-    "sha256":  "D8DEC80120EC5FF6F351F85C0D44E237883754956F0DCAC275DB63F8C4C43BF0",
-    "changelog":  "Cập nhật Page, BM, proxy, checkpoint và lịch sử tài khoản",
+    "version":  "2.2.3",
+    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.2.3/client_app.exe",
+    "sha256":  "97CDC430DF51F050DF09D63151B7532658B3761A4C91E48A1EF72E53F7CDF254",
+    "changelog":  "Cập nhật tạo page ổn định và tối ưu hơn",
     "mandatory":  false
 }
