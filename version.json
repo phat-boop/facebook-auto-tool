@@ -1,7 +1,7 @@
 {
-    "version":  "2.2.0",
-    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.2.0/client_app.exe",
-    "sha256":  "F59ECD0515EA79B1D61BFF1D74168ECC02EDF11577325E8E17E4558BF3AB255F",
-    "changelog":  "Cập nhật Page và BM, tối ưu lại độ ổn định",
+    "version":  "2.2.1",
+    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.2.1/client_app.exe",
+    "sha256":  "E9EBF375DF4B2FFB8D854283BCB02F09C1A4B7AC469CE26F05375A0B3433798D",
+    "changelog":  "Cập nhật Page và BM, tối ưu lại độ ổn định, fix lỗi không nhận user",
     "mandatory":  false
 }
