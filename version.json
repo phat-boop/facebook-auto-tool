@@ -1,7 +1,7 @@
 {
-    "version":  "2.2.4",
-    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.2.4/client_app.exe",
-    "sha256":  "0A0B3149BBE0317C02BF2FAAC4D475B02E220A5B13CB5C23FB33F90CC275918C",
-    "changelog":  "Cập nhật lại giao diện ",
+    "version":  "2.2.5",
+    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.2.5/client_app.exe",
+    "sha256":  "0524536C723904E417A97A32CFA477824D1F223FEC555BAB76CB3F62339B9349",
+    "changelog":  "Cập nhật Tool ổn định hơn",
     "mandatory":  false
 }
