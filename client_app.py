@@ -43,7 +43,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.2.3"
+CURRENT_VERSION = "2.2.4"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -2173,8 +2173,12 @@ class MainToolApp:
         self.root = root
         self.expire_date = expire_date
         self.root.title(f"Facebook Workspace Pro v{CURRENT_VERSION} - ĐẶNG PHÁT - Hạn dùng: {expire_date}")
-        self.root.geometry("1380x880")
-        self.root.minsize(1280, 800)
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        window_width = min(1380, max(1000, round(screen_width * 0.90)))
+        window_height = min(880, max(620, round(screen_height * 0.88)))
+        self.root.geometry(f"{window_width}x{window_height}")
+        self.root.minsize(1000, 620)
         try:
             self.root.iconbitmap(resource_path("picture.ico"))
         except (tk.TclError, OSError):
@@ -2509,7 +2513,7 @@ class MainToolApp:
 
         # 1. Cookie / Token Card (Auto Detect)
         card1 = tk.Frame(paned_left, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
-        paned_left.add(card1, minsize=110, height=180)
+        paned_left.add(card1, minsize=90, height=160)
 
         f1_head = tk.Frame(card1, bg="#131C2E")
         f1_head.pack(fill="x", pady=(0, 2))
@@ -2531,7 +2535,7 @@ class MainToolApp:
 
         # 3. Chức năng tự động Card
         card3 = tk.Frame(paned_left, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
-        paned_left.add(card3, minsize=180, height=320)
+        paned_left.add(card3, minsize=140, height=280)
 
         f3_head = tk.Frame(card3, bg="#131C2E")
         f3_head.pack(fill="x", pady=(0, 2))
@@ -2597,7 +2601,7 @@ class MainToolApp:
 
         # Log Card
         card_log = tk.Frame(paned_left, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
-        paned_left.add(card_log, minsize=100, height=180)
+        paned_left.add(card_log, minsize=80, height=140)
 
         f_log_head = tk.Frame(card_log, bg="#131C2E")
         f_log_head.pack(fill="x", pady=(0, 2))
@@ -2622,7 +2626,7 @@ class MainToolApp:
 
         # R1: Card Danh sách Proxy
         card2 = tk.Frame(paned_right, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
-        paned_right.add(card2, minsize=190, height=215)
+        paned_right.add(card2, minsize=150, height=190)
 
         f2_head = tk.Frame(card2, bg="#131C2E")
         f2_head.pack(fill="x", pady=(0, 2))
@@ -2670,7 +2674,7 @@ class MainToolApp:
 
         # R2: Trạng thái tài khoản và điều hướng theo đợt
         card_reg = tk.Frame(paned_right, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
-        paned_right.add(card_reg, minsize=180, height=220)
+        paned_right.add(card_reg, minsize=135, height=190)
 
         f_reg_head = tk.Frame(card_reg, bg="#131C2E")
         f_reg_head.pack(fill="x", pady=(0, 3))
@@ -2719,7 +2723,7 @@ class MainToolApp:
 
         # R3: Card Nuôi Nick Chống Checkpoint
         card4 = tk.Frame(paned_right, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
-        paned_right.add(card4, minsize=140, height=180)
+        paned_right.add(card4, minsize=115, height=155)
 
         tk.Label(card4, text="🛡️ 5. HIỆU NĂNG & ĐIỀU TIẾT", font=("Segoe UI", 9, "bold"), fg="#38BDF8", bg="#131C2E").pack(anchor="w", pady=(0, 2))
 
@@ -2770,7 +2774,7 @@ class MainToolApp:
 
         # R4: Card Thông số & Điều khiển
         f_bottom_right = tk.Frame(paned_right, bg="#0A0E1A")
-        paned_right.add(f_bottom_right, minsize=140, height=160)
+        paned_right.add(f_bottom_right, minsize=120, height=145)
 
         card5 = tk.Frame(f_bottom_right, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=6)
         card5.pack(fill="x", pady=(0, 4))
