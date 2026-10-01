@@ -878,6 +878,9 @@ class CoreHelpersTest(unittest.TestCase):
             async def is_visible(self):
                 return self._count > 0
 
+            async def is_enabled(self):
+                return self._count > 0
+
             async def wait_for(self, **_kwargs):
                 if self._count == 0:
                     raise TimeoutError("not visible")
@@ -1465,12 +1468,12 @@ class CheckpointRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Hoàn thành", state["current_action"])
         self.assertEqual(self.app.account_states.task_summary()["ERROR"], 1)
 
-    async def test_required_proxy_failure_does_not_launch_direct_browser(self):
+    async def test_empty_account_proxy_mode_allows_direct_browser(self):
         self.app.run_config.update(proxy_mode="account")
         resources = self.resources("https://www.facebook.com/")
         await self.run_worker(1, resources)
-        self.assertEqual(self.app.account_states.get(1)["status"], "ERROR")
-        self.app.create_browser_page.assert_not_awaited()
+        self.assertEqual(self.app.account_states.get(1)["status"], "LIVE")
+        self.app.create_browser_page.assert_awaited_once()
 
     async def test_policy_detection_is_not_a_technical_error(self):
         self.assertTrue(client_app.is_page_policy_rejected(

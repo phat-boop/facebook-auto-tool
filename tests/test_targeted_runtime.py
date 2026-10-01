@@ -154,6 +154,15 @@ def test_proxy_resolution_isolated_between_accounts():
     assert app.account_states.get(2)["effective_proxy"] == "b:8002"
 
 
+@pytest.mark.parametrize("mode", ["account", "rotating_api"])
+def test_empty_proxy_configuration_allows_direct_connection(mode):
+    app = make_app()
+    app.run_config = {"proxy_mode": mode, "proxy_api": "", "proxies": ""}
+    result = asyncio.run(app.resolve_effective_proxy(1, ""))
+    assert result == ""
+    assert app.account_states.get(1)["effective_proxy"] == ""
+
+
 def page_job():
     return {"owner_account_id": "111111", "owner_uid": "111111", "page_job_id": "job-A",
             "submitted": True, "page_name": "Page A", "prior_page_ids": {"555555"}}

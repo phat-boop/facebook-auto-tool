@@ -43,7 +43,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.2.4"
+CURRENT_VERSION = "2.2.5"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -238,10 +238,10 @@ def verify_page_job_evidence(url, evidence, job, owner_account_id):
         return empty
     if normalize_ui_text(evidence.get("name")) != normalize_ui_text(job["page_name"]):
         return empty
-    if page_id == str(job.get("owner_uid") or "") or page_id in job.get("prior_page_ids", set()):
-        return empty
     canonical = evidence.get("canonical")
     if canonical and facebook_page_reference(canonical) != facebook_page_reference(url):
+        return empty
+    if page_id == str(job.get("owner_uid") or "") or page_id in job.get("prior_page_ids", set()):
         return empty
     return {**identity, "id": page_id, "owner_account_id": owner_account_id,
             "page_job_id": job["page_job_id"], "verified": True}
@@ -1086,15 +1086,20 @@ async def close_browser_resources(context=None, browser=None, page=None):
     return errors
 
 
-async def wait_for_locator_ready(locator, timeout=10000):
-    """Wait for a visible, enabled action without clicking it."""
+async def wait_for_locator_ready(locator, timeout=15000):
+    """Chờ phần tử hiển thị và sẵn sàng tương tác, kết hợp kiểm tra is_enabled() chuẩn xác."""
     await locator.wait_for(state="visible", timeout=timeout)
-    for _ in range(10):
-        aria_disabled = (await locator.get_attribute("aria-disabled") or "").casefold()
-        disabled = await locator.get_attribute("disabled")
-        if aria_disabled != "true" and disabled is None:
-            return True
-        await asyncio.sleep(0.25)
+    deadline = time.monotonic() + (timeout / 1000.0)
+    while time.monotonic() < deadline:
+        try:
+            aria_disabled = (await locator.get_attribute("aria-disabled") or "").casefold()
+            disabled = await locator.get_attribute("disabled")
+            enabled = await locator.is_enabled()
+            if aria_disabled != "true" and disabled is None and enabled:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
     return False
 
 
@@ -3363,14 +3368,20 @@ class MainToolApp:
         config = self.run_config
         mode = config.get("proxy_mode", "round_robin")
         effective_proxy = str(assigned_proxy or "")
-        if mode == "rotating_api":
-            if not config.get("proxy_api"):
-                raise ValueError("API xoay chưa được cấu hình; không dùng IP thật.")
+        proxy_api = str(config.get("proxy_api") or "").strip()
+        proxy_list_configured = bool(str(config.get("proxies") or "").strip())
+        has_proxy_source = bool(effective_proxy or proxy_api or proxy_list_configured)
+        if mode == "rotating_api" and proxy_api:
             async with self.proxy_api_lock:
-                effective_proxy = await asyncio.to_thread(fetch_proxy_from_api, config["proxy_api"])
+                effective_proxy = await asyncio.to_thread(fetch_proxy_from_api, proxy_api)
             if not effective_proxy:
                 raise ConnectionError("API proxy không trả về proxy hợp lệ.")
-        required = config.get("proxy_required", False) or mode in {"account", "rotating_api"}
+        elif mode == "rotating_api" and has_proxy_source:
+            if not proxy_api:
+                raise ValueError("API xoay chưa được cấu hình; không dùng IP thật.")
+        required = bool(config.get("proxy_required", False)) or (
+            mode in {"account", "rotating_api"} and has_proxy_source
+        )
         if (required and not effective_proxy) or (effective_proxy and not parse_proxy(effective_proxy)):
             raise ValueError("Thiếu proxy bắt buộc hoặc proxy sai định dạng; không dùng IP thật.")
         self.account_states.set_proxy(index, effective_proxy)
@@ -3947,14 +3958,19 @@ class MainToolApp:
         was_stopped = self.stop_requested
         self.is_running = False
         self.run_thread = None
+        self.worker_loop = None
+        self.worker_tasks = []
+        self.stop_requested = False
+
+        # Khôi phục trạng thái nút Bắt đầu để người dùng có thể chạy lại ngay
         self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
+        
         if hasattr(self, 'lbl_status_indicator'):
             self.lbl_status_indicator.config(
-                text="● Đã dừng" if was_stopped else "● Hoàn thành",
-                fg="#EF4444" if was_stopped else "#10B981",
+                text="● Đã dừng (Sẵn sàng chạy lại)" if was_stopped else "● Hoàn thành",
+                fg="#F59E0B" if was_stopped else "#10B981",
             )
-        self.stop_requested = False
 
     def run_process(self):
         """Khởi tạo vòng lặp sự kiện tương thích tuyệt đối với Windows và Playwright"""
@@ -5486,6 +5502,38 @@ class MainToolApp:
                 return not any(cookie.get("name") == "i_user" for cookie in fallback_cookies)
             except Exception:
                 return False
+
+    async def get_system_notifications(self, page):
+        """Tự động đọc mọi thông báo nổi, toast, alert hệ thống theo chuẩn ARIA."""
+        messages = []
+        try:
+            notifs = page.locator('[role="alert"], [role="status"]')
+            count = await notifs.count()
+            for i in range(count):
+                el = notifs.nth(i)
+                if await el.is_visible():
+                    txt = (await el.inner_text()).strip()
+                    if txt:
+                        messages.append(txt)
+        except Exception:
+            pass
+        return messages
+
+    async def dismiss_floating_overlays(self, page):
+        """Tự động đóng mọi popup, toast, dialog nổi cản trở trên màn hình."""
+        try:
+            await page.keyboard.press("Escape")
+            close_btns = page.locator(
+                '[aria-label="Đóng" i], [aria-label="Close" i], '
+                '[role="status"] [role="button"], [role="alert"] [role="button"], '
+                '[role="status"] button, [role="alert"] button'
+            )
+            for i in range(await close_btns.count()):
+                btn = close_btns.nth(i)
+                if await btn.is_visible():
+                    await btn.click(timeout=800)
+        except Exception:
+            pass            
     async def human_type(self, page, locator, text: str, error_rate=0.03):
         """Gõ từng ký tự với độ trễ biến thiên, mô phỏng gõ nhầm và sửa lại."""
         await locator.click()
@@ -5920,12 +5968,30 @@ class MainToolApp:
                     continue
 
                 try:
-                    if not await wait_for_locator_ready(create_btn, timeout=10000):
+                    # Chờ tối đa 15 giây cho Facebook đồng bộ dữ liệu Tên và Hạng mục
+                    if not await wait_for_locator_ready(create_btn, timeout=15000):
+                        # Quét thông báo lỗi chi tiết trên form để chỉ rõ nguyên nhân
+                        form_alerts = await page.locator(
+                            'div[role="main"] div[role="alert"], '
+                            'div[role="main"] [aria-invalid="true"], '
+                            'div[role="main"] span:has-text("hợp lệ"), '
+                            'div[role="main"] span:has-text("valid")'
+                        ).all_inner_texts()
+                        
+                        detail_msg = "Nút Tạo Trang bị khóa: "
+                        if form_alerts:
+                            detail_msg += "; ".join(txt.strip() for txt in form_alerts if txt.strip())
+                        else:
+                            detail_msg += f"Tên '{page_name}' hoặc Hạng mục '{category_name}' chưa được Facebook chấp thuận."
+
+                        self.log(f"[-] [{acc_name}] {detail_msg}")
                         record_result(build_create_page_result(
-                            "ERROR", acc_name, page_name, category_name,
-                            technical_error="Nút Submit không chuyển sang trạng thái khả dụng.",
+                            "FAILED", acc_name, page_name, category_name,
+                            reason=detail_msg,
                             retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
                         ))
+                        if hasattr(self, 'take_error_snapshot'):
+                            await self.take_error_snapshot(page, acc_name, "submit_disabled")
                         continue
                 except Exception as e:
                     record_result(build_create_page_result(
@@ -5965,7 +6031,6 @@ class MainToolApp:
                 rate_limited = False
                 submission_accepted = False
 
-                # Chờ Facebook phản hồi sau khi ấn Submit (tối đa 16 giây)
                 for _ in range(8):
                     if not self.is_running or getattr(self, "stop_requested", False):
                         set_page_flow_state("CANCELLED", "Dừng trong khi gửi tạo Page")
@@ -5978,23 +6043,29 @@ class MainToolApp:
                         invalid_session_reason = f"Tài khoản mất phiên đăng nhập sau khi gửi tạo Page: {page.url}"
                         break
 
+                    # 1. Tự động đọc mọi thông báo hệ thống xuất hiện trên màn hình qua ARIA
+                    system_alerts = await self.get_system_notifications(page)
+                    combined_alerts = " ".join(system_alerts).lower()
                     body_text = (await page.inner_text("body")).lower()
 
-                    if is_page_policy_rejected(body_text):
+                    if is_page_policy_rejected(body_text) or "page policies" in combined_alerts or "chính sách" in combined_alerts:
                         policy_rejected = True
                         break
 
-                    if any(err in body_text for err in ["quá nhiều trang", "too many pages", "xảy ra lỗi", "went wrong", "giới hạn"]):
+                    if any(err in f"{combined_alerts} {body_text}" for err in ["quá nhiều trang", "too many pages", "limit", "giới hạn"]):
                         rate_limited = True
                         break
 
-                    # Dấu hiệu tạo thành công: Form Wizard xuất hiện (có textarea tiểu sử hoặc các nút Next/Done/Skip)
-                    wizard_indicators = page.locator(
-                        'div[role="dialog"], textarea, button:has-text("Tiếp"), button:has-text("Next"), '
-                        'button:has-text("Xong"), button:has-text("Done"), button:has-text("Bỏ qua"), button:has-text("Skip")'
-                    )
-                    if await wizard_indicators.count() > 0:
+                    # 2. Nhận diện cấu trúc Onboarding xuất hiện (form chi tiết hoặc URL đã điều hướng)
+                    has_onboarding_form = await page.locator(
+                        'input[type="tel"], input[aria-label*="phone" i], '
+                        'input[aria-label*="website" i], div[role="dialog"]'
+                    ).count() > 0
+
+                    if has_onboarding_form or "profile.php?id=" in cur_url or "facebook.com/pages/creation" not in cur_url:
                         submission_accepted = True
+                        # Tự động đóng toast/dialog che khuất màn hình
+                        await self.dismiss_floating_overlays(page)
                         break
 
                 if invalid_session_reason:
@@ -6012,22 +6083,20 @@ class MainToolApp:
                         reason="PAGE_POLICY_REJECTED",
                         retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
                     ))
-                    self.log(f"[-] [{acc_name}] Facebook từ chối tạo Page theo chính sách (Page policies).")
+                    self.log(f"[-] [{acc_name}] Facebook từ chối tạo Page theo chính sách.")
                     continue
 
                 if rate_limited:
                     record_result(build_create_page_result(
                         "FAILED", acc_name, page_name, category_name,
-                        reason="Bị giới hạn tạo Trang (Too many pages / Rate limited)",
+                        reason="Bị giới hạn tạo Trang gần đây (Rate limited)",
                         retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
                     ))
-                    self.log(f"[-] [{acc_name}] Bị giới hạn: Đã tạo quá nhiều Trang gần đây.")
-                    if hasattr(self, 'take_error_snapshot'):
-                        await self.take_error_snapshot(page, acc_name, "rate_limit_page")
+                    self.log(f"[-] [{acc_name}] Bị giới hạn tạo Trang gần đây.")
                     break
 
                 if not submission_accepted:
-                    self.log(f"[-] [{acc_name}] Không nhận được phản hồi tạo trang từ Facebook.")
+                    self.log(f"[-] [{acc_name}] Không phát hiện bước tiếp theo hoặc thông báo xác nhận.")
                     record_result(build_create_page_result(
                         "FAILED", acc_name, page_name, category_name,
                         reason="Không xuất hiện giao diện thiết lập sau khi bấm Tạo.",
@@ -6154,22 +6223,40 @@ class MainToolApp:
                     surf_mins = self.run_config.get("feed_surf_min", 10)
                     watch_mins = self.run_config.get("watch_review_min", 5)
 
+                    # 7.1. Lướt Feed đệm có đếm ngược từng phút trên bảng trạng thái
                     if surf_mins > 0:
-                        await self.human_surf_feed(page, acc_name, duration_minutes=surf_mins)
+                        self.log(f"[*] [{acc_name}] Lướt Newfeed đệm trong {surf_mins} phút...")
+                        end_surf = time.monotonic() + (surf_mins * 60)
+                        while time.monotonic() < end_surf and self.is_running:
+                            remain_s = int(end_surf - time.monotonic())
+                            mins, secs = divmod(remain_s, 60)
+                            self.set_account_state(idx, current_action=f"Đang ngâm Feed: còn {mins:02d}:{secs:02d}")
+                            await self.human_surf_feed(page, acc_name, duration_minutes=0.5)
 
-                    if watch_mins > 0:
-                        await self.human_watch_movie_reviews(page, acc_name, duration_minutes=watch_mins)
+                    # 7.2. Xem Review Phim có đếm ngược
+                    if watch_mins > 0 and self.is_running:
+                        self.log(f"[*] [{acc_name}] Xem Review Phim trong {watch_mins} phút...")
+                        end_watch = time.monotonic() + (watch_mins * 60)
+                        while time.monotonic() < end_watch and self.is_running:
+                            remain_s = int(end_watch - time.monotonic())
+                            mins, secs = divmod(remain_s, 60)
+                            self.set_account_state(idx, current_action=f"Xem Review Phim: còn {mins:02d}:{secs:02d}")
+                            await self.human_watch_movie_reviews(page, acc_name, duration_minutes=0.5)
 
                     self.log(f"[*] [{acc_name}] Đang chuyển về tài khoản cá nhân...")
                     if not await self.ensure_personal_profile(context, page, acc_name):
-                        self.log(
-                            f"[!] [{acc_name}] Dừng tạo thêm Page để tránh thao tác nhầm bằng danh tính Page."
-                        )
+                        self.log(f"[!] [{acc_name}] Dừng tạo thêm Page để tránh thao tác nhầm bằng danh tính Page.")
                         break
-                    page_delay = (int(min_page_del) + int(max_page_del)) // 2
-                    if page_delay > 0:
-                        self.log(f"[*] [{acc_name}] Chờ {page_delay} giây trước Page tiếp theo...")
-                        await asyncio.sleep(page_delay)
+
+                    # 7.3. Đếm ngược từng giây Delay trước khi reg Page kế tiếp
+                    page_delay = random.randint(int(min_page_del), int(max_page_del))
+                    if page_delay > 0 and self.is_running:
+                        self.log(f"[*] [{acc_name}] Chờ {page_delay}s trước khi tạo Page tiếp theo...")
+                        for rem in range(page_delay, 0, -1):
+                            if not self.is_running or getattr(self, "stop_requested", False):
+                                break
+                            self.set_account_state(idx, current_action=f"Nghỉ reg Page tiếp: còn {rem}s")
+                            await asyncio.sleep(1)
 
             except Exception as e:
                 self.log(f"[-] [{acc_name}] Lỗi vòng lặp tạo Page: {e}")
