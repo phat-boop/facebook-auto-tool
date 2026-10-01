@@ -19,7 +19,8 @@ import time
 import tkinter as tk
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta
+import math
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 from urllib.parse import quote, urlparse
 from urllib.parse import unquote, urljoin
@@ -43,7 +44,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.2.5"
+CURRENT_VERSION = "2.2.6"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -166,6 +167,14 @@ def configure_account_table_style(style, *trees):
 def task_result_status(tasks):
     values = {task.get("status", "PENDING") for task in tasks.values()}
     return next((status for status in ("ERROR", "FAILED", "RUNNING", "PENDING", "SUCCESS", "SKIPPED") if status in values), "PENDING")
+
+
+def page_wait_label(state):
+    remaining = state.get("page_wait_remaining")
+    if remaining is None:
+        return "-"
+    minutes, seconds = divmod(max(0, int(remaining)), 60)
+    return f"{minutes:02d}:{seconds:02d} → {state['next_page_at'][11:19]}"
 
 
 class FriendRequestOutcome(tuple):
@@ -477,6 +486,8 @@ class AccountStateStore:
                         "history_logs": [],
                         "tasks": {},
                         "last_task_result": "PENDING",
+                        "page_wait_remaining": None,
+                        "next_page_at": "",
                         **account_payload,
                     }
                     saved = self.history.load(self._states[index]) if self.history else None
@@ -522,6 +533,8 @@ class AccountStateStore:
             if state is None:
                 return None
             if status == "CHECKING":
+                state["page_wait_remaining"] = None
+                state["next_page_at"] = ""
                 if self.history:
                     saved = self.history.load(state)
                     state["history_logs"] = saved["logs"] if saved else []
@@ -554,7 +567,32 @@ class AccountStateStore:
         with self._lock:
             self._states[int(index)].setdefault("friend_attempts", set()).add(target)
 
-    def record_task(self, index, module, status, detail="", outcome=None):
+    def set_page_wait(self, index, remaining=None, next_page_at=""):
+        with self._lock:
+            state = self._states.get(int(index))
+            if state is None:
+                return
+            if remaining is not None and state["status"] in {"CHECKPOINT", "DIE", "ERROR"}:
+                return
+            state["page_wait_remaining"] = remaining
+            state["next_page_at"] = next_page_at
+
+    def finalize_active_tasks(self, index, status, reason):
+        if status not in {"SKIPPED", "ERROR"}:
+            raise ValueError("Kết quả dừng tác vụ phải là SKIPPED hoặc ERROR")
+        with self._lock:
+            state = self._states.get(int(index))
+            if state is None:
+                return
+            state["page_wait_remaining"] = None
+            state["next_page_at"] = ""
+            for module, task in state.get("tasks", {}).items():
+                if task["status"] in {"PENDING", "RUNNING"}:
+                    task.update(status=status, detail=reason)
+                    state["last_task_result"] = task_result_status(state["tasks"])
+                    self._persist(state, module, "TASK", reason)
+
+    def record_task(self, index, module, status, detail="", outcome=None, preserve_outcomes=False):
         if status not in TASK_RESULTS:
             raise ValueError(f"Task result không hợp lệ: {status}")
         with self._lock:
@@ -563,7 +601,10 @@ class AccountStateStore:
                 return
             task = state.setdefault("tasks", {}).setdefault(module, {"status": "PENDING", "detail": "", "outcomes": []})
             if status == "RUNNING":
-                task.update(status=status, detail=detail, outcomes=[])
+                if not preserve_outcomes:
+                    task.update(status=status, detail=detail, outcomes=[])
+                elif task["status"] not in {"FAILED", "ERROR"}:
+                    task.update(status=status, detail=detail)
             else:
                 if outcome is not None:
                     task["outcomes"].append(copy.deepcopy(outcome))
@@ -1073,14 +1114,14 @@ async def retry_create_page_operation(operation, max_attempts=3, base_delay=1.0)
     raise last_error
 
 
-async def close_browser_resources(context=None, browser=None, page=None):
+async def close_browser_resources(context=None, browser=None, page=None, close_timeout=5):
     """Close isolated resources on success, failure, or cancellation."""
     errors = []
     for resource in (page, context, browser):
         if resource is None:
             continue
         try:
-            await resource.close()
+            await asyncio.wait_for(resource.close(), timeout=close_timeout)
         except Exception as exc:
             errors.append(exc)
     return errors
@@ -2190,6 +2231,7 @@ class MainToolApp:
             pass
         self.is_running = False
         self.stop_requested = False
+        self.run_error = None
         self.run_thread = None
         self.worker_loop = None
         self.worker_tasks = []
@@ -2237,12 +2279,15 @@ class MainToolApp:
                 callback = self.ui_queue.get_nowait()
                 try:
                     callback()
-                except (tk.TclError, RuntimeError):
-                    pass
+                except Exception as exc:
+                    # A failed row refresh must not discard the later finish_run callback.
+                    with self.global_log_lock:
+                        self.global_logs.append(f"[UI ERROR] {type(exc).__name__}: {exc}")
         except queue.Empty:
             pass
-        if not self.close_requested:
-            self.root.after(50, self._drain_ui_queue)
+        finally:
+            if not self.close_requested:
+                self.root.after(50, self._drain_ui_queue)
 
     @staticmethod
     def _bounded_int(value, default, minimum=0, maximum=100000):
@@ -2697,17 +2742,19 @@ class MainToolApp:
         self.lbl_batch_info.pack(side="left", expand=True)
         tk.Button(f_batch_nav, text="Đợt sau ▶", font=("Segoe UI", 7, "bold"), bg="#1E293B", fg="#E2E8F0", relief="flat", cursor="hand2", command=lambda: self.change_batch(1)).pack(side="right")
 
-        state_columns = ("stt", "account", "status", "task", "action")
+        state_columns = ("stt", "account", "status", "task", "next_page", "action")
         self.account_state_tree = ttk.Treeview(card_reg, columns=state_columns, show="headings", selectmode="browse", height=5)
         self.account_state_tree.heading("stt", text="STT")
         self.account_state_tree.heading("account", text="Tài khoản")
         self.account_state_tree.heading("status", text="Trạng thái")
         self.account_state_tree.heading("task", text="Kết quả tác vụ")
+        self.account_state_tree.heading("next_page", text="Page tiếp / Còn lại")
         self.account_state_tree.heading("action", text="Tác vụ hiện tại")
         self.account_state_tree.column("stt", width=40, anchor="center", stretch=False)
         self.account_state_tree.column("account", width=120, anchor="w")
         self.account_state_tree.column("status", width=105, anchor="center", stretch=False)
         self.account_state_tree.column("task", width=100, anchor="center", stretch=False)
+        self.account_state_tree.column("next_page", width=155, anchor="center", stretch=False)
         self.account_state_tree.column("action", width=190, anchor="w")
         configure_account_table_style(self.style, self.account_state_tree)
         self.account_state_tree.pack(fill="both", expand=True)
@@ -3245,6 +3292,7 @@ class MainToolApp:
                     state["account_id"],
                     ACCOUNT_STATUS_LABELS[state["status"]],
                     state["last_task_result"],
+                    page_wait_label(state),
                     state["current_action"],
                 ),
                 tags=(state["status"],),
@@ -3274,6 +3322,7 @@ class MainToolApp:
                 state["account_id"],
                 ACCOUNT_STATUS_LABELS[state["status"]],
                 state["last_task_result"],
+                page_wait_label(state),
                 state["current_action"],
             ),
             tags=(state["status"],),
@@ -3360,8 +3409,12 @@ class MainToolApp:
         self.account_states.update(index, status=status, current_action=current_action)
         self.post_ui(lambda idx=int(index): self.refresh_account_state_row(idx))
 
-    def record_task_result(self, index, module, status, detail="", outcome=None):
-        self.account_states.record_task(index, module, status, detail, outcome)
+    def record_task_result(self, index, module, status, detail="", outcome=None, preserve_outcomes=False):
+        self.account_states.record_task(index, module, status, detail, outcome, preserve_outcomes)
+        self.post_ui(lambda idx=int(index): self.refresh_account_state_row(idx))
+
+    def finalize_active_account_tasks(self, index, status, reason):
+        self.account_states.finalize_active_tasks(index, status, reason)
         self.post_ui(lambda idx=int(index): self.refresh_account_state_row(idx))
 
     async def resolve_effective_proxy(self, index, assigned_proxy):
@@ -3427,6 +3480,11 @@ class MainToolApp:
     async def watch_facebook_checkpoint(self, page, index, worker):
         try:
             while not worker.done():
+                is_closed = getattr(page, "is_closed", None)
+                if callable(is_closed) and is_closed() is True:
+                    self.set_account_failure(index, "automation", "Profile/trình duyệt đã được đóng thủ công; dừng worker của tài khoản.")
+                    worker.cancel()
+                    return
                 await self.guard_facebook_checkpoint(page, index)
                 await asyncio.sleep(2.5)
         except FacebookCheckpointStopped:
@@ -3926,13 +3984,19 @@ class MainToolApp:
             self.run_config["headless"] = True
             self.log("[i] Trên 12 trình duyệt: tự động bật chế độ chạy ẩn để giảm RAM và tránh tràn màn hình.")
         self.stop_requested = False
+        self.run_error = None
         self.is_running = True
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         if hasattr(self, 'lbl_status_indicator'):
             self.lbl_status_indicator.config(text="● Đang chạy...", fg="#F59E0B")
-        self.run_thread = threading.Thread(target=self.run_process, daemon=True)
-        self.run_thread.start()
+        try:
+            self.run_thread = threading.Thread(target=self.run_process, daemon=True)
+            self.run_thread.start()
+        except Exception as exc:
+            self.run_error = f"Không khởi động được luồng: {type(exc).__name__}: {exc}"
+            self.log(f"[ERROR] {self.run_error}")
+            self.finish_run()
 
     def stop_bot(self):
         if not self.is_running and not (self.run_thread and self.run_thread.is_alive()):
@@ -3955,6 +4019,9 @@ class MainToolApp:
                 task.cancel()
 
     def finish_run(self):
+        if self.run_thread and self.run_thread.is_alive():
+            self.root.after(50, self.finish_run)
+            return
         was_stopped = self.stop_requested
         self.is_running = False
         self.run_thread = None
@@ -3968,8 +4035,10 @@ class MainToolApp:
         
         if hasattr(self, 'lbl_status_indicator'):
             self.lbl_status_indicator.config(
-                text="● Đã dừng (Sẵn sàng chạy lại)" if was_stopped else "● Hoàn thành",
-                fg="#F59E0B" if was_stopped else "#10B981",
+                text=("● Lỗi (Sẵn sàng chạy lại)" if getattr(self, "run_error", None)
+                      else "● Đã dừng (Sẵn sàng chạy lại)" if was_stopped else "● Hoàn thành"),
+                fg=("#EF4444" if getattr(self, "run_error", None)
+                    else "#F59E0B" if was_stopped else "#10B981"),
             )
 
     def run_process(self):
@@ -3977,8 +4046,15 @@ class MainToolApp:
         try:
             # Chạy trực tiếp worker chính, không gọi lại set_event_loop_policy để tránh xung đột luồng
             asyncio.run(self.main_worker())
+        except asyncio.CancelledError:
+            self.stop_requested = True
+            self.log("[!] Luồng chính đã nhận lệnh dừng.")
         except Exception as e:
+            self.run_error = f"{type(e).__name__}: {e}"
             self.log(f"[-] Lỗi hệ thống luồng chính [{type(e).__name__}]: {e}")
+            if hasattr(self, "account_states"):
+                for index in self.account_states.indexes():
+                    self.finalize_active_account_tasks(index, "ERROR", self.run_error)
         finally:
             self.worker_loop = None
             self.worker_tasks = []
@@ -5023,6 +5099,74 @@ class MainToolApp:
 
         self.log(f"[*] Đã mở Slot {slot} (Luồng {idx}) tại Tọa độ: {pos_x}x{pos_y}")
         return browser, context, page
+
+    async def wait_between_page_jobs(self, page, context, acc_name, index, min_delay, max_delay):
+        """Browse without reactions during the one configured inter-Page delay."""
+        if not self.is_running or getattr(self, "stop_requested", False):
+            return False
+        lower, upper = sorted((max(0, int(min_delay)), max(0, int(max_delay))))
+        delay = random.randint(lower, upper)
+        deadline = time.monotonic() + delay
+        next_page_at = (datetime.now() + timedelta(seconds=delay)).isoformat(timespec="seconds")
+        timer = None
+
+        def update_countdown():
+            remaining = max(0, math.ceil(deadline - time.monotonic()))
+            self.account_states.set_page_wait(index, remaining, next_page_at)
+            self.post_ui(lambda idx=int(index): self.refresh_account_state_row(idx))
+
+        async def countdown():
+            while self.is_running and not getattr(self, "stop_requested", False):
+                update_countdown()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                await asyncio.sleep(min(1, remaining))
+
+        try:
+            update_countdown()
+            self.record_task_result(index, "CREATE_PAGE", "RUNNING", "Chờ Page tiếp", preserve_outcomes=True)
+            self.log(f"[PAGE][WAIT] [{acc_name}] Delay {delay}s; Page tiếp lúc {next_page_at[11:19]}.")
+            timer = asyncio.create_task(countdown())
+            if not await self.ensure_personal_profile(context, page, acc_name):
+                raise RuntimeError("Không xác minh được danh tính cá nhân trước khi chờ Page tiếp")
+            if not self.is_running or getattr(self, "stop_requested", False):
+                self.finalize_active_account_tasks(index, "SKIPPED", "Đã dừng theo yêu cầu")
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                self.set_account_state(index, current_action="Đang lướt Feed; chờ Page tiếp")
+                await asyncio.wait_for(
+                    page.goto("https://www.facebook.com/", wait_until="domcontentloaded",
+                              timeout=max(1, int(min(15, remaining) * 1000))),
+                    timeout=remaining,
+                )
+            while self.is_running and not getattr(self, "stop_requested", False):
+                await self.guard_facebook_checkpoint(page, index)
+                is_closed = getattr(page, "is_closed", None)
+                if callable(is_closed) and is_closed() is True:
+                    raise RuntimeError("Profile đã được đóng trong lúc chờ Page tiếp")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return True
+                await asyncio.wait_for(page.mouse.wheel(0, 500), timeout=min(15, remaining))
+                await asyncio.sleep(min(5, max(0, deadline - time.monotonic())))
+            self.finalize_active_account_tasks(index, "SKIPPED", "Đã dừng theo yêu cầu")
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            reason = f"Lỗi chờ Page tiếp: {type(exc).__name__}: {exc}"
+            self.set_account_failure(index, "automation", reason)
+            self.finalize_active_account_tasks(index, "ERROR", reason)
+            return False
+        finally:
+            if timer is not None:
+                timer.cancel()
+                await asyncio.gather(timer, return_exceptions=True)
+            self.account_states.set_page_wait(index)
+            self.post_ui(lambda idx=int(index): self.refresh_account_state_row(idx))
+
     async def human_surf_feed(self, page, acc_name, duration_minutes=10):
         """Lướt Bảng tin như người thật trong khoảng thời gian chỉ định"""
         self.log(f"[*] [{acc_name}] Bắt đầu lướt Newfeed trong {duration_minutes} phút...")
@@ -6216,47 +6360,11 @@ class MainToolApp:
                 )
                 self.log(f"[PAGE][SUCCESS] [{acc_name}] page_id={page_identity['id'] or 'N/A'} page_url={page_identity['url']}")
 
-                # ======================================================
-                # BƯỚC 7: NUÔI NICK THEO CẤU HÌNH NGƯỜI DÙNG (NHẬP 0 SẼ BỎ QUA)
-                # ======================================================
-                if created_count < effective_max_pages and self.is_running:
-                    surf_mins = self.run_config.get("feed_surf_min", 10)
-                    watch_mins = self.run_config.get("watch_review_min", 5)
-
-                    # 7.1. Lướt Feed đệm có đếm ngược từng phút trên bảng trạng thái
-                    if surf_mins > 0:
-                        self.log(f"[*] [{acc_name}] Lướt Newfeed đệm trong {surf_mins} phút...")
-                        end_surf = time.monotonic() + (surf_mins * 60)
-                        while time.monotonic() < end_surf and self.is_running:
-                            remain_s = int(end_surf - time.monotonic())
-                            mins, secs = divmod(remain_s, 60)
-                            self.set_account_state(idx, current_action=f"Đang ngâm Feed: còn {mins:02d}:{secs:02d}")
-                            await self.human_surf_feed(page, acc_name, duration_minutes=0.5)
-
-                    # 7.2. Xem Review Phim có đếm ngược
-                    if watch_mins > 0 and self.is_running:
-                        self.log(f"[*] [{acc_name}] Xem Review Phim trong {watch_mins} phút...")
-                        end_watch = time.monotonic() + (watch_mins * 60)
-                        while time.monotonic() < end_watch and self.is_running:
-                            remain_s = int(end_watch - time.monotonic())
-                            mins, secs = divmod(remain_s, 60)
-                            self.set_account_state(idx, current_action=f"Xem Review Phim: còn {mins:02d}:{secs:02d}")
-                            await self.human_watch_movie_reviews(page, acc_name, duration_minutes=0.5)
-
-                    self.log(f"[*] [{acc_name}] Đang chuyển về tài khoản cá nhân...")
-                    if not await self.ensure_personal_profile(context, page, acc_name):
-                        self.log(f"[!] [{acc_name}] Dừng tạo thêm Page để tránh thao tác nhầm bằng danh tính Page.")
+                if created_count < effective_max_pages:
+                    if not await self.wait_between_page_jobs(
+                        page, context, acc_name, idx, min_page_del, max_page_del
+                    ):
                         break
-
-                    # 7.3. Đếm ngược từng giây Delay trước khi reg Page kế tiếp
-                    page_delay = random.randint(int(min_page_del), int(max_page_del))
-                    if page_delay > 0 and self.is_running:
-                        self.log(f"[*] [{acc_name}] Chờ {page_delay}s trước khi tạo Page tiếp theo...")
-                        for rem in range(page_delay, 0, -1):
-                            if not self.is_running or getattr(self, "stop_requested", False):
-                                break
-                            self.set_account_state(idx, current_action=f"Nghỉ reg Page tiếp: còn {rem}s")
-                            await asyncio.sleep(1)
 
             except Exception as e:
                 self.log(f"[-] [{acc_name}] Lỗi vòng lặp tạo Page: {e}")
@@ -6804,6 +6912,8 @@ class MainToolApp:
                     )
                     total_sent += len(created_pages)
                     current_state = self.account_states.get(idx)
+                    if current_state and current_state["status"] == "ERROR":
+                        return
                     if current_state and current_state["status"] == "DIE":
                         self.record_create_page_account_result(
                             idx,
@@ -6950,9 +7060,15 @@ class MainToolApp:
                 self.log(f"[ACCOUNT][SUMMARY] {acc_name}: LIVE; TASK={task_state['last_task_result']}; {total_sent} kết quả đã xác nhận.")
 
             except FacebookCheckpointStopped:
+                self.finalize_active_account_tasks(idx, "ERROR", "Dừng do Facebook Checkpoint")
                 return
             except asyncio.CancelledError:
                 current_state = self.account_states.get(idx)
+                interrupted = bool(current_state and current_state["status"] in {"CHECKPOINT", "ERROR"})
+                self.finalize_active_account_tasks(
+                    idx, "ERROR" if interrupted else "SKIPPED",
+                    current_state["current_action"] if interrupted else "Đã dừng theo yêu cầu",
+                )
                 if current_state and current_state["status"] in {"CHECKPOINT", "ERROR"}:
                     return
                 if current_state and current_state["status"] == "CHECKING":
@@ -6964,6 +7080,7 @@ class MainToolApp:
                 raise
             except Exception as e:
                 reason = f"Lỗi nick {acc_name}: {e}"
+                self.finalize_active_account_tasks(idx, "ERROR", reason)
                 self.set_account_failure(idx, "automation", reason)
                 self.update_tree_row(str(idx), status="ERROR")
                 # Bắn cảnh báo về Telegram

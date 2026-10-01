@@ -1015,6 +1015,7 @@ class CoreHelpersTest(unittest.TestCase):
             click_error=None,
             targets=None,
             running=True,
+            wait_result=None,
         ):
             app = client_app.MainToolApp.__new__(client_app.MainToolApp)
             app.is_running = running
@@ -1039,6 +1040,8 @@ class CoreHelpersTest(unittest.TestCase):
             app.refresh_account_state_row = lambda _index: None
             app.render_log_view = lambda: None
             app.selected_log_account = None
+            if wait_result is not None:
+                app.wait_between_page_jobs = mock.AsyncMock(return_value=wait_result)
 
             async def take_error_snapshot(*_args, **_kwargs):
                 return None
@@ -1156,6 +1159,18 @@ class CoreHelpersTest(unittest.TestCase):
         )
         self.assertEqual(categories, ["Nhà hàng", "Spa"])
         self.assertEqual([record["category"] for record in records], ["Nhà hàng", "Spa"])
+
+        stopped_records, stopped_saves, _categories, _status = asyncio.run(
+            run_create_case(
+                ["https://www.facebook.com/profile.php?id=423456789",
+                 "https://www.facebook.com/profile.php?id=523456789"],
+                targets=["Trang A|Nhà hàng", "Trang B|Spa"],
+                wait_result=False,
+            )
+        )
+        self.assertEqual(len(stopped_records), 1)
+        self.assertEqual(stopped_records[0]["status"], "SUCCESS")
+        self.assertEqual(stopped_saves, 1)
 
         cancelled_records, cancelled_saves, _categories, _status = asyncio.run(
             run_create_case(
@@ -1475,11 +1490,283 @@ class CheckpointRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.app.account_states.get(1)["status"], "LIVE")
         self.app.create_browser_page.assert_awaited_once()
 
+    async def test_cancelled_friend_worker_finalizes_running_task(self):
+        self.app.run_config["modes"] = {"by_uid": True}
+        entered = asyncio.Event()
+        async def wait_action(*_args, **_kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+        self.app.run_add_by_uid = wait_action
+        resources = self.resources("https://www.facebook.com/")
+        task = asyncio.create_task(self.run_worker(1, resources))
+        await asyncio.wait_for(entered.wait(), timeout=7)
+        self.assertEqual(self.app.account_states.get(1)["tasks"]["FRIEND_REQUEST"]["status"], "RUNNING")
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        state = self.app.account_states.get(1)
+        self.assertEqual(state["status"], "LIVE")
+        self.assertEqual(state["tasks"]["FRIEND_REQUEST"]["status"], "SKIPPED")
+        self.assertEqual(self.app.account_states.task_summary()["RUNNING"], 0)
+        resources[2].close.assert_awaited_once()
+
     async def test_policy_detection_is_not_a_technical_error(self):
         self.assertTrue(client_app.is_page_policy_rejected(
             "An error occurred while creating the page.\nPlease ensure you are following Page policies."
         ))
         self.assertFalse(client_app.is_page_policy_rejected("network timeout"))
+
+
+class RunLifecycleTests(unittest.TestCase):
+    def make_app(self):
+        app = client_app.MainToolApp.__new__(client_app.MainToolApp)
+        app.root = mock.Mock()
+        app.btn_start = mock.Mock()
+        app.btn_stop = mock.Mock()
+        app.lbl_status_indicator = mock.Mock()
+        app.is_running = True
+        app.stop_requested = True
+        app.close_requested = False
+        app.run_thread = None
+        app.worker_loop = None
+        app.worker_tasks = []
+        app.ui_queue = client_app.queue.Queue()
+        app.global_logs = []
+        app.global_log_lock = threading.RLock()
+        app.log = mock.Mock()
+        return app
+
+    def test_ui_error_does_not_block_finish_or_future_callbacks(self):
+        app = self.make_app()
+        broken = mock.Mock(side_effect=ValueError("row refresh failed"))
+        subsequent = mock.Mock()
+        app.ui_queue.put(broken)
+        app.ui_queue.put(app.finish_run)
+        app.ui_queue.put(subsequent)
+        app._drain_ui_queue()
+        self.assertFalse(app.is_running)
+        app.btn_start.config.assert_called_once_with(state="normal")
+        app.btn_stop.config.assert_called_once_with(state="disabled")
+        subsequent.assert_called_once()
+        self.assertIn("row refresh failed", app.global_logs[0])
+        app.root.after.assert_called_once_with(50, app._drain_ui_queue)
+
+    def test_finish_waits_for_old_thread_before_enabling_start(self):
+        app = self.make_app()
+        old_thread = mock.Mock()
+        old_thread.is_alive.side_effect = [True, False]
+        app.run_thread = old_thread
+        app.finish_run()
+        app.btn_start.config.assert_not_called()
+        self.assertIs(app.run_thread, old_thread)
+        app.root.after.call_args.args[1]()
+        self.assertIsNone(app.run_thread)
+        self.assertFalse(app.stop_requested)
+        app.btn_start.config.assert_called_once_with(state="normal")
+
+    def test_completed_run_can_start_again(self):
+        app = self.make_app()
+        app.save_settings = mock.Mock()
+        app.tree = mock.Mock()
+        app.tree.get_children.return_value = []
+        app.reload_table_from_text = mock.Mock()
+        app.capture_run_config = mock.Mock(return_value={"modes": {}, "threads": 1, "headless": True})
+        app.ent_threads = mock.Mock()
+        app.ent_threads.get.return_value = "1"
+        app.finish_run()
+        with mock.patch.object(client_app.threading, "Thread") as factory:
+            factory.return_value.is_alive.return_value = False
+            app.start_thread()
+            self.assertTrue(app.is_running)
+            app.finish_run()
+            app.start_thread()
+            self.assertEqual(factory.call_count, 2)
+            self.assertEqual(factory.return_value.start.call_count, 2)
+
+    def test_run_process_exception_and_cancel_always_schedule_finish(self):
+        for error in (RuntimeError("worker failed"), asyncio.CancelledError()):
+            with self.subTest(error=type(error).__name__):
+                app = self.make_app()
+                app.main_worker = mock.AsyncMock(side_effect=error)
+                app.post_ui = mock.Mock()
+                app.run_process()
+                app.post_ui.assert_called_once_with(app.finish_run)
+                app.post_ui.call_args.args[0]()
+                self.assertFalse(app.is_running)
+                indicator = app.lbl_status_indicator.config.call_args.kwargs
+                if isinstance(error, RuntimeError):
+                    self.assertEqual(indicator["fg"], "#EF4444")
+                    self.assertIn("Lỗi", indicator["text"])
+                else:
+                    self.assertIn("Đã dừng", indicator["text"])
+
+    def test_thread_start_failure_restores_buttons_and_can_retry(self):
+        app = self.make_app()
+        app.is_running = False
+        app.save_settings = mock.Mock()
+        app.tree = mock.Mock()
+        app.tree.get_children.return_value = []
+        app.reload_table_from_text = mock.Mock()
+        app.capture_run_config = mock.Mock(return_value={"modes": {}, "threads": 1, "headless": True})
+        app.ent_threads = mock.Mock()
+        app.ent_threads.get.return_value = "1"
+        with mock.patch.object(client_app.threading, "Thread") as factory:
+            factory.return_value.is_alive.return_value = False
+            factory.return_value.start.side_effect = RuntimeError("cannot start new thread")
+            app.start_thread()
+            self.assertFalse(app.is_running)
+            self.assertIsNone(app.run_thread)
+            self.assertEqual(app.btn_start.config.call_args.kwargs["state"], "normal")
+            self.assertEqual(app.btn_stop.config.call_args.kwargs["state"], "disabled")
+            self.assertIn("cannot start", app.run_error)
+            factory.return_value.start.side_effect = None
+            app.start_thread()
+            self.assertTrue(app.is_running)
+            self.assertIsNone(app.run_error)
+
+    def test_hung_close_is_bounded_and_other_resources_still_close(self):
+        async def run():
+            entered = asyncio.Event()
+            async def hang():
+                entered.set()
+                await asyncio.Event().wait()
+            page, context, browser = mock.Mock(), mock.Mock(), mock.Mock()
+            page.close = mock.AsyncMock(side_effect=hang)
+            context.close = mock.AsyncMock(side_effect=RuntimeError("already closed"))
+            browser.close = mock.AsyncMock()
+            errors = await asyncio.wait_for(
+                client_app.close_browser_resources(context, browser, page, close_timeout=0.02),
+                timeout=1,
+            )
+            self.assertTrue(entered.is_set())
+            self.assertEqual(len(errors), 2)
+            self.assertIsInstance(errors[0], TimeoutError)
+            browser.close.assert_awaited_once()
+        asyncio.run(run())
+
+    def test_manual_profile_close_cancels_only_its_worker(self):
+        async def run():
+            app = self.make_app()
+            app.set_account_failure = mock.Mock()
+            app.guard_facebook_checkpoint = mock.AsyncMock()
+            page = mock.Mock()
+            page.is_closed.return_value = True
+            worker = mock.Mock()
+            worker.done.return_value = False
+            await app.watch_facebook_checkpoint(page, 1, worker)
+            worker.cancel.assert_called_once()
+            app.set_account_failure.assert_called_once()
+            self.assertEqual(app.set_account_failure.call_args.args[:2], (1, "automation"))
+            app.guard_facebook_checkpoint.assert_not_awaited()
+        asyncio.run(run())
+
+
+class PageWaitTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        app = client_app.MainToolApp.__new__(client_app.MainToolApp)
+        self.app = app
+        app.is_running = True
+        app.stop_requested = False
+        app.run_config = {"feed_surf_min": 999, "watch_review_min": 999}
+        app.account_states = client_app.AccountStateStore()
+        app.account_states.sync([{"stt": index, "account_id": str(index)} for index in (1, 2)])
+        for index in (1, 2):
+            app.account_states.update(index, status="LIVE")
+            app.account_states.record_task(index, "CREATE_PAGE", "RUNNING")
+        app.refresh_account_state_row = mock.Mock()
+        app.post_ui = lambda callback: callback()
+        app.log = mock.Mock()
+        app.selected_log_account = None
+        app.ensure_personal_profile = mock.AsyncMock(return_value=True)
+        app.guard_facebook_checkpoint = mock.AsyncMock()
+        app.human_surf_feed = mock.AsyncMock()
+        app.human_watch_movie_reviews = mock.AsyncMock()
+        self.page = mock.Mock()
+        self.page.goto = mock.AsyncMock()
+        self.page.mouse.wheel = mock.AsyncMock()
+        self.page.is_closed.return_value = False
+
+    async def test_feed_runs_during_delay_and_not_before_deadline(self):
+        before = asyncio.get_running_loop().time()
+        self.assertTrue(await self.app.wait_between_page_jobs(self.page, object(), "A", 1, 1, 1))
+        self.assertGreaterEqual(asyncio.get_running_loop().time() - before, 1)
+        self.page.goto.assert_awaited_once()
+        self.page.mouse.wheel.assert_awaited()
+        self.app.human_surf_feed.assert_not_awaited()
+        self.app.human_watch_movie_reviews.assert_not_awaited()
+        self.assertIsNone(self.app.account_states.get(1)["page_wait_remaining"])
+
+    async def test_zero_delay_does_not_browse_or_sleep(self):
+        self.assertTrue(await self.app.wait_between_page_jobs(self.page, object(), "A", 1, 0, 0))
+        self.page.goto.assert_not_awaited()
+        self.page.mouse.wheel.assert_not_awaited()
+
+    async def test_countdown_uses_config_range_and_isolated_account_state(self):
+        with mock.patch.object(client_app.random, "randint", return_value=30) as choose:
+            task = asyncio.create_task(self.app.wait_between_page_jobs(self.page, object(), "A", 1, 30, 60))
+            for _ in range(15):
+                await asyncio.sleep(0)
+                if self.page.mouse.wheel.await_count:
+                    break
+            state = self.app.account_states.get(1)
+            self.assertGreater(state["page_wait_remaining"], 0)
+            self.assertLessEqual(state["page_wait_remaining"], 30)
+            self.assertIn("→", client_app.page_wait_label(state))
+            self.assertEqual(client_app.page_wait_label(self.app.account_states.get(2)), "-")
+            choose.assert_called_once_with(30, 60)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertIsNone(self.app.account_states.get(1)["page_wait_remaining"])
+
+    async def test_stop_during_wait_never_resumes_creation(self):
+        async def stop_on_scroll(*_args, **_kwargs):
+            self.app.is_running = False
+            self.app.stop_requested = True
+        self.page.mouse.wheel.side_effect = stop_on_scroll
+        with mock.patch.object(client_app.asyncio, "sleep", new=mock.AsyncMock()):
+            self.assertFalse(await self.app.wait_between_page_jobs(self.page, object(), "A", 1, 10, 10))
+        self.assertIsNone(self.app.account_states.get(1)["page_wait_remaining"])
+
+    async def test_closed_profile_and_network_errors_are_error_not_die(self):
+        for error in (RuntimeError("browser closed"), OSError("proxy timeout")):
+            self.page.goto.side_effect = error
+            self.assertFalse(await self.app.wait_between_page_jobs(self.page, object(), "A", 1, 10, 10))
+            self.assertEqual(self.app.account_states.get(1)["status"], "ERROR")
+            self.assertEqual(self.app.account_states.get(1)["tasks"]["CREATE_PAGE"]["status"], "ERROR")
+            self.assertIsNone(self.app.account_states.get(1)["page_wait_remaining"])
+        self.assertEqual(self.app.account_states.get(2)["status"], "LIVE")
+
+    async def test_checkpoint_cancels_wait_and_clears_countdown(self):
+        self.app.guard_facebook_checkpoint.side_effect = client_app.FacebookCheckpointStopped()
+        with self.assertRaises(client_app.FacebookCheckpointStopped):
+            await self.app.wait_between_page_jobs(self.page, object(), "A", 1, 1, 1)
+        self.assertIsNone(self.app.account_states.get(1)["page_wait_remaining"])
+
+    def test_finalization_preserves_completed_results_and_account_status(self):
+        states = self.app.account_states
+        states.record_task(1, "FRIEND_REQUEST", "SUCCESS", "sent")
+        states.finalize_active_tasks(1, "SKIPPED", "Stopped")
+        self.assertEqual(states.get(1)["tasks"]["CREATE_PAGE"]["status"], "SKIPPED")
+        self.assertEqual(states.get(1)["tasks"]["FRIEND_REQUEST"]["status"], "SUCCESS")
+        self.assertEqual(states.get(1)["status"], "LIVE")
+        self.assertEqual(states.get(2)["tasks"]["CREATE_PAGE"]["status"], "RUNNING")
+        self.assertEqual(states.task_summary()["RUNNING"], 1)
+
+    def test_checkpoint_finalization_keeps_checkpoint_status(self):
+        states = self.app.account_states
+        states.update(1, status="CHECKPOINT", current_action="checkpoint")
+        states.finalize_active_tasks(1, "ERROR", "Stopped at checkpoint")
+        self.assertEqual(states.get(1)["status"], "CHECKPOINT")
+        self.assertEqual(states.get(1)["tasks"]["CREATE_PAGE"]["status"], "ERROR")
+
+    def test_waiting_for_next_page_preserves_verified_results(self):
+        states = self.app.account_states
+        states.record_task(1, "CREATE_PAGE", "SUCCESS", "verified", {"page_id": "123456"})
+        states.record_task(1, "CREATE_PAGE", "RUNNING", "wait", preserve_outcomes=True)
+        self.assertEqual(states.get(1)["tasks"]["CREATE_PAGE"]["outcomes"], [{"page_id": "123456"}])
+        states.finalize_active_tasks(1, "SKIPPED", "Stopped")
+        self.assertEqual(states.get(1)["tasks"]["CREATE_PAGE"]["outcomes"], [{"page_id": "123456"}])
 
 
 if __name__ == "__main__":

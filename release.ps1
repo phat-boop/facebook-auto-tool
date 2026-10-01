@@ -175,17 +175,17 @@ try {
     Write-Utf8NoBom $clientPath $updatedClientContent
     Write-Host "Đã cập nhật CURRENT_VERSION thành $Version." -ForegroundColor Green
 
-    $testOutput = Invoke-NativeChecked $python @('-m', 'unittest', 'discover', '-s', 'tests', '-v') 'Chạy unit test'
+    $testOutput = Invoke-NativeChecked $python @('-m', 'pytest', '-v', '--color=no') 'Chạy unit test'
     $testText = $testOutput -join "`n"
-    $testSummary = [regex]::Matches($testText, '(?m)^Ran\s+(\d+)\s+tests?\s+in\b')
-    if ($testSummary.Count -ne 1) {
-        throw 'Unit test không có duy nhất một bản tổng kết số test đã chạy.'
+    # Invoke-NativeChecked validates the process exit code; counts are display-only.
+    $testSummary = [regex]::Matches($testText, '\b(\d+)\s+passed\b')
+    if ($testSummary.Count -gt 0) {
+        $testsPassed = $testSummary[$testSummary.Count - 1].Groups[1].Value
+        Write-Host "Tests passed: $testsPassed"
     }
-    $testsRun = [long]$testSummary[0].Groups[1].Value
-    if ($testsRun -lt 1 -or $testText -notmatch '(?m)^OK\s*$' -or $testText -match '\b(?:FAILED|ERROR)\b') {
-        throw 'Unit test không xác nhận thành công hoặc không chạy được test nào.'
+    else {
+        Write-Host 'Tests passed: N/A (pytest không báo số passed).'
     }
-    Write-Host "Tests run: $testsRun"
     Write-Host 'Result: PASS' -ForegroundColor Green
 
     if (Test-Path -LiteralPath $exePath) {
