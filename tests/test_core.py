@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import base64
 import contextvars
 import json
 import pathlib
@@ -82,11 +83,16 @@ class CoreHelpersTest(unittest.TestCase):
             r"C:\Users\Test User\AppData\Local\FacebookAutoTool\update_restart_error.log",
         )
         copy_position = restart_script.index('copy /y ')
-        copy_check_position = restart_script.index('if errorlevel 1 goto replace_failed')
+        copy_check_position = restart_script.index('if errorlevel 1 goto replace_failed', copy_position)
         reset_position = restart_script.index('set "PYINSTALLER_RESET_ENVIRONMENT=1"')
-        restart_position = restart_script.index(
-            'start "" /d "C:\\Apps\\FacebookTool" "C:\\Apps\\FacebookTool\\client_app.exe"'
-        )
+        restart_position = restart_script.index('powershell.exe ', reset_position)
+        commands = [line.split('-EncodedCommand ', 1)[1] for line in restart_script.splitlines() if '-EncodedCommand ' in line]
+        wait_code, restart_code = [base64.b64decode(command).decode('utf-16le') for command in commands]
+        self.assertIn('WaitForExit(60000)', wait_code)
+        self.assertIn("$info.EnvironmentVariables['PYINSTALLER_RESET_ENVIRONMENT'] = '1'", restart_code)
+        self.assertIn("$info.EnvironmentVariables.Remove($key)", restart_code)
+        self.assertIn('$info.UseShellExecute = $false', restart_code)
+        self.assertIn('WaitForExit(10000)', restart_code)
         self.assertLess(copy_position, copy_check_position)
         self.assertLess(copy_check_position, reset_position)
         self.assertLess(reset_position, restart_position)
@@ -504,8 +510,8 @@ class CoreHelpersTest(unittest.TestCase):
             ("valid", "https://www.facebook.com/", None, "LIVE"),
             ("disabled", "https://www.facebook.com/disabled/", None, "DIE"),
             ("login-wall", "https://www.facebook.com/login/", None, "DIE"),
-            ("checkpoint", "https://www.facebook.com/checkpoint/", None, "DIE"),
-            ("challenge", "https://www.facebook.com/challenge/", None, "DIE"),
+            ("checkpoint", "https://www.facebook.com/checkpoint/", None, "CHECKPOINT"),
+            ("challenge", "https://www.facebook.com/challenge/", None, "CHECKPOINT"),
             ("timeout", "https://www.facebook.com/", TimeoutError("navigation timeout"), "ERROR"),
             ("network", "https://www.facebook.com/", OSError("DNS failure"), "ERROR"),
             ("browser", "https://www.facebook.com/", RuntimeError("browser crashed"), "ERROR"),
@@ -548,6 +554,20 @@ class CoreHelpersTest(unittest.TestCase):
             async def is_visible(self):
                 return True
 
+            async def evaluate_handle(self, _script):
+                return self
+
+            def as_element(self):
+                return self
+
+            async def evaluate(self, _script):
+                return {"connected": True, "row": True,
+                        "links": ["https://www.facebook.com/profile.php?id=123456789"],
+                        "controls": ["pending" if self.clicked else "none"]}
+
+            async def dispose(self):
+                return None
+
         class EmptyLocator:
             @property
             def last(self):
@@ -557,6 +577,7 @@ class CoreHelpersTest(unittest.TestCase):
                 return 0
 
         class FriendPage:
+            url = "https://www.facebook.com/search/people/"
             def locator(self, _selector):
                 return EmptyLocator()
 
@@ -833,13 +854,14 @@ class CoreHelpersTest(unittest.TestCase):
         class FakeLocator:
             def __init__(
                 self, count=0, on_click=None, on_focus=None,
-                on_fill=None, click_error=None,
+                on_fill=None, click_error=None, text=None,
             ):
                 self._count = count
                 self._on_click = on_click
                 self._on_focus = on_focus
                 self._on_fill = on_fill
                 self._click_error = click_error
+                self._text = text
 
             @property
             def first(self):
@@ -880,6 +902,12 @@ class CoreHelpersTest(unittest.TestCase):
             async def get_attribute(self, _name):
                 return None
 
+            async def inner_text(self):
+                return self._text() if callable(self._text) else self._text
+
+            async def evaluate(self, _script, _requested):
+                return True
+
         class FakePage:
             def __init__(self, result_url=None, body_text="", click_error=None):
                 self.url = "https://www.facebook.com/pages/creation/"
@@ -892,6 +920,14 @@ class CoreHelpersTest(unittest.TestCase):
                 self.create_index = 0
                 self.body_text = body_text
                 self.click_error = click_error
+                self.requested_name = ""
+
+            async def evaluate(self, script):
+                if script != client_app.PAGE_CREATION_EVIDENCE:
+                    return False
+                identity = client_app.extract_facebook_page_identity([self.url])
+                return {"page_id": identity.get("id", ""), "page_type": "PAGE",
+                        "name": self.requested_name, "canonical": self.url}
 
             async def goto(self, *_args, **_kwargs):
                 self.url = "https://www.facebook.com/pages/creation/"
@@ -907,6 +943,7 @@ class CoreHelpersTest(unittest.TestCase):
                     return FakeLocator(
                         count=1,
                         on_focus=lambda: setattr(self, "active_field", "name"),
+                        on_fill=lambda value: setattr(self, "requested_name", value),
                     )
                 if "Hạng mục" in selector or "Category" in selector:
                     def focus_category():
@@ -922,6 +959,7 @@ class CoreHelpersTest(unittest.TestCase):
                     return FakeLocator(
                         count=1,
                         on_click=lambda: self.typed_categories.append(self.category_buffer),
+                        text=lambda: self.category_buffer,
                     )
                 if selector == "input":
                     return FakeLocator(count=1)
@@ -987,22 +1025,21 @@ class CoreHelpersTest(unittest.TestCase):
             page_targets = targets or ["Trang kiểm thử"]
             with (
                 mock.patch.object(client_app.asyncio, "sleep", new=mock.AsyncMock()),
+                mock.patch.object(client_app, "save_checkpoint_account"),
                 mock.patch.object(
                     client_app, "save_created_page_success", return_value=True
                 ) as save_result,
                 mock.patch.object(client_app, "save_create_page_outcome"),
                 mock.patch.object(client_app, "append_create_page_account_log"),
             ):
-                records = await app.run_create_page(
-                    fake_page,
-                    object(),
-                    "FB_1",
-                    1,
-                    targets=page_targets,
-                    max_pages=len(page_targets),
-                    min_page_del=0,
-                    max_page_del=0,
-                )
+                try:
+                    records = await app.run_create_page(
+                        fake_page, object(), "FB_1", 1,
+                        targets=page_targets, max_pages=len(page_targets),
+                        min_page_del=0, max_page_del=0,
+                    )
+                except client_app.FacebookCheckpointStopped:
+                    records = []
             return (
                 records,
                 save_result.call_count,
@@ -1022,6 +1059,12 @@ class CoreHelpersTest(unittest.TestCase):
                 "UNKNOWN",
             ),
             ("create exception", None, "", RuntimeError("click failed"), "ERROR", 0, "UNKNOWN"),
+            (
+                "policy overrides candidate URL",
+                "https://www.facebook.com/profile.php?id=123456789",
+                "An error occurred while creating the page. Please ensure you are following Page policies.",
+                None, "FAILED", 0, "UNKNOWN",
+            ),
             (
                 "account disabled during create",
                 "https://www.facebook.com/disabled/",
@@ -1044,6 +1087,17 @@ class CoreHelpersTest(unittest.TestCase):
                 self.assertEqual(records[0]["status"], expected_status)
                 self.assertEqual(save_calls, expected_saves)
                 self.assertEqual(account_status, expected_account_status)
+                if case_name.startswith("policy"):
+                    self.assertEqual(records[0]["reason"], "PAGE_POLICY_REJECTED")
+                    self.assertEqual(records[0]["retry_count"], 0)
+
+        records, saves, _categories, state = asyncio.run(run_create_case(
+            "https://www.facebook.com/checkpoint/",
+            "An error occurred while creating the page. Please ensure you are following Page policies.",
+        ))
+        self.assertEqual(records, [])
+        self.assertEqual(saves, 0)
+        self.assertEqual(state, "CHECKPOINT")
 
         category_cases = (
             ("restaurant", "Trang A|Nhà hàng", "Nhà hàng", "123456789"),
@@ -1154,6 +1208,250 @@ class CoreHelpersTest(unittest.TestCase):
                 if node.func.attr == "get" and owner.startswith(forbidden_prefixes):
                     violations.append(f"{function.name}:{node.lineno}:{owner}.get")
         self.assertEqual(violations, [])
+
+
+class UpdateRestartRegressionTests(unittest.TestCase):
+    def test_restart_environment_resets_private_state_and_keeps_user_environment(self):
+        original = {"PATH": "system-path", "_PYI_ARCHIVE_FILE": "old.exe", "_PYI_PARENT_PROCESS_LEVEL": "1", "_MEIPASS2": "old-unpack", "PYINSTALLER_RESET_ENVIRONMENT": "0"}
+        clean = client_app.get_update_restart_environment(original)
+        self.assertEqual(clean, {"PATH": "system-path", "PYINSTALLER_RESET_ENVIRONMENT": "1"})
+        self.assertEqual(original["_PYI_PARENT_PROCESS_LEVEL"], "1")
+
+    def test_interpreter_guards_are_preserved(self):
+        for filename in ("python.exe", "pythonw.exe", "py.exe"):
+            self.assertIsNone(client_app.get_self_update_target(str(pathlib.Path("C:/Python") / filename), frozen=True))
+        self.assertIsNone(client_app.get_self_update_target("C:/Apps/client_app.exe", frozen=False))
+        self.assertIsNotNone(client_app.get_self_update_target("C:/Apps/client_app.exe", frozen=True))
+
+    def test_restart_failure_preserves_installed_executable(self):
+        import os
+        import shutil
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory) / "client_app.exe"
+            shutil.copyfile(pathlib.Path(os.environ["SystemRoot"]) / "System32" / "where.exe", target)
+            expected_hash = client_app.hashlib.sha256(target.read_bytes()).hexdigest()
+            script = client_app.build_windows_update_restart_script(2147483647, str(target.parent / "temp.exe"), str(target), str(target.parent / "error.log"))
+            encoded = [line.split("-EncodedCommand ", 1)[1] for line in script.splitlines() if "-EncodedCommand " in line][-1]
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                env=client_app.get_update_restart_environment(), capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW, timeout=20,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(client_app.hashlib.sha256(target.read_bytes()).hexdigest(), expected_hash)
+            failure_branch = script.split(":restart_failed\n", 1)[1]
+            self.assertIn("mo lai ung dung thu cong", failure_branch)
+            self.assertNotIn('copy /y ', failure_branch)
+
+    def test_checkpoint_cancellation_never_retries_creation(self):
+        operation = mock.AsyncMock(side_effect=client_app.FacebookCheckpointStopped())
+        with self.assertRaises(client_app.FacebookCheckpointStopped):
+            asyncio.run(client_app.retry_create_page_operation(operation))
+        operation.assert_awaited_once()
+
+    def test_invalid_download_never_reaches_restart_or_replace(self):
+        source = ast.parse(pathlib.Path(client_app.__file__).read_text(encoding="utf-8"))
+        worker = next(node for node in ast.walk(source) if isinstance(node, ast.FunctionDef) and node.name == "download_worker")
+        for payload, expected_hash in ((b"MZwrong hash", "0" * 64), (b"not an exe", client_app.hashlib.sha256(b"not an exe").hexdigest())):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                fake_self = mock.Mock()
+                fake_self.post_ui.side_effect = lambda callback: callback()
+                response = mock.MagicMock()
+                response.__enter__.return_value = response
+                response.headers = {}
+                response.read.side_effect = [payload, b""]
+                namespace = dict(vars(client_app))
+                namespace.update({"self": fake_self, "dlg": mock.Mock(), "expected_sha256": expected_hash, "download_url": "https://github.com/example/payload.exe", "output_path": lambda name: str(pathlib.Path(directory) / name)})
+                restart = mock.Mock()
+                namespace["build_windows_update_restart_script"] = restart
+                target_guard = mock.Mock()
+                namespace["get_self_update_target"] = target_guard
+                exec(compile(ast.Module(body=[worker], type_ignores=[]), "download_worker", "exec"), namespace)
+                with mock.patch.object(client_app.urllib.request, "urlopen", return_value=response), mock.patch.object(client_app.messagebox, "showerror") as showerror:
+                    namespace["download_worker"]()
+                restart.assert_not_called()
+                target_guard.assert_not_called()
+                showerror.assert_called_once()
+                self.assertFalse((pathlib.Path(directory) / "updater.bat").exists())
+
+
+class CheckpointRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        patch = mock.patch.object(client_app, "output_path", side_effect=lambda name: str(pathlib.Path(self.directory.name) / name))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.raw = "123456789|Secret|2FA|||c_user=123456789; xs=abc;|TOKEN|proxy=example|locale=th-TH"
+        self.app = client_app.MainToolApp.__new__(client_app.MainToolApp)
+        app = self.app
+        app.is_running = True
+        app.stop_requested = False
+        app.run_config = {"modes": {"create_page": True, "by_uid": True, "add_page_admin": True}, "options": {}, "targets": "Page|Spa", "target": 1}
+        app.account_states = client_app.AccountStateStore()
+        app.account_states.sync([{"stt": i, "account_id": str(i), "raw_line": self.raw if i == 1 else "B|password"} for i in (1, 2)])
+        app.account_log_context = contextvars.ContextVar("checkpoint_test", default=None)
+        app.global_logs = []
+        app.global_log_lock = threading.RLock()
+        app.selected_log_account = None
+        app.create_page_result_lock = threading.RLock()
+        app.create_page_account_results = {"completed": {}, "die": {}, "checkpoint": {}}
+        app.post_ui = mock.Mock()
+        app.refresh_account_state_row = mock.Mock()
+        app.render_log_view = mock.Mock()
+        app.refresh_create_page_results_dialog = mock.Mock()
+        app.update_tree_row = mock.Mock()
+        app.get_current_friends_count = mock.AsyncMock(return_value=0)
+        app.run_add_by_uid = mock.AsyncMock(return_value=0)
+        app.run_create_page = mock.AsyncMock(return_value=[])
+        app.run_add_page_admin = mock.AsyncMock(return_value={"assignment_status": "FAILED"})
+
+    def resources(self, url):
+        page = mock.Mock()
+        page.url = url
+        page.evaluate = mock.AsyncMock(return_value=False)
+        page.close = mock.AsyncMock()
+        page.goto = mock.AsyncMock()
+        empty = mock.Mock()
+        empty.count = mock.AsyncMock(return_value=0)
+        page.locator.return_value = empty
+        context = mock.Mock()
+        context.add_cookies = mock.AsyncMock()
+        context.cookies = mock.AsyncMock(return_value=[{"name": "c_user", "value": "123456789"}])
+        context.close = mock.AsyncMock()
+        browser = mock.Mock()
+        browser.close = mock.AsyncMock()
+        return browser, context, page
+
+    async def run_worker(self, index, resources, proxy=None):
+        self.app.create_browser_page = mock.AsyncMock(return_value=resources)
+        await self.app.process_account_scoped(
+            object(), index, str(index), "c_user=123456789; xs=abc;", proxy,
+            asyncio.Semaphore(2), account_type="COOKIE",
+        )
+
+    async def test_checkpoint_worker_stops_actions_and_closes_own_resources(self):
+        resources = self.resources("https://www.facebook.com/checkpoint/")
+        async def check_ui_queued_before_close():
+            self.assertEqual(self.app.account_states.get(1)["status"], "CHECKPOINT")
+            self.assertTrue(self.app.post_ui.called)
+        resources[2].close.side_effect = check_ui_queued_before_close
+        await self.run_worker(1, resources)
+        state = self.app.account_states.get(1)
+        self.assertEqual(state["status"], "CHECKPOINT")
+        self.assertEqual(state["current_action"], "Đã dừng - Facebook Checkpoint")
+        self.app.run_create_page.assert_not_awaited()
+        self.app.run_add_by_uid.assert_not_awaited()
+        self.app.run_add_page_admin.assert_not_awaited()
+        for resource in resources:
+            resource.close.assert_awaited_once()
+        self.assertTrue(self.app.post_ui.called)
+        self.assertEqual(self.app.account_states.get(2)["status"], "UNKNOWN")
+        self.assertFalse(self.app.stop_requested)
+
+    async def test_challenge_is_checkpoint_and_external_urls_are_not(self):
+        for url, expected in (
+            ("https://www.facebook.com/challenge/verify", "CHECKPOINT"),
+            ("https://m.facebook.com/checkpoint/?next=home", "CHECKPOINT"),
+            ("https://example.com/checkpoint/", "UNKNOWN"),
+            ("https://www.facebook.com/?next=/checkpoint/", "UNKNOWN"),
+            ("https://www.facebook.com/", "UNKNOWN"),
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(await client_app.detect_facebook_account_state(self.resources(url)[2]), expected)
+
+    async def test_structural_checkpoint_form(self):
+        page = self.resources("https://www.facebook.com/verify")[2]
+        page.evaluate.return_value = True
+        await self.assert_checkpoint(page)
+
+    async def test_navigation_dom_replacement_is_not_false_error_or_checkpoint(self):
+        page = self.resources("https://www.facebook.com/")[2]
+        page.evaluate.side_effect = RuntimeError("Execution context was destroyed, most likely because of a navigation")
+        self.assertEqual(await client_app.detect_facebook_account_state(page), "UNKNOWN")
+        page.url = "https://www.facebook.com/checkpoint/"
+        self.assertEqual(await client_app.detect_facebook_account_state(page), "CHECKPOINT")
+
+    async def assert_checkpoint(self, page):
+        with self.assertRaises(client_app.FacebookCheckpointStopped):
+            await self.app.guard_facebook_checkpoint(page, 1)
+        self.assertEqual(self.app.account_states.get(1)["status"], "CHECKPOINT")
+
+    async def test_checkpoint_storage_deduplicates_and_preserves_raw_input(self):
+        page = self.resources("https://www.facebook.com/checkpoint/")[2]
+        await self.assert_checkpoint(page)
+        await self.assert_checkpoint(page)
+        client_app.save_checkpoint_account(self.raw)
+        self.assertEqual((pathlib.Path(self.directory.name) / "checkpoint_accounts.txt").read_text(encoding="utf-8"), self.raw + "\n")
+        records = self.app.get_create_page_account_results("checkpoint")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["raw_line"], self.raw)
+        self.app.set_account_state(1, status="LIVE", current_action="Hoàn thành")
+        self.app.set_account_failure(1, "invalid_login", "Not allowed to overwrite checkpoint")
+        self.assertEqual(self.app.account_states.get(1)["status"], "CHECKPOINT")
+
+    async def test_checkpoint_during_wait_cancels_without_manual_browser_close(self):
+        resources = self.resources("https://www.facebook.com/")
+        entered = asyncio.Event()
+        async def wait_action(*_args):
+            entered.set()
+            await asyncio.Event().wait()
+        self.app.run_config["options"] = {"warmup": True}
+        self.app.warm_up_feed = wait_action
+        self.app.create_browser_page = mock.AsyncMock(return_value=resources)
+        task = asyncio.create_task(self.run_worker(1, resources))
+        await asyncio.wait_for(entered.wait(), timeout=7)
+        resources[2].url = "https://www.facebook.com/checkpoint/"
+        await asyncio.wait_for(task, timeout=2)
+        self.assertEqual(self.app.account_states.get(1)["status"], "CHECKPOINT")
+        self.app.run_create_page.assert_not_awaited()
+        resources[2].close.assert_awaited_once()
+        self.app.run_config["options"] = {}
+        await self.run_worker(2, self.resources("https://www.facebook.com/"))
+        self.assertEqual(self.app.account_states.get(2)["status"], "LIVE")
+
+    async def test_technical_errors_stay_error(self):
+        for error in (TimeoutError("proxy timeout"), OSError("DNS failure"), RuntimeError("browser crash")):
+            with self.subTest(kind=type(error).__name__):
+                resources = self.resources("https://www.facebook.com/")
+                resources[2].goto.side_effect = error
+                await self.run_worker(1, resources)
+                self.assertEqual(self.app.account_states.get(1)["status"], "ERROR")
+        self.assertFalse((pathlib.Path(self.directory.name) / "checkpoint_accounts.txt").exists())
+
+    async def test_invalid_proxy_stays_error(self):
+        await self.run_worker(1, self.resources("https://www.facebook.com/"), proxy="bad proxy")
+        self.assertEqual(self.app.account_states.get(1)["status"], "ERROR")
+        self.app.create_browser_page.assert_not_awaited()
+
+    async def test_friend_error_does_not_become_completed_or_die(self):
+        self.app.run_config["modes"] = {"by_uid": True}
+        self.app.run_config["targets"] = "333333"
+        self.app.run_add_by_uid = client_app.MainToolApp.run_add_by_uid.__get__(self.app)
+        resources = self.resources("https://www.facebook.com/")
+        resources[2].goto.side_effect = [None, TimeoutError("friend navigation timeout")]
+        with mock.patch.object(client_app.asyncio, "sleep", new=mock.AsyncMock()):
+            await self.run_worker(1, resources)
+        state = self.app.account_states.get(1)
+        self.assertEqual(state["status"], "LIVE")
+        self.assertEqual(state["tasks"]["FRIEND_REQUEST"]["status"], "ERROR")
+        self.assertIn("timeout", state["current_action"])
+        self.assertNotIn("Hoàn thành", state["current_action"])
+        self.assertEqual(self.app.account_states.task_summary()["ERROR"], 1)
+
+    async def test_required_proxy_failure_does_not_launch_direct_browser(self):
+        self.app.run_config.update(proxy_mode="account")
+        resources = self.resources("https://www.facebook.com/")
+        await self.run_worker(1, resources)
+        self.assertEqual(self.app.account_states.get(1)["status"], "ERROR")
+        self.app.create_browser_page.assert_not_awaited()
+
+    async def test_policy_detection_is_not_a_technical_error(self):
+        self.assertTrue(client_app.is_page_policy_rejected(
+            "An error occurred while creating the page.\nPlease ensure you are following Page policies."
+        ))
+        self.assertFalse(client_app.is_page_policy_rejected("network timeout"))
 
 
 if __name__ == "__main__":

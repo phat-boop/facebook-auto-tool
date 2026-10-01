@@ -22,8 +22,14 @@ import urllib.error
 from datetime import datetime
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 from urllib.parse import quote, urlparse
+from urllib.parse import unquote, urljoin
+import copy
+import ipaddress
+import unicodedata
+import uuid
+from account_history import AccountHistoryStore, safe_proxy_label
 from cryptography.fernet import Fernet, InvalidToken
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 # ==================== CẤU HÌNH EVENT LOOP AN TOÀN CHO WINDOWS ====================
 # ==================== CẤU HÌNH EVENT LOOP THEO CHUẨN HIỆN ĐẠI ====================
 if sys.platform == 'win32':
@@ -37,7 +43,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.2.1"
+CURRENT_VERSION = "2.2.2"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -120,13 +126,14 @@ FRIEND_REQUEST_SENT_SELECTORS = (
 
 RESULT_FILE_LOCK = threading.Lock()
 
-ACCOUNT_STATUSES = {"UNKNOWN", "CHECKING", "LIVE", "DIE", "ERROR"}
+ACCOUNT_STATUSES = {"UNKNOWN", "CHECKING", "LIVE", "DIE", "ERROR", "CHECKPOINT"}
 ACCOUNT_STATUS_LABELS = {
     "UNKNOWN": "CHƯA KIỂM TRA",
     "CHECKING": "ĐANG KIỂM TRA",
     "LIVE": "LIVE",
     "DIE": "DIE",
     "ERROR": "ERROR",
+    "CHECKPOINT": "CHECKPOINT",
 }
 ACCOUNT_STATUS_COLORS = {
     "UNKNOWN": "#94A3B8",
@@ -134,10 +141,165 @@ ACCOUNT_STATUS_COLORS = {
     "LIVE": "#22C55E",
     "DIE": "#EF4444",
     "ERROR": "#F97316",
+    "CHECKPOINT": "#C084FC",
 }
+ACCOUNT_STATUS_PALETTE = {
+    "UNKNOWN": {"background": "#28323C", "foreground": "#E7EDF2"},
+    "CHECKING": {"background": "#594418", "foreground": "#FFF3C4"},
+    "LIVE": {"background": "#164535", "foreground": "#D5FBE5"},
+    "CHECKPOINT": {"background": "#49315D", "foreground": "#F0DEFF"},
+    "DIE": {"background": "#57252C", "foreground": "#FFE1E5"},
+    "ERROR": {"background": "#623B1D", "foreground": "#FFE9CD"},
+}
+TASK_RESULTS = {"PENDING", "RUNNING", "SUCCESS", "FAILED", "ERROR", "SKIPPED"}
+
+
+def configure_account_table_style(style, *trees):
+    style.configure("Account.Treeview", rowheight=30, foreground="#E7EDF2", background="#19232C", fieldbackground="#19232C", font=("Segoe UI", 9))
+    style.map("Account.Treeview", background=[("selected", "#285D69")], foreground=[("selected", "#FFFFFF")])
+    for tree in trees:
+        tree.configure(style="Account.Treeview")
+        for status, palette in ACCOUNT_STATUS_PALETTE.items():
+            tree.tag_configure(status, **palette)
+
+
+def task_result_status(tasks):
+    values = {task.get("status", "PENDING") for task in tasks.values()}
+    return next((status for status in ("ERROR", "FAILED", "RUNNING", "PENDING", "SUCCESS", "SKIPPED") if status in values), "PENDING")
+
+
+class FriendRequestOutcome(tuple):
+    def __new__(cls, status, target, detail):
+        result = super().__new__(cls, (status == "SENT", detail))
+        result.status, result.target = status, target
+        return result
+
+
+def friend_profile_reference(value):
+    value = str(value or "").strip()
+    if value.isdigit():
+        return value
+    parsed = urlparse(urljoin("https://www.facebook.com/", value))
+    if parsed.hostname not in {"facebook.com", "www.facebook.com", "m.facebook.com"}:
+        return ""
+    path = parsed.path.strip("/")
+    if path == "profile.php":
+        match = re.search(r'(?:^|&)id=(\d+)(?:&|$)', parsed.query)
+        return match.group(1) if match else ""
+    if not path or "/" in path or path in {"friends", "search", "groups", "checkpoint", "login", "pages", "settings"}:
+        return ""
+    return path.casefold()
+
+
+def classify_friend_controls(controls):
+    for value in controls:
+        text = " ".join(str(value or "").casefold().split())
+        if text in {"pending", "outgoing_pending", "request_sent", "cancel request", "hủy lời mời", "hủy yêu cầu", "ยกเลิกคำขอ", "batalkan permintaan", "友達リクエストをキャンセル", "요청 취소"}:
+            return "ALREADY_PENDING"
+        if text in {"friends", "friend", "bạn bè", "เพื่อน", "teman", "友達", "친구"}:
+            return "ALREADY_FRIEND"
+    return "UNKNOWN"
+
+
+FRIEND_SCOPE_SNAPSHOT = r"""root => ({
+    connected: root.isConnected,
+    row: Boolean(root.closest('[role="row"], [role="listitem"]')),
+    links: Array.from(root.querySelectorAll('a[href]')).map(a => a.href),
+    controls: Array.from(root.querySelectorAll('button,[role="button"]')).flatMap(el =>
+        [el.getAttribute('data-friendship-status'), el.getAttribute('aria-label'), el.innerText])
+})"""
+
+
+def normalize_ui_text(value):
+    return " ".join(unicodedata.normalize("NFKC", str(value or "")).casefold().split())
+
+
+PAGE_CREATION_EVIDENCE = r"""() => {
+    const data = document.querySelector('[data-page-id]');
+    const deepLink = document.querySelector('meta[property="al:android:url"]');
+    const match = (deepLink?.content || '').match(/^fb:\/\/page\/(\d+)/);
+    const pageId = data?.getAttribute('data-page-id') || match?.[1] || '';
+    const heading = Array.from(document.querySelectorAll('h1'))
+        .find(el => el.getClientRects().length > 0);
+    return {page_id: pageId, page_type: pageId ? 'PAGE' : '', name: heading?.innerText || '',
+        canonical: document.querySelector('link[rel="canonical"]')?.href || ''};
+}"""
+
+
+def verify_page_job_evidence(url, evidence, job, owner_account_id):
+    empty = {"url": "", "id": ""}
+    if not evidence or not job.get("submitted") or job.get("owner_account_id") != owner_account_id:
+        return empty
+    identity = extract_facebook_page_identity([url])
+    page_id = str(evidence.get("page_id") or "")
+    if evidence.get("page_type") != "PAGE" or not page_id.isdigit() or len(page_id) < 5:
+        return empty
+    if not identity["url"] or (identity["id"] and identity["id"] != page_id):
+        return empty
+    if normalize_ui_text(evidence.get("name")) != normalize_ui_text(job["page_name"]):
+        return empty
+    if page_id == str(job.get("owner_uid") or "") or page_id in job.get("prior_page_ids", set()):
+        return empty
+    canonical = evidence.get("canonical")
+    if canonical and facebook_page_reference(canonical) != facebook_page_reference(url):
+        return empty
+    return {**identity, "id": page_id, "owner_account_id": owner_account_id,
+            "page_job_id": job["page_job_id"], "verified": True}
 LOGIN_SUCCESS = "SUCCESS"
 LOGIN_INVALID = "INVALID"
 LOGIN_TECHNICAL_ERROR = "TECHNICAL_ERROR"
+
+
+class FacebookCheckpointStopped(asyncio.CancelledError):
+    """Unwind account automation without being swallowed by action retries."""
+
+
+async def detect_facebook_account_state(page):
+    parsed = urlparse(str(getattr(page, "url", "") or ""))
+    host = (parsed.hostname or "").casefold()
+    if host != "facebook.com" and not host.endswith(".facebook.com"):
+        return "UNKNOWN"
+    path = parsed.path.casefold()
+    if re.match(r'^/(?:checkpoint|challenge)(?:/|$|\.)', path):
+        return "CHECKPOINT"
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return "UNKNOWN"
+    try:
+        checkpoint_form = await evaluate(r"""() => Array.from(document.forms).some(form => {
+        const url = new URL(form.action, location.href);
+        return (url.hostname === 'facebook.com' || url.hostname.endsWith('.facebook.com'))
+            && /^\/(checkpoint|challenge)(\/|$|\.)/i.test(url.pathname)
+            && form.getClientRects().length > 0;
+    })""")
+    except Exception as exc:
+        # A navigation can destroy the old DOM between monitor polls.
+        if "execution context was destroyed" in str(exc).casefold():
+            return "UNKNOWN"
+        raise
+    if checkpoint_form:
+        return "CHECKPOINT"
+    return "UNKNOWN"
+
+
+def is_page_policy_rejected(text):
+    normalized = " ".join(str(text or "").casefold().split())
+    return (
+        "error occurred while creating the page" in normalized
+        and "page policies" in normalized
+    )
+
+
+def save_checkpoint_account(raw_line):
+    path = output_path("checkpoint_accounts.txt")
+    with RESULT_FILE_LOCK:
+        existing = set()
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as handle:
+                existing = set(handle.read().splitlines())
+        if raw_line and raw_line not in existing:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(raw_line + "\n")
 
 PAGE_FLOW_STATES = {
     "PENDING", "VALIDATING", "SESSION_CHECK", "OPEN_CREATE_PAGE",
@@ -268,9 +430,14 @@ def write_create_page_results_xlsx(file_path, categorized_records):
 
 
 class AccountStateStore:
-    def __init__(self):
+    def __init__(self, history=None):
         self._lock = threading.RLock()
         self._states = {}
+        self.history = history
+
+    def _persist(self, state, module="ACCOUNT", event_type="STATE", message=""):
+        if self.history is not None:
+            self.history.save(state, module, event_type, message)
 
     def sync(self, accounts):
         with self._lock:
@@ -304,15 +471,27 @@ class AccountStateStore:
                         "locale": normalize_account_locale(account.get("locale")),
                         "timezone": normalize_account_timezone(account.get("timezone")),
                         "status": "UNKNOWN",
+                        "checkpoint_stopped": False,
                         "current_action": "Chưa chạy",
                         "logs": [],
+                        "history_logs": [],
+                        "tasks": {},
+                        "last_task_result": "PENDING",
                         **account_payload,
                     }
+                    saved = self.history.load(self._states[index]) if self.history else None
+                    if saved:
+                        self._states[index].update(
+                            status=saved["last_status"], current_action=saved["last_action"],
+                            tasks=saved["tasks"], last_task_result=saved["last_task_result"],
+                            history_logs=saved["logs"],
+                        )
                 else:
                     existing["country"] = str(account.get("country") or "")
                     existing["locale"] = normalize_account_locale(account.get("locale"))
                     existing["timezone"] = normalize_account_timezone(account.get("timezone"))
                     existing.update(account_payload)
+                self._persist(self._states[index], event_type="SEEN")
             for index in list(self._states):
                 if index not in active_indexes:
                     del self._states[index]
@@ -328,6 +507,9 @@ class AccountStateStore:
                 return None
             snapshot = dict(state)
             snapshot["logs"] = list(state["logs"])
+            snapshot["history_logs"] = list(state.get("history_logs", []))
+            snapshot["tasks"] = copy.deepcopy(state.get("tasks", {}))
+            snapshot["friend_attempts"] = set(state.get("friend_attempts", set()))
             snapshot["fields"] = list(state.get("fields") or [])
             snapshot["unknown_fields"] = [
                 dict(field) for field in state.get("unknown_fields") or []
@@ -339,14 +521,68 @@ class AccountStateStore:
             state = self._states.get(int(index))
             if state is None:
                 return None
+            if status == "CHECKING":
+                if self.history:
+                    saved = self.history.load(state)
+                    state["history_logs"] = saved["logs"] if saved else []
+                    state["logs"] = []
+                state["checkpoint_stopped"] = False
+                state["tasks"] = {}
+                state["friend_attempts"] = set()
+                state["last_task_result"] = "PENDING"
+            if state.get("checkpoint_stopped") and status != "CHECKPOINT":
+                return self.get(index)
             if status is not None:
                 normalized_status = str(status).upper()
                 if normalized_status not in ACCOUNT_STATUSES:
                     raise ValueError(f"Trạng thái tài khoản không hợp lệ: {status}")
                 state["status"] = normalized_status
+                if normalized_status == "CHECKPOINT":
+                    state["checkpoint_stopped"] = True
             if current_action is not None:
                 state["current_action"] = str(current_action)
+            self._persist(state)
             return self.get(index)
+
+    def set_proxy(self, index, proxy):
+        with self._lock:
+            state = self._states[int(index)]
+            state["proxy"] = state["effective_proxy"] = str(proxy or "")
+            self._persist(state, event_type="PROXY", message=safe_proxy_label(proxy))
+
+    def mark_friend_attempt(self, index, target):
+        with self._lock:
+            self._states[int(index)].setdefault("friend_attempts", set()).add(target)
+
+    def record_task(self, index, module, status, detail="", outcome=None):
+        if status not in TASK_RESULTS:
+            raise ValueError(f"Task result không hợp lệ: {status}")
+        with self._lock:
+            state = self._states.get(int(index))
+            if state is None or state.get("checkpoint_stopped"):
+                return
+            task = state.setdefault("tasks", {}).setdefault(module, {"status": "PENDING", "detail": "", "outcomes": []})
+            if status == "RUNNING":
+                task.update(status=status, detail=detail, outcomes=[])
+            else:
+                if outcome is not None:
+                    task["outcomes"].append(copy.deepcopy(outcome))
+                if (task["status"] not in {"FAILED", "ERROR"} or status == "ERROR") and not (status == "SKIPPED" and task["status"] == "SUCCESS"):
+                    task.update(status=status, detail=detail)
+            state["last_task_result"] = task_result_status(state["tasks"])
+            if task["status"] in {"FAILED", "ERROR"}:
+                state["current_action"] = f"{module} {task['status']}: {task['detail']}"
+            self._persist(state, module, "TASK", detail)
+
+    def task_summary(self, indexes=None):
+        with self._lock:
+            selected = set(indexes) if indexes is not None else set(self._states)
+            counts = {status: 0 for status in TASK_RESULTS}
+            for index, state in self._states.items():
+                if index in selected:
+                    for task in state.get("tasks", {}).values():
+                        counts[task["status"]] += 1
+            return counts
 
     def append_log(self, index, message, current_action=None):
         with self._lock:
@@ -356,11 +592,15 @@ class AccountStateStore:
             state["logs"].append(str(message))
             if len(state["logs"]) > 5000:
                 del state["logs"][:-4500]
-            if current_action:
+            if current_action and not state.get("checkpoint_stopped"):
                 state["current_action"] = str(current_action)
+            self._persist(state, event_type="LOG", message=message)
             return self.get(index)
 
     def set_failure(self, index, failure_kind, reason):
+        state = self.get(index)
+        if state and state.get("checkpoint_stopped"):
+            return "CHECKPOINT"
         status = account_status_for_failure(failure_kind)
         self.update(index, status=status, current_action=str(reason))
         self.append_log(index, f"[-] {reason}")
@@ -394,6 +634,13 @@ CANCEL_REQUEST_SELECTORS = (
     'div[role="button"]:has-text("Cancel request"), '
     'div[aria-label="Hủy lời mời"], '
     'div[aria-label="Cancel request"]'
+)
+
+FRIEND_STATE_SELECTORS = (
+    '[role="button"][data-friendship-status], button[data-friendship-status], '
+    '[role="button"][aria-label="Friends"], [role="button"][aria-label="Bạn bè"], '
+    '[role="button"][aria-label="เพื่อน"], [role="button"][aria-label="Teman"], '
+    '[role="button"][aria-label="友達"], [role="button"][aria-label="친구"]'
 )
 
 CREATE_PAGE_BUTTON_PATTERN = re.compile(
@@ -722,6 +969,7 @@ def save_created_page_success(record):
         "time", "timestamp", "account_index", "account", "account_id",
         "page_name", "category", "page_url", "page_id", "proxy", "status",
         "reason", "technical_error", "retry_count", "flow_state",
+        "owner_account_id", "page_job_id",
     ]
     csv_path = output_path("created_pages.csv")
     success_path = output_path("created_pages_success.txt")
@@ -730,6 +978,7 @@ def save_created_page_success(record):
         return False
 
     with RESULT_FILE_LOCK:
+        upgrade_page_result_header(csv_path, fieldnames)
         existing_keys = set()
         if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
             with open(csv_path, "r", newline="", encoding="utf-8-sig") as handle:
@@ -758,11 +1007,34 @@ CREATE_PAGE_RESULT_FIELDS = [
     "time", "timestamp", "account_index", "account", "account_id",
     "page_name", "category", "page_url", "page_id", "proxy", "status",
     "reason", "technical_error", "retry_count", "flow_state",
+    "owner_account_id", "page_job_id",
 ]
 
 
+def upgrade_page_result_header(path, fieldnames):
+    if not os.path.exists(path) or not os.path.getsize(path):
+        return
+    with open(path, newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames == fieldnames:
+            return
+        rows = list(reader)
+    temporary = path + ".schema.tmp"
+    try:
+        with open(temporary, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+
 def save_create_page_outcome(record):
-    append_csv_result("create_page_results.csv", CREATE_PAGE_RESULT_FIELDS, record)
+    with RESULT_FILE_LOCK:
+        upgrade_page_result_header(output_path("create_page_results.csv"), CREATE_PAGE_RESULT_FIELDS)
+        append_csv_result("create_page_results.csv", CREATE_PAGE_RESULT_FIELDS, record)
 
 
 def append_create_page_account_log(account_index, account_id, message):
@@ -801,10 +1073,10 @@ async def retry_create_page_operation(operation, max_attempts=3, base_delay=1.0)
     raise last_error
 
 
-async def close_browser_resources(context=None, browser=None):
+async def close_browser_resources(context=None, browser=None, page=None):
     """Close isolated resources on success, failure, or cancellation."""
     errors = []
-    for resource in (context, browser):
+    for resource in (page, context, browser):
         if resource is None:
             continue
         try:
@@ -924,27 +1196,75 @@ def get_self_update_target(executable=None, frozen=None):
     return target
 
 
-def build_windows_update_restart_script(process_id, temp_file, current_exe, error_log):
+def get_update_restart_environment(environment=None):
+    source = os.environ if environment is None else environment
+    clean = {
+        key: value for key, value in source.items()
+        if not key.upper().startswith("_PYI_") and key.upper() != "_MEIPASS2"
+    }
+    clean["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return clean
+
+
+def build_windows_update_restart_script(process_id, temp_file, current_exe, error_log, parent_process_id=0):
     """Build the updater script that replaces and starts a fresh PyInstaller app."""
     def batch_path(value):
         return os.path.abspath(str(value)).replace("%", "%%")
 
     temp_path = batch_path(temp_file)
     executable_path = batch_path(current_exe)
-    executable_dir = batch_path(os.path.dirname(current_exe))
     error_log_path = batch_path(error_log)
+    def encoded_command(script):
+        return base64.b64encode(script.encode("utf-16le")).decode("ascii")
+
+    ps_executable = os.path.abspath(current_exe).replace("'", "''")
+    wait_command = encoded_command(f"""
+$ErrorActionPreference = 'Stop'
+try {{
+    $oldProcesses = @(Get-Process -Id {int(process_id)} -ErrorAction SilentlyContinue)
+    $parent = Get-Process -Id {int(parent_process_id)} -ErrorAction SilentlyContinue
+    if ($parent -and $parent.Path -eq '{ps_executable}') {{ $oldProcesses += $parent }}
+    foreach ($oldProcess in $oldProcesses) {{
+        if (-not $oldProcess.WaitForExit(60000)) {{ throw 'Old instance is still running.' }}
+    }}
+    exit 0
+}} catch {{ exit 1 }}
+""")
+    restart_command = encoded_command(f"""
+$ErrorActionPreference = 'Stop'
+try {{
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = '{ps_executable}'
+    $info.WorkingDirectory = [IO.Path]::GetDirectoryName($info.FileName)
+    $info.UseShellExecute = $false
+    foreach ($key in @($info.EnvironmentVariables.Keys)) {{
+        if ($key.StartsWith('_PYI_', [StringComparison]::OrdinalIgnoreCase) -or $key -eq '_MEIPASS2') {{
+            $info.EnvironmentVariables.Remove($key)
+        }}
+    }}
+    $info.EnvironmentVariables['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    $newProcess = [Diagnostics.Process]::Start($info)
+    if ($null -eq $newProcess) {{ throw 'Restart did not create a process.' }}
+    if ($newProcess.WaitForExit(10000) -and $newProcess.ExitCode -ne 0) {{
+        throw 'Restarted application exited with an error.'
+    }}
+    exit 0
+}} catch {{ exit 1 }}
+""")
     return f"""@echo off
 setlocal
 del /q "{error_log_path}" >nul 2>&1
-taskkill /f /pid {int(process_id)} >nul 2>&1
-timeout /t 3 /nobreak >nul
+powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {wait_command}
+if errorlevel 1 goto replace_failed
 copy /y "{temp_path}" "{executable_path}" >nul
 if errorlevel 1 goto replace_failed
 del /q "{temp_path}" >nul 2>&1
 
 rem Start a new top-level PyInstaller instance instead of inheriting the old archive context.
 set "PYINSTALLER_RESET_ENVIRONMENT=1"
-start "" /d "{executable_dir}" "{executable_path}"
+for /f "tokens=1 delims==" %%V in ('set _PYI_ 2^>nul') do set "%%V="
+set "_MEIPASS2="
+powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {restart_command}
 if errorlevel 1 goto restart_failed
 goto cleanup
 
@@ -1105,7 +1425,8 @@ def check_for_updates(self, manual=False):
                                     updater_file = output_path("updater.bat")
                                     restart_error_log = output_path("update_restart_error.log")
                                     bat_script = build_windows_update_restart_script(
-                                        os.getpid(), temp_file, current_exe, restart_error_log
+                                        os.getpid(), temp_file, current_exe, restart_error_log,
+                                        parent_process_id=os.getppid(),
                                     )
                                     with open(updater_file, "w", encoding="utf-8") as f_bat:
                                         f_bat.write(bat_script)
@@ -1113,7 +1434,11 @@ def check_for_updates(self, manual=False):
                                     self.post_ui(lambda: lbl_progress.config(text="Tải xong! Đang khởi động lại ứng dụng..."))
                                     time.sleep(1.5)
 
-                                    subprocess.Popen([updater_file], shell=True, cwd=APP_DATA_DIR)
+                                    subprocess.Popen(
+                                        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", updater_file],
+                                        cwd=APP_DATA_DIR, env=get_update_restart_environment(),
+                                        creationflags=subprocess.CREATE_NO_WINDOW,
+                                    )
                                     self.post_ui(self.root.destroy)
 
                                 except Exception as err:
@@ -1304,30 +1629,43 @@ def parse_proxy(proxy_raw: str):
     if not proxy_raw or not proxy_raw.strip():
         return None
     raw = proxy_raw.strip()
-    if "://" in raw:
+    scheme = "http"
+    username = password = None
+    if "://" in raw or ("@" in raw and not re.match(r'^[^:@]+:\d+:', raw)):
         try:
-            parsed = urlparse(raw)
-            if parsed.scheme not in {"http", "https", "socks4", "socks5"} or not parsed.hostname or not parsed.port:
+            parsed = urlparse(raw if "://" in raw else "http://" + raw)
+            if parsed.scheme not in {"http", "https", "socks4", "socks5"} or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
                 return None
-            proxy = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
-            if parsed.username:
-                proxy["username"] = parsed.username
-            if parsed.password:
-                proxy["password"] = parsed.password
-            return proxy
+            scheme, host, port = parsed.scheme, parsed.hostname, parsed.port
+            if parsed.username is not None:
+                username, password = unquote(parsed.username), unquote(parsed.password or "")
         except ValueError:
             return None
-
-    parts = raw.split(':')
-    if len(parts) == 4:
-        host, port, username, password = parts
-        if port.isdigit() and 0 < int(port) <= 65535:
-            return {"server": f"http://{host}:{port}", "username": username, "password": password}
-    elif len(parts) == 2:
-        host, port = parts
-        if port.isdigit() and 0 < int(port) <= 65535:
-            return {"server": f"http://{host}:{port}"}
-    return None
+    else:
+        match = re.fullmatch(r'(\[[^\]]+\]|[^:\s]+):(\d+)(?::([^:]*):(.*))?', raw)
+        if not match:
+            return None
+        host, port, username, password = match.groups()
+        host = host.strip("[]")
+        port = int(port)
+        if username is not None:
+            username, password = unquote(username), unquote(password or "")
+    if not host or port is None or not 0 < port <= 65535:
+        return None
+    if username is not None and (not username or not password):
+        return None
+    if ":" in host:
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            return None
+        host = f"[{host}]"
+    elif not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', host):
+        return None
+    proxy = {"server": f"{scheme}://{host}:{port}"}
+    if username is not None:
+        proxy.update(username=username, password=password)
+    return proxy
 
 def reset_rotating_proxy(api_url: str):
     """Gửi yêu cầu đổi IP qua đường link API của nhà cung cấp Proxy xoay"""
@@ -1850,14 +2188,14 @@ class MainToolApp:
         self.run_config = {}
         self.ui_queue = queue.Queue()
         self.close_requested = False
-        self.account_states = AccountStateStore()
+        self.account_states = AccountStateStore(AccountHistoryStore(output_path("account_history.db")))
         self.account_log_context = contextvars.ContextVar("account_log_context", default=None)
         self.global_logs = []
         self.global_log_lock = threading.RLock()
         self.selected_log_account = None
         self.current_batch = 1
         self.create_page_result_lock = threading.RLock()
-        self.create_page_account_results = {"completed": {}, "die": {}}
+        self.create_page_account_results = {"completed": {}, "die": {}, "checkpoint": {}}
         self.create_page_results_window = None
         self.create_page_result_trees = {}
 
@@ -2118,6 +2456,7 @@ class MainToolApp:
         self.style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"), background=t["card"], foreground=t["primary"])
         self.style.configure("Treeview", rowheight=28, font=("Segoe UI", 9), background=t["card"], foreground=t["text"], fieldbackground=t["card"], borderwidth=0)
         self.style.map("Treeview", background=[("selected", t["primary"])], foreground=[("selected", "#FFFFFF")])
+        configure_account_table_style(self.style, self.account_state_tree, self.tree)
 
         # Style Progressbar
         self.style.configure("Horizontal.TProgressbar", troughcolor=t["border"], background=t["primary"], bordercolor=t["card"])
@@ -2297,7 +2636,7 @@ class MainToolApp:
         f2_cfg = tk.Frame(card2, bg="#131C2E")
         f2_cfg.pack(fill="x")
         self.proxy_mode = tk.StringVar(value="round_robin")
-        for txt, val in [("Luân phiên", "round_robin"), ("Theo nhóm", "fixed_ratio"), ("Ngẫu nhiên", "random"), ("API xoay", "rotating_api")]:
+        for txt, val in [("Luân phiên", "round_robin"), ("Theo nhóm", "fixed_ratio"), ("Ngẫu nhiên", "random"), ("Riêng/account", "account"), ("API xoay", "rotating_api")]:
             tk.Radiobutton(
                 f2_cfg,
                 text=txt,
@@ -2349,19 +2688,23 @@ class MainToolApp:
         self.lbl_batch_info.pack(side="left", expand=True)
         tk.Button(f_batch_nav, text="Đợt sau ▶", font=("Segoe UI", 7, "bold"), bg="#1E293B", fg="#E2E8F0", relief="flat", cursor="hand2", command=lambda: self.change_batch(1)).pack(side="right")
 
-        state_columns = ("stt", "account", "status", "action")
+        state_columns = ("stt", "account", "status", "task", "action")
         self.account_state_tree = ttk.Treeview(card_reg, columns=state_columns, show="headings", selectmode="browse", height=5)
         self.account_state_tree.heading("stt", text="STT")
         self.account_state_tree.heading("account", text="Tài khoản")
         self.account_state_tree.heading("status", text="Trạng thái")
+        self.account_state_tree.heading("task", text="Kết quả tác vụ")
         self.account_state_tree.heading("action", text="Tác vụ hiện tại")
         self.account_state_tree.column("stt", width=40, anchor="center", stretch=False)
         self.account_state_tree.column("account", width=120, anchor="w")
         self.account_state_tree.column("status", width=105, anchor="center", stretch=False)
+        self.account_state_tree.column("task", width=100, anchor="center", stretch=False)
         self.account_state_tree.column("action", width=190, anchor="w")
-        for status, color in ACCOUNT_STATUS_COLORS.items():
-            self.account_state_tree.tag_configure(status, foreground=color)
+        configure_account_table_style(self.style, self.account_state_tree)
         self.account_state_tree.pack(fill="both", expand=True)
+        state_scroll = ttk.Scrollbar(card_reg, orient="horizontal", command=self.account_state_tree.xview)
+        state_scroll.pack(fill="x")
+        self.account_state_tree.configure(xscrollcommand=state_scroll.set)
         self.account_state_tree.bind("<<TreeviewSelect>>", self.on_account_state_selected)
 
         self.lbl_queue_info = tk.Label(
@@ -2510,8 +2853,8 @@ class MainToolApp:
 
         self.lbl_stat_total = make_stat_box(f_stats, "Tổng nick", "0", 0, "#38BDF8")
         self.lbl_stat_running = make_stat_box(f_stats, "Đang chạy", "0", 1, "#F59E0B")
-        self.lbl_stat_success = make_stat_box(f_stats, "Thành công", "0", 2, "#10B981")
-        self.lbl_stat_failed = make_stat_box(f_stats, "Thất bại", "0", 3, "#EF4444")
+        self.lbl_stat_success = make_stat_box(f_stats, "Account LIVE", "0", 2, "#10B981")
+        self.lbl_stat_failed = make_stat_box(f_stats, "Account lỗi", "0", 3, "#EF4444")
 # [KẾT THÚC THAY THẾ]
 
     def _build_tab_data(self):
@@ -2589,11 +2932,7 @@ class MainToolApp:
         columns = ("select", "id", "uid", "name", "password", "2fa", "cookie", "email", "proxy", "status")
         self.tree = ttk.Treeview(frame_tree, columns=columns, show="headings", selectmode="extended")
         self.tree.tag_configure("empty", foreground="#8EA3B5")
-        self.tree.tag_configure("UNKNOWN", foreground="#94A3B8")
-        self.tree.tag_configure("CHECKING", foreground="#FACC15")
-        self.tree.tag_configure("LIVE", foreground="#4ADE80")
-        self.tree.tag_configure("DIE", foreground="#F87171")
-        self.tree.tag_configure("ERROR", foreground="#FB923C")
+        configure_account_table_style(self.style, self.tree)
 
         self.tree.heading("select", text="[✔]")
         self.tree.heading("id", text="STT")
@@ -2703,6 +3042,7 @@ class MainToolApp:
         for result_type, title in (
             ("completed", "LIVE - ĐÃ TẠO XONG PAGE"),
             ("die", "DIE - ĐÃ DỪNG"),
+            ("checkpoint", "CHECKPOINT - CẦN XÁC MINH"),
         ):
             frame = tk.Frame(notebook, bg="#0B1117")
             notebook.add(frame, text=title)
@@ -2759,7 +3099,7 @@ class MainToolApp:
         if window is None or not window.winfo_exists():
             return
         counts = {}
-        for result_type in ("completed", "die"):
+        for result_type in ("completed", "die", "checkpoint"):
             tree = self.create_page_result_trees.get(result_type)
             if tree is None:
                 continue
@@ -2787,7 +3127,7 @@ class MainToolApp:
             self.lbl_create_page_result_summary.config(
                 text=(
                     f"LIVE đã tạo xong: {counts.get('completed', 0)}   |   "
-                    f"DIE: {counts.get('die', 0)}"
+                    f"DIE: {counts.get('die', 0)}   |   CHECKPOINT: {counts.get('checkpoint', 0)}"
                 )
             )
         if hasattr(self, "lbl_create_page_live_count"):
@@ -2895,6 +3235,7 @@ class MainToolApp:
                     state["stt"],
                     state["account_id"],
                     ACCOUNT_STATUS_LABELS[state["status"]],
+                    state["last_task_result"],
                     state["current_action"],
                 ),
                 tags=(state["status"],),
@@ -2923,6 +3264,7 @@ class MainToolApp:
                 state["stt"],
                 state["account_id"],
                 ACCOUNT_STATUS_LABELS[state["status"]],
+                state["last_task_result"],
                 state["current_action"],
             ),
             tags=(state["status"],),
@@ -2932,11 +3274,15 @@ class MainToolApp:
     def refresh_state_summary(self):
         summary = self.account_states.summary()
         total = sum(summary.values())
+        task_summary = self.account_states.task_summary()
+        task_totals = {status: task_summary[status]
+                       for status in ("SUCCESS", "FAILED", "ERROR", "SKIPPED")}
         if hasattr(self, "lbl_queue_info"):
             self.lbl_queue_info.config(
                 text=(
                     f"Tổng: {total} • LIVE: {summary['LIVE']} • "
-                    f"DIE: {summary['DIE']} • ERROR: {summary['ERROR']}"
+                    f"DIE: {summary['DIE']} • ERROR: {summary['ERROR']} • CHECKPOINT: {summary['CHECKPOINT']}\n"
+                    + "Task: " + " • ".join(f"{key}: {value}" for key, value in task_totals.items())
                 )
             )
         if hasattr(self, "lbl_stat_running"):
@@ -2947,7 +3293,7 @@ class MainToolApp:
             self.lbl_management_summary.config(
                 text=(
                     f"Tổng {total}  •  LIVE {summary['LIVE']}  •  "
-                    f"DIE {summary['DIE']}  •  ERROR {summary['ERROR']}"
+                    f"DIE {summary['DIE']}  •  ERROR {summary['ERROR']}  •  CHECKPOINT {summary['CHECKPOINT']}"
                 )
             )
 
@@ -2989,7 +3335,7 @@ class MainToolApp:
             title = "📜 NHẬT KÝ TỔNG"
         else:
             state = self.account_states.get(self.selected_log_account)
-            lines = state["logs"] if state else []
+            lines = (state["history_logs"] + ["[CURRENT RUN]"] + state["logs"]) if state else []
             account_label = state["account_id"] if state else str(self.selected_log_account)
             title = f"📜 NHẬT KÝ: {account_label}"
 
@@ -3004,6 +3350,75 @@ class MainToolApp:
     def set_account_state(self, index, status=None, current_action=None):
         self.account_states.update(index, status=status, current_action=current_action)
         self.post_ui(lambda idx=int(index): self.refresh_account_state_row(idx))
+
+    def record_task_result(self, index, module, status, detail="", outcome=None):
+        self.account_states.record_task(index, module, status, detail, outcome)
+        self.post_ui(lambda idx=int(index): self.refresh_account_state_row(idx))
+
+    async def resolve_effective_proxy(self, index, assigned_proxy):
+        config = self.run_config
+        mode = config.get("proxy_mode", "round_robin")
+        effective_proxy = str(assigned_proxy or "")
+        if mode == "rotating_api":
+            if not config.get("proxy_api"):
+                raise ValueError("API xoay chưa được cấu hình; không dùng IP thật.")
+            async with self.proxy_api_lock:
+                effective_proxy = await asyncio.to_thread(fetch_proxy_from_api, config["proxy_api"])
+            if not effective_proxy:
+                raise ConnectionError("API proxy không trả về proxy hợp lệ.")
+        required = config.get("proxy_required", False) or mode in {"account", "rotating_api"}
+        if (required and not effective_proxy) or (effective_proxy and not parse_proxy(effective_proxy)):
+            raise ValueError("Thiếu proxy bắt buộc hoặc proxy sai định dạng; không dùng IP thật.")
+        self.account_states.set_proxy(index, effective_proxy)
+        def update_proxy():
+            if hasattr(self, "tree") and self.tree.exists(str(index)):
+                values = list(self.tree.item(str(index), "values"))
+                values[8] = effective_proxy or "Không dùng"
+                self.tree.item(str(index), values=values)
+            self.refresh_account_state_row(index)
+        self.post_ui(update_proxy)
+        return effective_proxy
+
+    def stop_checkpoint_account(self, index):
+        state = self.account_states.get(index)
+        if state is None or state.get("checkpoint_stopped"):
+            return
+        self.set_account_state(
+            index, status="CHECKPOINT",
+            current_action="Đã dừng - Facebook Checkpoint",
+        )
+        self.log("[CHECKPOINT] Facebook yêu cầu xác minh tài khoản.", account_index=index)
+        self.log("[CHECKPOINT] Dừng toàn bộ tác vụ của account này.", account_index=index)
+        raw_line = state.get("raw_line", "")
+        try:
+            save_checkpoint_account(raw_line)
+        except OSError as exc:
+            self.log(f"[ERROR] Không lưu được danh sách checkpoint: {exc}", account_index=index)
+        if hasattr(self, "create_page_result_lock"):
+            self.record_create_page_account_result(
+                index, "checkpoint", reason="Đã dừng - Facebook Checkpoint"
+            )
+
+    async def guard_facebook_checkpoint(self, page, index=None):
+        if index is None:
+            log_context = getattr(self, "account_log_context", None)
+            index = log_context.get() if log_context is not None else None
+        state = self.account_states.get(index) if index is not None else None
+        if (state and state.get("checkpoint_stopped")) or await detect_facebook_account_state(page) == "CHECKPOINT":
+            if index is not None:
+                self.stop_checkpoint_account(index)
+            raise FacebookCheckpointStopped()
+
+    async def watch_facebook_checkpoint(self, page, index, worker):
+        try:
+            while not worker.done():
+                await self.guard_facebook_checkpoint(page, index)
+                await asyncio.sleep(0.25)
+        except FacebookCheckpointStopped:
+            worker.cancel()
+        except Exception as exc:
+            self.set_account_failure(index, "automation", f"Lỗi theo dõi phiên Facebook: {exc}")
+            worker.cancel()
 
     def set_account_failure(self, index, failure_kind, reason):
         status = self.account_states.set_failure(index, failure_kind, reason)
@@ -3020,13 +3435,13 @@ class MainToolApp:
 
     def reset_create_page_account_results(self):
         with self.create_page_result_lock:
-            self.create_page_account_results = {"completed": {}, "die": {}}
+            self.create_page_account_results = {"completed": {}, "die": {}, "checkpoint": {}}
         self.refresh_create_page_results_dialog()
 
     def record_create_page_account_result(
         self, index, result_type, reason="", created_count=0, target_count=0
     ):
-        if result_type not in {"completed", "die"}:
+        if result_type not in {"completed", "die", "checkpoint"}:
             raise ValueError(f"Loại kết quả Create Page không hợp lệ: {result_type}")
         state = self.account_states.get(index)
         if state is None:
@@ -3039,7 +3454,7 @@ class MainToolApp:
             "stt": state.get("stt", index),
             "account_id": state.get("account_id", ""),
             "uid": state.get("uid", ""),
-            "raw_line": source_line,
+            "raw_line": (state.get("raw_line") or source_line) if result_type == "checkpoint" else source_line,
             "created_count": int(created_count or 0),
             "target_count": int(target_count or 0),
             "reason": str(reason or ""),
@@ -3048,7 +3463,9 @@ class MainToolApp:
         opposite = "die" if result_type == "completed" else "completed"
         with self.create_page_result_lock:
             self.create_page_account_results[opposite].pop(key, None)
-            self.create_page_account_results[result_type][key] = record
+            if result_type == "checkpoint":
+                self.create_page_account_results["die"].pop(key, None)
+            self.create_page_account_results.setdefault(result_type, {})[key] = record
         self.post_ui(self.refresh_create_page_results_dialog)
 
     def get_create_page_account_results(self, result_type):
@@ -3376,6 +3793,8 @@ class MainToolApp:
                     writer.writerow([vals[1], vals[2], vals[3], vals[8], vals[9], now_str])
             messagebox.showinfo("Thành công", f"Đã xuất báo cáo tại:\n{file_path}")
     def reload_table_from_text(self, checked_indexes=None):
+        if getattr(self, "is_running", False):
+            return
         for item in self.tree.get_children():
             self.tree.delete(item)
 
@@ -3385,6 +3804,10 @@ class MainToolApp:
         ]
         proxy_lines = [p.strip() for p in self.txt_proxies.get("1.0", "end").splitlines() if p.strip() and not p.startswith("#")]
         ratio = int(self.ent_proxy_ratio.get()) if self.ent_proxy_ratio.get().isdigit() else 20
+        proxy_signature = (self.proxy_mode.get(), tuple(proxy_lines), ratio)
+        if getattr(self, "_preview_proxy_signature", None) != proxy_signature:
+            self._preview_proxy_assignments = {}
+            self._preview_proxy_signature = proxy_signature
         account_records = []
 
         for idx, line in enumerate(raw_acc_lines, 1):
@@ -3403,9 +3826,12 @@ class MainToolApp:
             account_records.append(account_record)
 
             assigned_proxy = parsed["proxy"] or "Không dùng"
-            if assigned_proxy == "Không dùng" and proxy_lines:
+            if assigned_proxy == "Không dùng" and proxy_lines and self.proxy_mode.get() not in {"account", "rotating_api"}:
                 if self.proxy_mode.get() == "random":
-                    assigned_proxy = random.choice(proxy_lines)
+                    key = (idx, line)
+                    if key not in self._preview_proxy_assignments:
+                        self._preview_proxy_assignments[key] = random.choice(proxy_lines)
+                    assigned_proxy = self._preview_proxy_assignments[key]
                 elif self.proxy_mode.get() == "round_robin":
                     assigned_proxy = proxy_lines[(idx - 1) % len(proxy_lines)]
                 else:
@@ -3687,6 +4113,7 @@ class MainToolApp:
             self.log(f"[-] [{acc_name}] Lỗi xóa session cũ: {e}")
         return 0
     async def run_add_page_admin(self, page, acc_name, idx, page_url, target_uid_or_name):
+        await self.guard_facebook_checkpoint(page, idx)
         """Tự động cấp quyền Quản trị viên / Biên tập viên cho Fanpage Profile"""
         def finish(status, reason):
             result = build_page_access_result(
@@ -3709,6 +4136,7 @@ class MainToolApp:
         try:
             settings_url = page_url.rstrip('/') + "/settings/?tab=profile_access"
             await page.goto(settings_url, wait_until="domcontentloaded", timeout=40000)
+            await self.guard_facebook_checkpoint(page, idx)
             await asyncio.sleep(4)
             if not page_reference_matches(page_url, page.url):
                 return finish(
@@ -3767,6 +4195,7 @@ class MainToolApp:
                             ).first
                         if await give_access.count() > 0:
                             await give_access.click()
+                            await self.guard_facebook_checkpoint(page, idx)
                             await asyncio.sleep(3)
                             password_prompt = page.locator('input[type="password"]:visible')
                             if await password_prompt.count() > 0:
@@ -3809,6 +4238,7 @@ class MainToolApp:
                                 except Exception:
                                     result_text = ""
                             assignment_status = classify_page_access_feedback(result_text)
+                            await self.guard_facebook_checkpoint(page, idx)
                             confirmed = bool(
                                 page_still_matches
                                 and target_still_verified
@@ -4784,7 +5214,8 @@ class MainToolApp:
                     try:
                         btns = page.locator(ADD_FRIEND_SELECTORS)
                         btn_count = await btns.count()
-                    except Exception:
+                    except Exception as exc:
+                        self.record_task_result(idx, "FRIEND_REQUEST", "ERROR", str(exc))
                         btn_count = 0
 
                     # =====================================
@@ -4795,7 +5226,9 @@ class MainToolApp:
                             btn = btns.first
                             await btn.scroll_into_view_if_needed()
                             await asyncio.sleep(random.uniform(0.5, 1.5))
-                            confirmed, detail = await self.click_and_confirm_friend_request(page, btn)
+                            outcome = await self.click_and_confirm_friend_request(page, btn)
+                            self.record_friend_outcome(idx, outcome)
+                            confirmed, detail = outcome
                             if confirmed:
                                 sent += 1
                                 no_new_data_count = 0
@@ -4815,6 +5248,7 @@ class MainToolApp:
                                     break
 
                         except Exception as click_err:
+                            self.record_task_result(idx, "FRIEND_REQUEST", "ERROR", str(click_err))
                             self.log(f"[!] [{acc_name}] Nút bị che hoặc lỗi: {click_err}")
                             # Cuộn nhẹ để nút lỗi trôi qua
                             await page.evaluate("window.scrollBy(0, 350)")
@@ -4835,73 +5269,80 @@ class MainToolApp:
 
             except Exception as e:
                 self.log(f"[-] [{acc_name}] Lỗi khi tìm '{keyword}': {e}")
+                self.record_task_result(idx, "FRIEND_REQUEST", "ERROR", str(e))
 
-        self.log(f"[✓] [{acc_name}] Hoàn thành. Tổng lời mời đã gửi: {sent}")
+        self.log(f"[FRIEND][SUMMARY] [{acc_name}] Lời mời đã xác minh: {sent}")
         return sent
 
-    async def click_and_confirm_friend_request(self, page, button):
-        """Click once and count only a request confirmed by Facebook's UI."""
-        blocked_phrases = (
-            "không thể gửi lời mời", "can't send friend request",
-            "bạn đã gửi quá nhiều", "you've sent too many",
-            "tạm thời bị chặn", "temporarily blocked",
-        )
-        before_count = await page.locator(FRIEND_REQUEST_SENT_SELECTORS).count()
-        before_state = []
-        for attribute in ("aria-label", "aria-pressed", "aria-disabled", "data-testid"):
-            try:
-                before_state.append(await button.get_attribute(attribute) or "")
-            except Exception:
-                before_state.append("")
+    async def click_and_confirm_friend_request(self, page, button, target=None):
+        """Bind evidence to the recipient's action group, never the whole page."""
+        await self.guard_facebook_checkpoint(page)
+        expected = friend_profile_reference(target) if target else ""
+        handle = None
         try:
-            before_state.append(await button.inner_text(timeout=500) or "")
-        except Exception:
-            before_state.append("")
-        before_state = tuple(before_state)
-        await button.click(timeout=5000)
-
-        stable_changed_polls = 0
-        for _ in range(8):
-            await asyncio.sleep(0.5)
-            has_feedback_overlay = False
-            alerts = page.locator('[role="alert"], [role="dialog"]')
-            if await alerts.count() > 0:
-                has_feedback_overlay = True
+            handle = await button.evaluate_handle(r"""button => {
+                let root = button.closest('[role="row"], [role="listitem"]');
+                if (root) return root;
+                root = button.parentElement;
+                for (let i = 0; root && i < 5; i++, root = root.parentElement) {
+                    if (root.querySelector('a[href]')) return root;
+                }
+                return button.parentElement;
+            }""")
+            scope = handle.as_element()
+            if scope is None:
+                return FriendRequestOutcome("FAILED", expected, "Không xác định được vùng thao tác của người nhận.")
+            before = await scope.evaluate(FRIEND_SCOPE_SNAPSHOT)
+            references = {ref for link in before["links"] if (ref := friend_profile_reference(link))}
+            current_profile = friend_profile_reference(page.url)
+            if expected:
+                if current_profile != expected or (references and references != {expected}):
+                    return FriendRequestOutcome("FAILED", expected, "Profile/UID không khớp người nhận.")
+            elif len(references) == 1:
+                expected = next(iter(references))
+            else:
+                return FriendRequestOutcome("FAILED", "", "Không xác minh được UID/profile người nhận.")
+            status = classify_friend_controls(before["controls"])
+            if status in {"ALREADY_PENDING", "ALREADY_FRIEND"}:
+                return FriendRequestOutcome(status, expected, "Đã có trạng thái trước khi gửi; bỏ qua.")
+            context = getattr(self, "account_log_context", None)
+            index = context.get() if context is not None else None
+            if index is not None:
+                state = self.account_states.get(index)
+                attempts = state.get("friend_attempts", set()) if state else set()
+                if expected in attempts:
+                    return FriendRequestOutcome("FAILED", expected, "Đã thao tác người nhận này trong đợt; không gửi lại khi chưa xác minh.")
+                self.account_states.mark_friend_attempt(index, expected)
+            await button.click(timeout=5000)
+            for _ in range(8):
+                await self.guard_facebook_checkpoint(page)
+                after = await scope.evaluate(FRIEND_SCOPE_SNAPSHOT)
+                after_references = {ref for link in after["links"] if (ref := friend_profile_reference(link))}
+                if (target and friend_profile_reference(page.url) != expected) or (after_references and after_references != {expected}):
+                    return FriendRequestOutcome("FAILED", expected, "Người nhận thay đổi sau khi click.")
+                if after["connected"] and (not before["row"] or after_references == {expected}):
+                    if classify_friend_controls(after["controls"]) == "ALREADY_PENDING":
+                        return FriendRequestOutcome("SENT", expected, "Đã xác minh pending của đúng người nhận.")
+                await asyncio.sleep(0.5)
+            return FriendRequestOutcome("FAILED", expected, "Không có bằng chứng pending của đúng người nhận.")
+        except Exception as exc:
+            return FriendRequestOutcome("ERROR", expected, f"{type(exc).__name__}: {exc}")
+        finally:
+            if handle is not None:
                 try:
-                    alert_text = (await alerts.last.inner_text(timeout=500)).casefold()
-                    if any(phrase in alert_text for phrase in blocked_phrases):
-                        return False, alert_text[:160]
-                except Exception:
-                    pass
+                    await handle.dispose()
+                except Exception as exc:
+                    self.log(f"[FRIEND][CLEANUP] {type(exc).__name__}: {exc}")
 
-            try:
-                if await button.count() == 0 or not await button.is_visible():
-                    if not has_feedback_overlay:
-                        return True, "Facebook đã thay thế nút gửi lời mời"
-                    continue
-
-                current_state = []
-                for attribute in ("aria-label", "aria-pressed", "aria-disabled", "data-testid"):
-                    current_state.append(await button.get_attribute(attribute) or "")
-                current_state.append(await button.inner_text(timeout=500) or "")
-                current_state = tuple(current_state)
-                if current_state != before_state and any(current_state):
-                    stable_changed_polls += 1
-                    if stable_changed_polls >= 2 and not has_feedback_overlay:
-                        return True, "Facebook đã đổi trạng thái nút"
-                else:
-                    stable_changed_polls = 0
-            except Exception:
-                pass
-
-            after_count = await page.locator(FRIEND_REQUEST_SENT_SELECTORS).count()
-            if after_count > before_count:
-                return True, "Facebook đã hiển thị trạng thái đã gửi"
-
-        return False, "không thấy trạng thái xác nhận sau khi bấm"
+    def record_friend_outcome(self, index, outcome):
+        status = {"SENT": "SUCCESS", "ALREADY_PENDING": "SKIPPED", "ALREADY_FRIEND": "SKIPPED", "FAILED": "FAILED", "ERROR": "ERROR"}[outcome.status]
+        self.record_task_result(index, "FRIEND_REQUEST", status, outcome[1], {
+            "target": outcome.target, "result": outcome.status, "detail": outcome[1],
+        })
 
     async def verify_facebook_session(self, page, context):
         """Distinguish a real logged-in session from login/checkpoint shells."""
+        await self.guard_facebook_checkpoint(page)
         current_url = page.url.lower()
         if any(marker in current_url for marker in (
             "/login", "checkpoint", "challenge", "disabled", "suspended"
@@ -4935,6 +5376,40 @@ class MainToolApp:
                 if value:
                     candidates.insert(0, value)
         return extract_facebook_page_identity(candidates)
+
+    async def verify_created_page(self, page, index, job):
+        await self.guard_facebook_checkpoint(page, index)
+        state = self.account_states.get(index) or {}
+        evidence = await page.evaluate(PAGE_CREATION_EVIDENCE)
+        return verify_page_job_evidence(page.url, evidence, job, state.get("account_id", ""))
+
+    async def select_page_category(self, page, category_input, requested_category):
+        options = page.locator('div[role="listbox"] [role="option"], ul[role="listbox"] li, [role="option"]')
+        try:
+            await options.first.wait_for(state="visible", timeout=5000)
+        except (TimeoutError, PlaywrightTimeoutError):
+            return False, "CATEGORY_SUGGESTIONS_NOT_AVAILABLE"
+        for index in range(await options.count()):
+            option = options.nth(index)
+            if await option.is_visible() and normalize_ui_text(await option.inner_text()) == normalize_ui_text(requested_category):
+                await option.click()
+                selected = await category_input.evaluate(r"""async (input, requested) => {
+                    const normalize = text => (text || '').normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+                    const deadline = Date.now() + 3000;
+                    while (Date.now() < deadline && input.isConnected) {
+                        const root = input.parentElement.parentElement;
+                        const selected = Array.from(root.querySelectorAll('[aria-selected="true"], [data-selected-category], span'))
+                        .some(el => !el.closest('[role="listbox"]') && el.getClientRects().length > 0
+                            && normalize(el.textContent) === normalize(requested)
+                            && (el.matches('[aria-selected="true"],[data-selected-category]')
+                                || el.parentElement.querySelector('button,[role="button"]')));
+                        if (selected) return true;
+                        await new Promise(resolve => setTimeout(resolve, 100));
+                    }
+                    return false;
+                }""", requested_category)
+                return bool(selected), "" if selected else "CATEGORY_SELECTION_NOT_VERIFIED"
+        return False, "CATEGORY_NOT_FOUND"
 
     async def ensure_personal_profile(self, context, page, acc_name):
         """Clear Facebook's Page-profile selector cookie before another Page job."""
@@ -5002,10 +5477,14 @@ class MainToolApp:
         Tạo Fanpage: Tích hợp check Checkpoint, đa tầng Selector, xử lý Stale Element (DOM refresh), 
         kiểm tra iframe, focus trước khi gõ và chụp ảnh debug.
         """
+        await self.guard_facebook_checkpoint(page, idx)
         created_count = 0
         results = []
+        current_page_job = None
 
         def record_result(result):
+            result["owner_account_id"] = (self.account_states.get(idx) or {}).get("account_id", acc_name)
+            result["page_job_id"] = current_page_job["page_job_id"] if current_page_job else ""
             results.append(result)
             result_status = str(result.get("status") or "ERROR").upper()
             detail = (
@@ -5019,6 +5498,7 @@ class MainToolApp:
                 idx,
                 current_action=f"Create Page [{result_status}]: {str(detail)[:140]}",
             )
+            self.record_task_result(idx, "CREATE_PAGE", result_status, str(detail), result)
             try:
                 save_create_page_outcome(result)
                 append_create_page_account_log(
@@ -5064,6 +5544,14 @@ class MainToolApp:
                 locale=self.account_states.get(idx).get("locale", "AUTO")
                 if self.account_states.get(idx) else "AUTO",
             )
+            owner_state = self.account_states.get(idx) or {}
+            current_page_job = {
+                "owner_account_id": owner_state.get("account_id", acc_name),
+                "owner_uid": owner_state.get("uid") or owner_state.get("account_id"),
+                "page_job_id": uuid.uuid4().hex, "page_name": page_name,
+                "prior_page_ids": {result["page_id"] for result in results if result.get("page_id")},
+                "submitted": False,
+            }
 
             def set_page_flow_state(state, detail=""):
                 transition_page_context(page_context, state)
@@ -5082,6 +5570,7 @@ class MainToolApp:
                 # ======================================================
                 try:
                     set_page_flow_state("SESSION_CHECK")
+                    await self.guard_facebook_checkpoint(page, idx)
                     if is_invalid_facebook_account_url(page.url):
                         reason = f"Session không hợp lệ trước Create Page: {page.url}"
                         set_page_flow_state("FAILED", reason)
@@ -5089,11 +5578,13 @@ class MainToolApp:
                         return results
                     set_page_flow_state("OPEN_CREATE_PAGE", page_name)
                     async def navigate_to_creation():
-                        return await page.goto(
+                        response = await page.goto(
                             "https://www.facebook.com/pages/creation/",
                             wait_until="domcontentloaded",
                             timeout=45000,
                         )
+                        await self.guard_facebook_checkpoint(page, idx)
+                        return response
 
                     _response, retry_count = await retry_create_page_operation(
                         navigate_to_creation, max_attempts=3, base_delay=1.0
@@ -5290,18 +5781,20 @@ class MainToolApp:
                     # Chờ 2.5s để Facebook gửi request tải danh sách gợi ý (Listbox)
                     await asyncio.sleep(2.5)
 
-                    cat_option = page.locator('div[role="listbox"] div[role="option"], ul[role="listbox"] li, div[role="option"]').first
-                    try:
-                        await cat_option.wait_for(state="visible", timeout=5000)
-                        await cat_option.click()
-                    except Exception:
-                        # Phương án dự phòng bằng bàn phím
-                        await page.keyboard.press("ArrowDown")
-                        await asyncio.sleep(0.5)
-                        await page.keyboard.press("Enter")
-                    await asyncio.sleep(1.5)
+                    category_selected, category_reason = await self.select_page_category(page, cat_input, category_name)
+                    if not category_selected:
+                        record_result(build_create_page_result(
+                            "FAILED", acc_name, page_name, category_name,
+                            reason=category_reason, account_index=idx, proxy=resolved_proxy,
+                        ))
+                        continue
                 else:
                     self.log(f"[!] [{acc_name}] Không tìm thấy ô nhập Hạng mục.")
+                    record_result(build_create_page_result(
+                        "FAILED", acc_name, page_name, category_name,
+                        reason="CATEGORY_INPUT_NOT_FOUND", account_index=idx, proxy=resolved_proxy,
+                    ))
+                    continue
                     record_result(build_create_page_result(
                         "ERROR", acc_name, page_name, category_name,
                         technical_error="Không tìm thấy combobox category.",
@@ -5353,8 +5846,13 @@ class MainToolApp:
                         set_page_flow_state("CANCELLED", "Dừng trước khi Submit")
                         return results
                     set_page_flow_state("SUBMITTING", page_name)
+                    before_identity = await self.get_current_page_identity(page)
+                    if before_identity.get("id"):
+                        current_page_job["prior_page_ids"].add(before_identity["id"])
                     await create_btn.scroll_into_view_if_needed()
                     await create_btn.click()
+                    current_page_job["submitted"] = True
+                    await self.guard_facebook_checkpoint(page, idx)
                 except Exception as e:
                     self.log(f"[!] [{acc_name}] Lỗi click nút Tạo Trang. Chụp ảnh debug...")
                     if hasattr(self, 'take_error_snapshot'):
@@ -5370,11 +5868,13 @@ class MainToolApp:
 
                 verified_page_identity = {"url": "", "id": ""}
                 invalid_session_reason = ""
+                policy_rejected = False
                 for _ in range(10):
                     if not self.is_running or getattr(self, "stop_requested", False):
                         set_page_flow_state("CANCELLED", "Dừng trong khi xác minh")
                         return results
                     await asyncio.sleep(2)
+                    await self.guard_facebook_checkpoint(page, idx)
                     cur_url = page.url.lower()
                     if is_invalid_facebook_account_url(cur_url):
                         invalid_session_reason = (
@@ -5383,12 +5883,16 @@ class MainToolApp:
                         self.log(f"[!] [{acc_name}] Bị Checkpoint ngay sau khi ấn Tạo!")
                         break
 
-                    candidate_identity = await self.get_current_page_identity(page)
+                    body_text = (await page.inner_text("body")).lower()
+                    await self.guard_facebook_checkpoint(page, idx)
+                    if is_page_policy_rejected(body_text):
+                        policy_rejected = True
+                        break
+                    candidate_identity = await self.verify_created_page(page, idx, current_page_job)
                     if is_verified_page_identity(candidate_identity):
                         verified_page_identity = candidate_identity
                         break
 
-                    body_text = (await page.inner_text("body")).lower()
                     
                     if any(err in body_text for err in ["quá nhiều trang", "too many pages", "xảy ra lỗi", "went wrong"]):
                         self.log(f"[-] [{acc_name}] Bị chặn tạo: Đã tạo quá nhiều Trang / Lỗi server.")
@@ -5396,6 +5900,15 @@ class MainToolApp:
                             await self.take_error_snapshot(page, acc_name, "rate_limit_page")
                         break
                     
+                if policy_rejected:
+                    record_result(build_create_page_result(
+                        "FAILED", acc_name, page_name, category_name,
+                        reason="PAGE_POLICY_REJECTED",
+                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    ))
+                    self.log("[PAGE][FAILED] Facebook từ chối tạo Page theo Page policies.")
+                    continue
+
                 if invalid_session_reason:
                     record_result(build_create_page_result(
                         "FAILED", acc_name, page_name, category_name,
@@ -5450,9 +5963,7 @@ class MainToolApp:
                 await page.keyboard.press("Escape")
                 await asyncio.sleep(1)
 
-                page_identity = await self.get_current_page_identity(page)
-                if not is_verified_page_identity(page_identity):
-                    page_identity = verified_page_identity
+                page_identity = await self.verify_created_page(page, idx, current_page_job)
                 if not is_verified_page_identity(page_identity):
                     self.log(
                         f"[-] [{acc_name}] Không xác minh được Page URL/ID sau khi tạo; "
@@ -5475,6 +5986,9 @@ class MainToolApp:
                     retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
                     flow_state=page_context["creation_status"],
                 )
+                page_record.update(owner_account_id=page_identity["owner_account_id"],
+                                   page_job_id=page_identity["page_job_id"])
+                await self.guard_facebook_checkpoint(page, idx)
                 if not save_created_page_success(page_record):
                     record_result(build_create_page_result(
                         "FAILED", acc_name, page_name, category_name,
@@ -5546,7 +6060,9 @@ class MainToolApp:
                 if not self.is_running: break
                 add_btn = page.locator(ADD_FRIEND_SELECTORS).first
                 if await add_btn.count() > 0 and await add_btn.is_visible():
-                    confirmed, detail = await self.click_and_confirm_friend_request(page, add_btn)
+                    outcome = await self.click_and_confirm_friend_request(page, add_btn)
+                    self.record_friend_outcome(idx, outcome)
+                    confirmed, detail = outcome
                     if confirmed:
                         sent += 1
                         self.log(f"[✔] [{acc_name}] Đã xác nhận kết bạn nhóm {sent}/{target_total}")
@@ -5560,6 +6076,7 @@ class MainToolApp:
                     await asyncio.sleep(2)
         except Exception as e:
             self.log(f"[-] [{acc_name}] Lỗi kết bạn nhóm: {e}")
+            self.record_task_result(idx, "FRIEND_REQUEST", "ERROR", str(e))
         return sent
 
     async def run_add_by_uid(self, page, acc_name, idx, targets, target_total, min_del, max_del):
@@ -5575,9 +6092,11 @@ class MainToolApp:
                 self.log(f"[*] [{acc_name}] Mở profile: {profile_url}...")
                 await page.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
                 await asyncio.sleep(3)
-                btn = page.locator(ADD_FRIEND_SELECTORS).first
+                btn = page.locator(ADD_FRIEND_SELECTORS + ", " + CANCEL_REQUEST_SELECTORS + ", " + FRIEND_STATE_SELECTORS).first
                 if await btn.count() > 0 and await btn.is_visible():
-                    confirmed, detail = await self.click_and_confirm_friend_request(page, btn)
+                    outcome = await self.click_and_confirm_friend_request(page, btn, target=target)
+                    self.record_friend_outcome(idx, outcome)
+                    confirmed, detail = outcome
                     append_csv_result(
                         "friend_actions.csv",
                         ["time", "account", "target", "method", "status", "detail"],
@@ -5586,7 +6105,7 @@ class MainToolApp:
                             "account": acc_name,
                             "target": target,
                             "method": "uid",
-                            "status": "sent" if confirmed else "not_confirmed",
+                            "status": outcome.status,
                             "detail": detail,
                         },
                     )
@@ -5596,8 +6115,11 @@ class MainToolApp:
                         await asyncio.sleep(random.randint(min_del, max_del))
                     else:
                         self.log(f"[!] [{acc_name}] Không tính {target}: {detail}")
+                else:
+                    self.record_task_result(idx, "FRIEND_REQUEST", "FAILED", f"Không xác định được trạng thái kết bạn của {target}.")
         except Exception as e:
             self.log(f"[-] [{acc_name}] Lỗi kết bạn UID: {e}")
+            self.record_task_result(idx, "FRIEND_REQUEST", "ERROR", str(e))
         return sent
 
     async def run_join_groups(self, page, acc_name, idx, targets, target_total, min_del, max_del):
@@ -5849,14 +6371,21 @@ class MainToolApp:
 
             self.set_account_state(idx, status="CHECKING", current_action="Khởi tạo tài khoản")
             self.update_tree_row(str(idx), status="ĐANG KIỂM TRA")
-            self.log(f"\n[🚀 LUỒNG BẮT ĐẦU] Nick {idx}: {acc_name} (Proxy: {assigned_proxy_str or 'None'})")
+            self.log(f"\n[🚀 LUỒNG BẮT ĐẦU] Nick {idx}: {acc_name}")
             self.log(
                 f"[*] [{acc_name}] Context: locale={normalize_account_locale(account_locale)}; "
                 f"country={account_country or 'N/A'}; timezone={account_timezone or 'AUTO'}"
             )
 
             cookies = parse_cookies(cookie_str)
+            try:
+                assigned_proxy_str = await self.resolve_effective_proxy(idx, assigned_proxy_str)
+            except Exception as exc:
+                self.set_account_failure(idx, "proxy", f"Lỗi proxy: {exc}")
+                self.update_tree_row(str(idx), status="ERROR")
+                return
             proxy_cfg = parse_proxy(assigned_proxy_str)
+            self.log(f"[*] [{acc_name}] Proxy thực tế: {safe_proxy_label(assigned_proxy_str) or 'Không dùng'}")
             is_headless = config.get("headless", False)
 
             if assigned_proxy_str and not proxy_cfg:
@@ -5875,29 +6404,11 @@ class MainToolApp:
                 mode: self.get_targets_for_mode(targets, mode, modes)
                 for mode in modes
             }
-            # Tự động gọi SuiProxy lấy IP mới riêng cho từng nick
-            if config.get("proxy_mode") == "rotating_api" and config.get("proxy_api"):
-                self.log(f"[*] [{acc_name}] Đang gọi SuiProxy lấy IP mới...")
-                async with self.proxy_api_lock:
-                    fresh_proxy = await asyncio.to_thread(fetch_proxy_from_api, config["proxy_api"])
-                if fresh_proxy:
-                    assigned_proxy_str = fresh_proxy
-                    proxy_cfg = parse_proxy(assigned_proxy_str)
-                    if not proxy_cfg:
-                        reason = f"[{acc_name}] API trả về proxy sai định dạng."
-                        self.set_account_failure(idx, "proxy", reason)
-                        self.update_tree_row(str(idx), status="ERROR")
-                        return
-                    self.log(f"[✔] [{acc_name}] Đã cấp IP SuiProxy mới: {assigned_proxy_str}")
-                    await asyncio.sleep(2)
-                else:
-                    reason = f"[{acc_name}] API proxy không trả về IP; dừng để tránh dùng IP thật."
-                    self.set_account_failure(idx, "proxy", reason)
-                    self.update_tree_row(str(idx), status="ERROR")
-                    return
             
             browser = None
             context = None
+            page = None
+            checkpoint_watcher = None
             try:
                 self.set_account_state(idx, status="CHECKING", current_action="Mở trình duyệt và kiểm tra đăng nhập")
                 # Gọi Helper khởi tạo trình duyệt siêu cấp (GPM Layout, Anti-Detect)
@@ -5909,6 +6420,10 @@ class MainToolApp:
                     account_locale=account_locale,
                     account_timezone=account_timezone,
                 )
+                checkpoint_watcher = asyncio.create_task(
+                    self.watch_facebook_checkpoint(page, idx, asyncio.current_task())
+                )
+                await self.guard_facebook_checkpoint(page, idx)
 
                 # --- BẮT ĐẦU LOGIC ĐĂNG NHẬP CHUẨN XÁC ---
                 is_valid_session = False
@@ -5919,6 +6434,7 @@ class MainToolApp:
                     
                     self.log(f"[*] [{acc_name}] Đang mở trang chủ để kích hoạt Cookie...")
                     await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=40000)
+                    await self.guard_facebook_checkpoint(page, idx)
                     await asyncio.sleep(4)
                     
                     is_valid_session, session_detail = await self.verify_facebook_session(page, context)
@@ -5934,6 +6450,7 @@ class MainToolApp:
                     login_result, login_detail = await self.login_facebook_user_pass(
                         page, context, login_user, login_password
                     )
+                    await self.guard_facebook_checkpoint(page, idx)
                     if login_result == LOGIN_TECHNICAL_ERROR:
                         reason = f"[{acc_name}] Lỗi kỹ thuật khi đăng nhập: {login_detail}"
                         self.set_account_failure(idx, "automation", reason)
@@ -5954,6 +6471,7 @@ class MainToolApp:
                     return  
                 # --- KẾT THÚC LOGIC ĐĂNG NHẬP ---
 
+                await self.guard_facebook_checkpoint(page, idx)
                 self.set_account_state(idx, status="LIVE", current_action="Đăng nhập Facebook hợp lệ")
                 self.update_tree_row(str(idx), status="LIVE")
 
@@ -5972,6 +6490,9 @@ class MainToolApp:
                 total_sent = 0
                 created_pages = []
                 create_page_completion_action = ""
+                friend_enabled = any(modes.get(mode) for mode in ("by_name", "by_group", "by_uid"))
+                if friend_enabled:
+                    self.record_task_result(idx, "FRIEND_REQUEST", "RUNNING", "Đang kết bạn")
                 # 1. Kết bạn theo tên
                 if modes.get("by_name", False):
                     total_sent += (await self.run_add_by_name(page, acc_name, idx, targets_by_mode["by_name"], target_total, min_del, max_del)) or 0
@@ -5983,6 +6504,11 @@ class MainToolApp:
                 # 3. Theo UID / Profile
                 if modes.get("by_uid", False):
                     total_sent += (await self.run_add_by_uid(page, acc_name, idx, targets_by_mode["by_uid"], target_total, min_del, max_del)) or 0
+
+                if friend_enabled:
+                    friend_task = self.account_states.get(idx)["tasks"].get("FRIEND_REQUEST", {})
+                    if friend_task.get("status") == "RUNNING":
+                        self.record_task_result(idx, "FRIEND_REQUEST", "FAILED", "Không có lời mời nào được xác minh")
 
                 # 4. Tham gia nhóm (Join)
                 if modes.get("join_group", False):
@@ -6018,6 +6544,7 @@ class MainToolApp:
                 
                 # 12. Tạo Fanpage
                 if modes.get("create_page", False):
+                    self.record_task_result(idx, "CREATE_PAGE", "RUNNING", "Đang tạo Page")
                     page_target_num = config.get("page_target", 5)
                     p_min_del = config.get("min_page_delay", 60)
                     p_max_del = config.get("max_page_delay", 120)
@@ -6033,6 +6560,9 @@ class MainToolApp:
                         result for result in create_page_results
                         if result.get("status") == "SUCCESS"
                     ]
+                    page_task = self.account_states.get(idx)["tasks"].get("CREATE_PAGE", {})
+                    if page_task.get("status") == "RUNNING":
+                        self.record_task_result(idx, "CREATE_PAGE", "FAILED", "Không có Page nào được xác minh")
                     page_metrics = {
                         status: sum(
                             1 for result in create_page_results
@@ -6180,16 +6710,24 @@ class MainToolApp:
                 if modes.get("scrape_contacts", False):
                     await self.run_scrape_contact_info(page, acc_name, idx, targets_by_mode["scrape_contacts"])
 
+                await self.guard_facebook_checkpoint(page, idx)
+                task_state = self.account_states.get(idx)
+                task_failures = [f"{module} {task['status']}: {task['detail']}"
+                                 for module, task in task_state.get("tasks", {}).items()
+                                 if task["status"] in {"FAILED", "ERROR"}]
                 self.set_account_state(
-                    idx,
-                    status="LIVE",
-                    current_action=create_page_completion_action or "Hoàn thành",
+                    idx, status="LIVE",
+                    current_action="; ".join(task_failures) or create_page_completion_action or "Hoàn thành",
                 )
                 self.update_tree_row(str(idx), sent_today=total_sent, status="LIVE")
-                self.log(f"[✔ XONG] Nick {acc_name} đã hoàn thành ({total_sent} kết quả đã xác nhận).")
+                self.log(f"[ACCOUNT][SUMMARY] {acc_name}: LIVE; TASK={task_state['last_task_result']}; {total_sent} kết quả đã xác nhận.")
 
+            except FacebookCheckpointStopped:
+                return
             except asyncio.CancelledError:
                 current_state = self.account_states.get(idx)
+                if current_state and current_state["status"] in {"CHECKPOINT", "ERROR"}:
+                    return
                 if current_state and current_state["status"] == "CHECKING":
                     self.set_account_state(idx, status="ERROR", current_action="Đã dừng khi đang kiểm tra")
                     self.update_tree_row(str(idx), status="ERROR")
@@ -6209,7 +6747,12 @@ class MainToolApp:
             
             finally:
                 # --- SIÊU NĂNG LỰC: DÙ LỖI HAY KHÔNG CŨNG BẮT BUỘC ĐÓNG TRÌNH DUYỆT ĐỂ CHỐNG TREO RAM ---
-                await close_browser_resources(context, browser)
+                if checkpoint_watcher is not None:
+                    checkpoint_watcher.cancel()
+                    await asyncio.gather(checkpoint_watcher, return_exceptions=True)
+                cleanup_errors = await close_browser_resources(context, browser, page)
+                if cleanup_errors:
+                    self.log(f"[ERROR] [{acc_name}] Lỗi đóng browser/profile: {cleanup_errors[0]}")
     def parse_range_string(self, range_str: str) -> set:
         """Tự động phân tách chuỗi số phức hợp dạng '1, 3, 5-9' thành danh sách STT"""
         selected = set()
@@ -6320,7 +6863,7 @@ class MainToolApp:
             ) or None
             if (
                 not assigned_proxy_str
-                and config.get("proxy_mode") != "rotating_api"
+                and config.get("proxy_mode") not in {"account", "rotating_api"}
                 and proxy_lines
             ):
                 # Compatibility for non-UI callers without a captured proxy map.
@@ -6391,10 +6934,11 @@ class MainToolApp:
                 self.worker_tasks = []
 
                 batch_summary = self.account_states.summary(batch_indexes)
+                batch_tasks = self.account_states.task_summary(batch_indexes)
                 self.log(
                     f"[KẾT THÚC ĐỢT] Đợt {batch_number}/{len(batches)} • "
                     f"LIVE: {batch_summary['LIVE']} • DIE: {batch_summary['DIE']} • "
-                    f"ERROR: {batch_summary['ERROR']}"
+                    f"ERROR: {batch_summary['ERROR']} • CHECKPOINT: {batch_summary['CHECKPOINT']} • TASK: {batch_tasks}"
                 )
 
         if self.stop_requested:
@@ -6404,7 +6948,8 @@ class MainToolApp:
         final_summary = self.account_states.summary([job["idx"] for job in account_jobs])
         self.log(
             f"[KẾT THÚC ĐỢT CHẠY] LIVE: {final_summary['LIVE']} • "
-            f"DIE: {final_summary['DIE']} • ERROR: {final_summary['ERROR']}"
+            f"DIE: {final_summary['DIE']} • ERROR: {final_summary['ERROR']} • CHECKPOINT: {final_summary['CHECKPOINT']} • "
+            f"TASK: {self.account_states.task_summary([job['idx'] for job in account_jobs])}"
         )
         if modes.get("create_page", False):
             self.post_ui(self.remove_processed_create_page_accounts_from_input)
