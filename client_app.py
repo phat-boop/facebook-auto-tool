@@ -44,7 +44,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.2.8"
+CURRENT_VERSION = "2.2.9"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -1874,157 +1874,174 @@ def send_telegram_alert(bot_token: str, chat_id: str, message: str):
         pass
 
 def parse_any_account_line(raw_line: str, idx: int = 1):
-    """Parse strictly according to official contract: UID|PASSWORD|2FA|COOKIE|TOKEN"""
+    """Parse account lines flexibly, auto-detecting UID, Password, Cookie, Token, and trimming extra trailing metadata."""
     raw_value = str(raw_line or "").rstrip("\r\n")
-    if not raw_value:
+    normalized_line = re.sub(r"^\s*\d+[\.\-\s]+", "", raw_value).strip()
+    if not normalized_line or normalized_line.startswith("#"):
         return None
 
-    # Tách chuỗi theo dấu pipe nhưng bảo toàn số lượng trường
-    fields = raw_value.split("|")
-    
-    uid = fields[0].strip() if len(fields) > 0 else ""
-    password = fields[1].strip() if len(fields) > 1 else ""
-    fa2 = fields[2].strip() if len(fields) > 2 else ""
-    cookie_raw = fields[3].strip() if len(fields) > 3 else ""
-    token = fields[4].strip() if len(fields) > 4 else ""
-
-    # Kiểm tra các trường bắt buộc theo Contract: UID, PASSWORD và COOKIE không được trống
-    if not uid or not password or not cookie_raw:
+    fields = [field.strip() for field in normalized_line.split("|") if field.strip()]
+    if not fields:
         return None
 
-    # Xác thực cookie phải chứa các khóa chuẩn (c_user, xs,...)
-    cookie_normalized = normalize_cookie_input(cookie_raw)
-    if not cookie_normalized:
+    uid = ""
+    password = ""
+    two_factor = ""
+    cookie = ""
+    token = ""
+    email = ""
+    proxy = ""
+
+    # Tự động quét và phân loại từng trường dữ liệu dựa vào đặc thù nhận diện
+    for field in fields:
+        norm_cookie = normalize_cookie_input(field)
+        if norm_cookie and not cookie:
+            cookie = field
+            continue
+        if not token and (field.startswith(("EAAB", "EAAA")) or len(field) > 50 and "." in field and not "@" in field):
+            token = field
+            continue
+        if not email and "@" in field and "." in field:
+            email = field
+            continue
+        if not proxy and parse_proxy(field):
+            proxy = field
+            continue
+        if not two_factor and (len(field) in (16, 32) and field.isalnum() and not field.isdigit()):
+            two_factor = field
+            continue
+        if not uid and (field.isdigit() and len(field) >= 5):
+            uid = field
+            continue
+        if not password and not uid:
+            uid = field
+            continue
+        if uid and not password and field != cookie and field != token:
+            password = field
+
+    # Fallback trích xuất UID từ chuỗi Cookie nếu chưa tìm thấy UID ở các cột đầu
+    cookie_val = normalize_cookie_input(cookie)
+    if cookie_val:
+        cookie_uid_match = re.search(r'(?:^|;)\s*c_user\s*=\s*(\d+)', cookie_val)
+        if cookie_uid_match and not uid:
+            uid = cookie_uid_match.group(1)
+
+    # Nếu vẫn không có UID, gán nhãn mặc định theo STT
+    if not uid:
+        uid = f"UID_{idx}"
+
+    if not cookie:
         return None
 
+    account_type = "COOKIE"
     return {
-        "type": "COOKIE",
+        "type": account_type,
         "raw_line": raw_value,
-        "source_line": raw_value,
+        "source_line": normalized_line,
         "fields": fields,
-        "unknown_fields": [
-            {"index": i, "value": fields[i]} 
-            for i in range(5, len(fields)) if fields[i].strip()
-        ],
+        "unknown_fields": [],
         "uid": uid,
         "name": uid,
         "pwd": password,
         "password": password,
-        "2fa": fa2,
-        "cookie": cookie_raw,
+        "2fa": two_factor,
+        "cookie": cookie,
         "token": token,
-        "email": uid if "@" in uid else "",
-        "proxy": "",
+        "email": email or (uid if "@" in uid else ""),
+        "proxy": proxy,
+        "data": cookie or token or normalized_line,
         "locale": "AUTO",
         "country": "",
-        "timezone": ""
+        "timezone": "",
     }
 
-    def is_cookie(value):
-        return bool(normalize_cookie_input(value))
+    def cookie_value(value):
+        return normalize_cookie_input(value)
 
-    prefix = parts[0].upper() if parts else ""
-    if prefix == "COOKIE":
-        recognized_indexes.add(0)
-        cookie = parts[1] if len(parts) > 1 else ""
-        if len(parts) > 1:
-            recognized_indexes.add(1)
+    if prefix == "FACEBOOK":
+        recognized.add(0)
+        uid = fields[1] if len(fields) > 1 else ""
+        password = fields[2] if len(fields) > 2 else ""
+        recognized.update(index for index in (1, 2) if index < len(fields))
+    elif prefix == "COOKIE":
+        recognized.add(0)
     elif prefix == "TOKEN":
-        recognized_indexes.add(0)
-        token = parts[1] if len(parts) > 1 else ""
-        if len(parts) > 1:
-            recognized_indexes.add(1)
-    elif prefix == "FACEBOOK":
-        recognized_indexes.add(0)
-        uid = parts[1] if len(parts) > 1 else ""
-        password = parts[2] if len(parts) > 2 else ""
-        recognized_indexes.update(index for index in (1, 2) if index < len(parts))
-        email = uid if "@" in uid else ""
-    elif len(parts) == 1:
-        value = parts[0]
-        if is_cookie(value):
-            cookie = value
-            recognized_indexes.add(0)
-        elif value.startswith(("EAAB", "EAAA")):
-            token = value
-            recognized_indexes.add(0)
-        else:
-            cookie = value
+        recognized.add(0)
+        token = fields[1] if len(fields) > 1 else ""
+        recognized.add(1) if len(fields) > 1 else None
     else:
-        uid = parts[0] if parts else ""
-        password = parts[1] if len(parts) > 1 else ""
-        fa2 = parts[2] if len(parts) > 2 else ""
-        recognized_indexes.update(index for index in (0, 1, 2) if index < len(parts))
+        uid = fields[0] if fields else ""
+        password = fields[1] if len(fields) > 1 else ""
+        recognized.update(index for index in (0, 1) if index < len(fields))
 
-        cookie_index = -1
-        for field_index, value in enumerate(parts):
-            if not value:
-                continue
-            if cookie_index < 0 and is_cookie(value):
-                cookie = value
-                cookie_index = field_index
-                recognized_indexes.add(field_index)
-            elif not token and value.startswith(("EAAB", "EAAA")):
-                token = value
-                recognized_indexes.add(field_index)
-            elif not email and "@" in value and "." in value:
-                email = value
-                recognized_indexes.add(field_index)
-            elif not proxy and parse_proxy(value):
-                proxy = value
-                recognized_indexes.add(field_index)
+    for index, field in enumerate(fields):
+        if not field:
+            continue
+        normalized_cookie = cookie_value(field)
+        if normalized_cookie and not cookie:
+            cookie = field
+            recognized.add(index)
+            continue
+        if not token and field.startswith(("EAAB", "EAAA")):
+            token = field
+            recognized.add(index)
+            continue
+        if not email and "@" in field and "." in field:
+            email = field
+            recognized.add(index)
+            continue
+        if not proxy and parse_proxy(field):
+            proxy = field
+            recognized.add(index)
+            continue
+        if not two_factor and index >= 2 and len(field) in (16, 32) and field.isalnum():
+            two_factor = field
+            recognized.add(index)
 
-        if cookie_index == 5 and len(parts) > 6 and parts[6]:
-            token = parts[6]
-            recognized_indexes.add(6)
+    if not cookie:
+        return None
 
-    cookie_fields = []
-    for field_index, value in enumerate(parts):
-        if is_cookie(value):
-            cookie_fields.append(value)
-            recognized_indexes.add(field_index)
-    if cookie_fields:
-        cookie = cookie_fields[0] if len(cookie_fields) == 1 else "; ".join(
-            normalize_cookie_input(value).rstrip("; ") for value in cookie_fields
-        )
-    cookie_uid = re.search(r"(?:^|;)\s*c_user\s*=\s*(\d+)", normalize_cookie_input(cookie))
-    if cookie_uid and (not uid or is_cookie(uid)):
+    cookie_uid = re.search(
+        r"(?:^|;)\s*c_user\s*=\s*(\d+)", cookie_value(cookie)
+    )
+    if cookie_uid and (not uid or cookie_value(uid)):
         uid = cookie_uid.group(1)
-    if prefix == "TOKEN" and not uid:
-        uid = token[:15]
+    if prefix == "COOKIE" and not uid:
+        uid = cookie_uid.group(1) if cookie_uid else ""
 
-    account_type = "COOKIE" if cookie else ("TOKEN" if token else "RAW")
-    if prefix == "FACEBOOK" and not cookie:
-        account_type = "RAW"
-    if uid:
-        name = uid if prefix != "COOKIE" else f"FB_{uid}"
-    elif token:
-        name = f"Token_{token[:8]}"
+    if not uid:
+        uid = f"UID_{idx}"
+    if not password and len(fields) > 1 and prefix not in {"COOKIE", "TOKEN"}:
+        password = fields[1]
 
+    account_type = "COOKIE"
+    if prefix == "TOKEN" and not cookie:
+        account_type = "TOKEN"
     unknown_fields = [
-        {"index": field_index, "value": value}
-        for field_index, value in enumerate(parts)
-        if field_index not in recognized_indexes and value
+        {"index": index, "value": field}
+        for index, field in enumerate(fields)
+        if field and index not in recognized
     ]
-    result = {
+    return {
         "type": account_type,
         "raw_line": raw_value,
         "source_line": normalized_line,
-        "fields": exact_fields,
+        "fields": normalized_line.split("|"),
         "unknown_fields": unknown_fields,
         "uid": uid,
-        "name": name,
+        "name": uid,
         "pwd": password,
         "password": password,
-        "2fa": fa2,
+        "2fa": two_factor,
         "cookie": cookie,
         "token": token,
-        "email": email,
+        "email": email or (uid if "@" in uid else ""),
         "proxy": proxy,
-        "data": cookie or token or account_line,
+        "data": cookie or token or normalized_line,
+        "locale": "AUTO",
+        "country": "",
+        "timezone": "",
     }
-    result.update(metadata)
-    return result
 
 
 def serialize_account_line(account):
@@ -2194,83 +2211,24 @@ class ImportAccountDialog(tk.Toplevel):
             return
 
         lines = [l.strip() for l in raw_data.splitlines() if l.strip()]
-        fmt = self.format_mode.get()
         parsed_accounts = []
 
-        # [THAY THẾ TOÀN BỘ VÒNG LẶP for line in lines BẰNG ĐOẠN AUTO-DETECT NÀY:]
         for idx, line in enumerate(lines, 1):
-            explicit_prefixes = {
-                "COOKIE|Cookie Facebook": "COOKIE|",
-                "TOKEN|Token Facebook": "TOKEN|",
-                "FACEBOOK|Email/UID|Password": "FACEBOOK|",
-            }
-            if fmt in explicit_prefixes:
-                prefix = explicit_prefixes[fmt]
-                normalized_line = line if line.upper().startswith(prefix) else prefix + line
-                parsed = parse_any_account_line(normalized_line, idx)
-                if parsed:
-                    parsed_accounts.append({
-                        "name": parsed["name"],
-                        "uid": parsed["uid"],
-                        "pwd": parsed["pwd"],
-                        "2fa": parsed["2fa"],
-                        "cookie": parsed["cookie"],
-                        "proxy": parsed["proxy"] or "Không dùng",
-                        "raw": normalized_line,
-                    })
-                continue
-
-            uid, pwd, fa2, cookie, proxy, name = "", "", "", "", "Không dùng", ""
-            
-            # 1. Nếu dòng là Cookie trần (không có dấu | hoặc chứa c_user/sb/datr)
-            if "|" not in line or ("c_user=" in line and fmt == "Chỉ Cookie (Tự nhận diện)"):
-                cookie = line
-                m = re.search(r'c_user=(\d+)', line)
-                uid = m.group(1) if m else f"UID_{idx}"
-                name = uid
-            else:
-                parts = line.split('|')
-                # Tự động quét tìm phần tử là Cookie trong các cột
-                for part in parts:
-                    p = part.strip()
-                    if "c_user=" in p or "sb=" in p or "datr=" in p:
-                        cookie = p
-                        m = re.search(r'c_user=(\d+)', p)
-                        if m: uid = m.group(1)
-                    elif p.isdigit() and len(p) >= 8 and not uid:
-                        uid = p
-                    elif len(p) in (16, 32) and p.isalnum() and not fa2 and not p.isdigit():
-                        fa2 = p
-                    elif ":" in p and any(char.isdigit() for char in p) and proxy == "Không dùng":
-                        proxy = p
-
-                # Nếu chọn theo định dạng mẫu cố định
-                if fmt == "UID|Pass|2FA|Cookie":
-                    uid = parts[0] if len(parts) > 0 else uid
-                    pwd = parts[1] if len(parts) > 1 else ""
-                    fa2 = parts[2] if len(parts) > 2 else fa2
-                    cookie = parts[3] if len(parts) > 3 else cookie
-                elif fmt == "Tên|Cookie":
-                    name = parts[0] if len(parts) > 0 else (uid or f"Nick_{idx}")
-                    cookie = parts[1] if len(parts) > 1 else cookie
-                
-                name = name or uid or f"Nick_{idx}"
-
-            parsed_accounts.append({
-                "name": name,
-                "uid": uid,
-                "pwd": pwd,
-                "2fa": fa2,
-                "cookie": cookie,
-                "proxy": proxy,
-                "raw": line
-            })
-# [KẾT THÚC THAY THẾ]
+            parsed = parse_any_account_line(line, idx)
+            if parsed:
+                parsed_accounts.append({
+                    "name": parsed["name"],
+                    "uid": parsed["uid"],
+                    "pwd": parsed["pwd"],
+                    "2fa": parsed["2fa"],
+                    "cookie": parsed["cookie"],
+                    "proxy": parsed["proxy"] or "Không dùng",
+                    "raw": line,
+                })
 
         self.on_import_callback(parsed_accounts)
         messagebox.showinfo("Thành công", f"Đã nạp thành công {len(parsed_accounts)} tài khoản vào bảng!", parent=self)
         self.destroy()
-
 # [ĐOẠN TRƯỚC:]
 class MainToolApp:
     def auto_format_cookie_numbers(self, event=None):

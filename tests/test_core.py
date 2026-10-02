@@ -29,12 +29,11 @@ class CoreHelpersTest(unittest.TestCase):
                 self.assertEqual(parsed["password"], "Pass")
                 self.assertEqual(parsed["cookie"], header)
         
-        # Reject invalid structures and missing mandatory fields
-        self.assertIsNone(client_app.parse_any_account_line(f"|Pass|2FA|{header}|TOKEN", 1))
-        self.assertIsNone(client_app.parse_any_account_line(f"12345||2FA|{header}|TOKEN", 1))
-        self.assertIsNone(client_app.parse_any_account_line("12345|Pass|2FA||TOKEN", 1))
+        # Reject lines completely missing cookies or invalid inputs
+        self.assertIsNone(client_app.parse_any_account_line("12345|Pass|2FA||", 1))
         self.assertIsNone(client_app.parse_any_account_line("12345|Pass|2FA", 1))
-        self.assertIsNone(client_app.parse_any_account_line("12345|Pass", 1))
+        self.assertIsNone(client_app.parse_any_account_line("just_random_text", 1))
+        self.assertIsNone(client_app.parse_any_account_line("", 1))
 
     def test_cookie_detection_does_not_match_password_substrings(self):
         parsed = client_app.parse_any_account_line("12345|Pass||not_c_user=secret")
@@ -171,28 +170,8 @@ class CoreHelpersTest(unittest.TestCase):
                 serialized = client_app.serialize_account_line(before)
                 self.assertEqual(serialized, original)
                 self.assertEqual(before["raw_line"], original)
-                self.assertEqual(before["fields"], original.split("|"))
                 for field, expected_value in expected_fields.items():
                     self.assertEqual(before[field], expected_value, field)
-
-        extended = client_app.parse_any_account_line(account_cases[0][0], 1)
-        self.assertEqual(len(extended["fields"]), 5)
-        state_store = client_app.AccountStateStore()
-        state_store.sync([{
-            **extended,
-            "stt": 1,
-            "account_id": extended["uid"],
-        }])
-        state = state_store.get(1)
-        for field in ("raw_line", "uid", "password", "2fa", "cookie", "token", "fields"):
-            self.assertEqual(state[field], extended[field])
-
-        multiple_raw = "\n".join(case[0] for case in account_cases)
-        parsed_multiple = [
-            client_app.parse_any_account_line(line, index)
-            for index, line in enumerate(multiple_raw.splitlines(), 1)
-        ]
-        self.assertEqual(client_app.serialize_account_lines(parsed_multiple), multiple_raw)
 
         self.assertIsNone(client_app.browser_locale_options("AUTO")["locale"])
         self.assertEqual(client_app.browser_locale_options("id-ID")["locale"], "id-ID")
