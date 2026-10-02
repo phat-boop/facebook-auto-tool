@@ -44,7 +44,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.2.7"
+CURRENT_VERSION = "2.2.8"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -402,8 +402,8 @@ def write_create_page_results_xlsx(file_path, categorized_records):
     workbook = Workbook()
     workbook.remove(workbook.active)
     headers = (
-        "STT", "Tài khoản / UID", "Trạng thái", "Page đã tạo",
-        "Chỉ tiêu Page", "Kết quả / Lý do", "Thời gian", "Dữ liệu tài khoản gốc",
+        "STT", "UID", "Mật khẩu (Pass)", "Trạng thái", "Page đã tạo",
+        "Chỉ tiêu Page", "Kết quả / Lý do", "Thời gian", "Dữ liệu gốc",
     )
     sheet_specs = (
         ("LIVE", categorized_records.get("completed", []), "16A34A"),
@@ -418,7 +418,8 @@ def write_create_page_results_xlsx(file_path, categorized_records):
         for record in records:
             sheet.append((
                 record.get("stt", ""),
-                record.get("account_id") or record.get("uid", ""),
+                record.get("uid") or record.get("account_id", ""),
+                record.get("password") or record.get("pwd", ""),
                 sheet_name,
                 int(record.get("created_count") or 0),
                 int(record.get("target_count") or 0),
@@ -1683,13 +1684,12 @@ def normalize_cookie_input(value: str):
             if isinstance(name, str) and isinstance(val, (str, int)):
                 pairs.append(f"{name.strip()}={val}")
         value = "; ".join(pairs)
-    if not re.search(r'(?:^|;)\s*(?:c_user|xs|sessionid|sb|datr)\s*=', value):
+    if not re.search(r'(?:^|;)\s*\b(?:c_user|xs|sessionid|sb|datr)\b\s*=', value):
         return ""
     return value
 
 
 def parse_cookies(cookie_raw: str, default_domain: str = ".facebook.com"):
-    """Tự động phân tách chuỗi cookie chuẩn định dạng Playwright"""
     clean_cookie = re.sub(r'^\d+[\.\-\s\|]+', '', cookie_raw.strip()).strip()
     if "|" in clean_cookie:
         clean_cookie = "; ".join(
@@ -1874,24 +1874,51 @@ def send_telegram_alert(bot_token: str, chat_id: str, message: str):
         pass
 
 def parse_any_account_line(raw_line: str, idx: int = 1):
-    """Parse account fields without mutating or discarding the original line."""
+    """Parse strictly according to official contract: UID|PASSWORD|2FA|COOKIE|TOKEN"""
     raw_value = str(raw_line or "").rstrip("\r\n")
-    normalized_line = re.sub(r'^\s*\d+[\.\-]\s*', '', raw_value).strip()
-    if not normalized_line:
+    if not raw_value:
         return None
 
-    account_line, metadata = split_account_metadata(normalized_line)
-    exact_fields = normalized_line.split("|")
-    parts = [part.strip() for part in account_line.split("|")]
-    recognized_indexes = set()
-    uid = ""
-    name = f"Nick_{idx}"
-    password = ""
-    fa2 = ""
-    cookie = ""
-    token = ""
-    email = ""
-    proxy = ""
+    # Tách chuỗi theo dấu pipe nhưng bảo toàn số lượng trường
+    fields = raw_value.split("|")
+    
+    uid = fields[0].strip() if len(fields) > 0 else ""
+    password = fields[1].strip() if len(fields) > 1 else ""
+    fa2 = fields[2].strip() if len(fields) > 2 else ""
+    cookie_raw = fields[3].strip() if len(fields) > 3 else ""
+    token = fields[4].strip() if len(fields) > 4 else ""
+
+    # Kiểm tra các trường bắt buộc theo Contract: UID, PASSWORD và COOKIE không được trống
+    if not uid or not password or not cookie_raw:
+        return None
+
+    # Xác thực cookie phải chứa các khóa chuẩn (c_user, xs,...)
+    cookie_normalized = normalize_cookie_input(cookie_raw)
+    if not cookie_normalized:
+        return None
+
+    return {
+        "type": "COOKIE",
+        "raw_line": raw_value,
+        "source_line": raw_value,
+        "fields": fields,
+        "unknown_fields": [
+            {"index": i, "value": fields[i]} 
+            for i in range(5, len(fields)) if fields[i].strip()
+        ],
+        "uid": uid,
+        "name": uid,
+        "pwd": password,
+        "password": password,
+        "2fa": fa2,
+        "cookie": cookie_raw,
+        "token": token,
+        "email": uid if "@" in uid else "",
+        "proxy": "",
+        "locale": "AUTO",
+        "country": "",
+        "timezone": ""
+    }
 
     def is_cookie(value):
         return bool(normalize_cookie_input(value))
@@ -1922,7 +1949,6 @@ def parse_any_account_line(raw_line: str, idx: int = 1):
             token = value
             recognized_indexes.add(0)
         else:
-            # Backward compatibility for raw, unclassified account input.
             cookie = value
     else:
         uid = parts[0] if parts else ""
@@ -1948,12 +1974,10 @@ def parse_any_account_line(raw_line: str, idx: int = 1):
                 proxy = value
                 recognized_indexes.add(field_index)
 
-        # Lossless extended format: UID|PASSWORD|2FA|||COOKIE|TOKEN
         if cookie_index == 5 and len(parts) > 6 and parts[6]:
             token = parts[6]
             recognized_indexes.add(6)
 
-    # Prefixes describe the import format; cookies anywhere in it take priority.
     cookie_fields = []
     for field_index, value in enumerate(parts):
         if is_cookie(value):
@@ -3032,7 +3056,7 @@ class MainToolApp:
         frame_tree = tk.Frame(paned_data, bg="#0A0E1A")
         paned_data.add(frame_tree, minsize=200)
 
-        columns = ("select", "id", "uid", "name", "password", "2fa", "cookie", "email", "proxy", "status")
+        columns = ("select", "id", "uid", "password", "2fa", "status", "action")
         self.tree = ttk.Treeview(frame_tree, columns=columns, show="headings", selectmode="extended")
         self.tree.tag_configure("empty", foreground="#8EA3B5")
         configure_account_table_style(self.style, self.tree)
@@ -3040,24 +3064,37 @@ class MainToolApp:
         self.tree.heading("select", text="[✔]")
         self.tree.heading("id", text="STT")
         self.tree.heading("uid", text="UID")
-        self.tree.heading("name", text="Tên Nick")
-        self.tree.heading("password", text="Password")
-        self.tree.heading("2fa", text="2FA Key")
-        self.tree.heading("cookie", text="Cookie")
-        self.tree.heading("email", text="Email")
-        self.tree.heading("proxy", text="Proxy")
-        self.tree.heading("status", text="Trạng Thái")
+        self.tree.heading("password", text="PASSWORD")
+        self.tree.heading("2fa", text="2FA")
+        self.tree.heading("status", text="STATUS")
+        self.tree.heading("action", text="ACTION")
 
         self.tree.column("select", width=45, anchor="center")
         self.tree.column("id", width=45, anchor="center")
         self.tree.column("uid", width=130, anchor="center")
-        self.tree.column("name", width=120)
-        self.tree.column("password", width=100, anchor="center")
-        self.tree.column("2fa", width=110, anchor="center")
-        self.tree.column("cookie", width=220)
-        self.tree.column("email", width=140)
-        self.tree.column("proxy", width=130, anchor="center")
+        self.tree.column("password", width=120, anchor="center")
+        self.tree.column("2fa", width=100, anchor="center")
         self.tree.column("status", width=110, anchor="center")
+        self.tree.column("action", width=250, anchor="w")
+
+        # Context Menu
+        self.tree_menu = tk.Menu(self.tree, tearoff=0, bg="#131C2E", fg="#FFFFFF")
+        self.tree_menu.add_command(label="Copy UID", command=lambda: self.copy_tree_data("uid"))
+        self.tree_menu.add_command(label="Copy Password", command=lambda: self.copy_tree_data("password"))
+        self.tree_menu.add_command(label="Copy UID | Password", command=lambda: self.copy_tree_data("uid|pass"))
+        self.tree_menu.add_command(label="Copy UID | Password | 2FA", command=lambda: self.copy_tree_data("uid|pass|2fa"))
+        self.tree_menu.add_separator()
+        self.tree_menu.add_command(label="Copy dòng gốc", command=lambda: self.copy_tree_data("raw"))
+
+        def show_context_menu(event):
+            item = self.tree.identify_row(event.y)
+            if item:
+                if item not in self.tree.selection():
+                    self.tree.selection_set(item)
+                self.tree_menu.tk_popup(event.x_root, event.y_root)
+
+        self.tree.bind("<Button-3>", show_context_menu)
+        self.tree.bind("<Control-c>", lambda e: self.copy_tree_data("raw"))
 
         def toggle_row_check(event):
             region = self.tree.identify("region", event.x, event.y)
@@ -3093,8 +3130,33 @@ class MainToolApp:
         # 3. Thanh trạng thái dưới đáy
         self.lbl_footer_status = tk.Label(self.tab_data, text="Tổng số nick: 0 | Sẵn sàng hoạt động.", font=("Segoe UI", 9), fg="#94A3B8", bg="#131C2E", anchor="w", padx=10, pady=4)
         self.lbl_footer_status.pack(fill="x", side="bottom")
-# [KẾT THÚC THAY THẾ]
 
+    def copy_tree_data(self, mode):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        result = []
+        for item in selected:
+            vals = self.tree.item(item, "values")
+            stt = int(vals[1])
+            parsed = self.account_states.get(stt)
+            if not parsed: continue
+            
+            if mode == "uid":
+                result.append(parsed["uid"])
+            elif mode == "password":
+                result.append(parsed["password"])
+            elif mode == "uid|pass":
+                result.append(f"{parsed['uid']}|{parsed['password']}")
+            elif mode == "uid|pass|2fa":
+                result.append(f"{parsed['uid']}|{parsed['password']}|{parsed['2fa']}")
+            elif mode == "raw":
+                result.append(parsed["raw_line"])
+                
+        if result:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(result))
+            self.log(f"[+] Đã copy {len(result)} dòng (Chế độ: {mode})")
     def open_create_page_results_dialog(self):
         window = self.create_page_results_window
         if window is not None and window.winfo_exists():
@@ -3573,7 +3635,8 @@ class MainToolApp:
         record = {
             "stt": state.get("stt", index),
             "account_id": state.get("account_id", ""),
-            "uid": state.get("uid", ""),
+            "uid": state.get("uid", "") or state.get("account_id", ""),
+            "password": state.get("password") or state.get("pwd", ""),
             "raw_line": (state.get("raw_line") or source_line) if result_type == "checkpoint" else source_line,
             "created_count": int(created_count or 0),
             "target_count": int(target_count or 0),
@@ -3628,7 +3691,7 @@ class MainToolApp:
                     msg_parts.append(status)
                 
                 if msg_parts:
-                    vals[9] = " | ".join(msg_parts)
+                    vals[5] = " | ".join(msg_parts)
                 row_status = account_state["status"] if account_state else "UNKNOWN"
                 self.tree.item(item_id, values=vals, tags=(row_status,))
         self.post_ui(_update)
@@ -3906,11 +3969,11 @@ class MainToolApp:
         if file_path:
             with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
-                writer.writerow(["STT", "UID", "Tên Nick", "Proxy", "Trạng thái", "Thời gian"])
+                writer.writerow(["STT", "UID", "PASSWORD", "2FA", "STATUS", "ACTION", "TIME"])
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 for item in items:
                     vals = list(self.tree.item(item, "values"))
-                    writer.writerow([vals[1], vals[2], vals[3], vals[8], vals[9], now_str])
+                    writer.writerow([vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], now_str])
             messagebox.showinfo("Thành công", f"Đã xuất báo cáo tại:\n{file_path}")
     def reload_table_from_text(self, checked_indexes=None):
         if getattr(self, "is_running", False):
@@ -3965,19 +4028,14 @@ class MainToolApp:
 
             account_records[-1]["proxy"] = "" if assigned_proxy == "Không dùng" else assigned_proxy
 
-            # Điền đúng thứ tự 10 cột: Checkbox, STT, UID, Tên, Password, 2FA Key, Cookie, Email, Proxy, Status
-            # Thêm cột đầu tiên là checkbox [✔] mặc định
             self.tree.insert("", "end", iid=str(idx), values=(
                 "[✔]" if checked_indexes is None or idx in checked_indexes else "[ ]",
                 idx, 
                 parsed["uid"], 
-                parsed["name"], 
-                parsed["pwd"], 
+                parsed["password"], 
                 parsed["2fa"], 
-                parsed["cookie"], 
-                parsed["email"], 
-                assigned_proxy, 
-                "CHƯA KIỂM TRA"
+                "CHƯA KIỂM TRA",
+                "Chưa chạy"
             ), tags=("UNKNOWN",))
 
         self.account_states.sync(account_records)
@@ -3986,7 +4044,8 @@ class MainToolApp:
             state = self.account_states.get(index)
             if self.tree.exists(item_id) and state:
                 values = list(self.tree.item(item_id, "values"))
-                values[9] = ACCOUNT_STATUS_LABELS[state["status"]]
+                values[5] = ACCOUNT_STATUS_LABELS[state["status"]]
+                values[6] = state["current_action"]
                 self.tree.item(item_id, values=values, tags=(state["status"],))
         self.refresh_account_state_table(reset_batch=True)
         
@@ -4002,10 +4061,13 @@ class MainToolApp:
                 self.lbl_tree_empty.place(relx=0.5, rely=0.5, anchor="center")
 
     def start_thread(self):
-        if self.is_running or (self.run_thread and self.run_thread.is_alive()):
-            self.log("[!] Tiến trình trước vẫn đang đóng. Vui lòng chờ hoàn tất.")
+        if self.run_thread and self.run_thread.is_alive():
+            self.log("[!] Tiến trình trước vẫn đang dọn dẹp. Vui lòng thử lại sau 2 giây.")
             return
 
+        self.is_running = True
+        self.stop_requested = False
+        self.run_error = None
         self.save_settings()
         checked_indexes = {
             int(self.tree.item(item, "values")[1])
@@ -4067,14 +4129,14 @@ class MainToolApp:
 
     def finish_run(self):
         if self.run_thread and self.run_thread.is_alive():
-            self.root.after(50, self.finish_run)
+            self.root.after(100, self.finish_run)
             return
         was_stopped = self.stop_requested
         self.is_running = False
+        self.stop_requested = False
         self.run_thread = None
         self.worker_loop = None
         self.worker_tasks = []
-        self.stop_requested = False
 
         # Khôi phục trạng thái nút Bắt đầu để người dùng có thể chạy lại ngay
         self.btn_start.config(state="normal")
@@ -4820,6 +4882,26 @@ class MainToolApp:
 
             await login_btn.click()
             await page.wait_for_timeout(5000)
+            
+            if "checkpoint" in page.url or "two_factor" in page.url or "id=1501092823525282" in page.url:
+                state = self.account_states.get(int(self.account_log_context.get())) if getattr(self, 'account_log_context', None) else None
+                fa2 = state.get("2fa", "") if state else ""
+                if not fa2:
+                    return LOGIN_INVALID, "Cần mã 2FA nhưng không có trong dữ liệu"
+                self.log(f"[*] [{username}] Đang giải mã 2FA...")
+                code_input = page.locator('input[id="approvals_code"], input[name="approvals_code"]').first
+                if await code_input.count() > 0:
+                    await code_input.fill(generate_totp_code(fa2))
+                    submit_2fa = page.locator('button[id="checkpointSubmitButton"]').first
+                    if await submit_2fa.count() > 0:
+                        await submit_2fa.click()
+                        await page.wait_for_timeout(5000)
+                        for _ in range(4):
+                            cont_btn = page.locator('button[id="checkpointSubmitButton"]').first
+                            if await cont_btn.count() > 0 and await cont_btn.is_visible():
+                                await cont_btn.click()
+                                await page.wait_for_timeout(3000)
+
             is_valid_session, session_detail = await self.verify_facebook_session(page, context)
             if not is_valid_session:
                 self.log(f"[-] [{username}] Đăng nhập Facebook chưa hợp lệ: {session_detail}.")
@@ -5130,7 +5212,7 @@ class MainToolApp:
             health_response = await page.goto(
                 "https://www.facebook.com/robots.txt",
                 wait_until="domcontentloaded",
-                timeout=15000,
+                timeout=30000,
             )
             if health_response is None:
                 raise RuntimeError("Không nhận được phản hồi HTTPS từ Facebook")
@@ -5650,28 +5732,36 @@ class MainToolApp:
             await options.first.wait_for(state="visible", timeout=5000)
         except (TimeoutError, PlaywrightTimeoutError):
             return False, "CATEGORY_SUGGESTIONS_NOT_AVAILABLE"
+        
+        # Mở rộng danh sách từ khóa tương đương cho đa ngôn ngữ
+        req_norm = normalize_ui_text(requested_category)
+        aliases = {req_norm}
+        if req_norm == normalize_ui_text("Blog cá nhân"):
+            aliases.update(normalize_ui_text(x) for x in ["Personal blog", "Blog personnel", "Blog personal", "Blog pessoal", "Persönlicher Blog", "บล็อกส่วนตัว", "Blog Pribadi", "ブログ(個人)", "개인 블로그"])
+            
         for index in range(await options.count()):
             option = options.nth(index)
-            if await option.is_visible() and normalize_ui_text(await option.inner_text()) == normalize_ui_text(requested_category):
-                await option.click()
-                selected = await category_input.evaluate(r"""async (input, requested) => {
-                    const normalize = text => (text || '').normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase();
-                    const deadline = Date.now() + 3000;
-                    while (Date.now() < deadline && input.isConnected) {
-                        const root = input.parentElement.parentElement;
-                        const selected = Array.from(root.querySelectorAll('[aria-selected="true"], [data-selected-category], span'))
-                        .some(el => !el.closest('[role="listbox"]') && el.getClientRects().length > 0
-                            && normalize(el.textContent) === normalize(requested)
-                            && (el.matches('[aria-selected="true"],[data-selected-category]')
-                                || el.parentElement.querySelector('button,[role="button"]')));
-                        if (selected) return true;
-                        await new Promise(resolve => setTimeout(resolve, 100));
-                    }
-                    return false;
-                }""", requested_category)
-                return bool(selected), "" if selected else "CATEGORY_SELECTION_NOT_VERIFIED"
+            if await option.is_visible():
+                opt_text = await option.inner_text()
+                if normalize_ui_text(opt_text) in aliases:
+                    await option.click()
+                    selected = await category_input.evaluate(r"""async (input, matched_text) => {
+                        const normalize = text => (text || '').normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+                        const deadline = Date.now() + 3000;
+                        while (Date.now() < deadline && input.isConnected) {
+                            const root = input.parentElement.parentElement;
+                            const selected = Array.from(root.querySelectorAll('[aria-selected="true"], [data-selected-category], span'))
+                            .some(el => !el.closest('[role="listbox"]') && el.getClientRects().length > 0
+                                && normalize(el.textContent) === normalize(matched_text)
+                                && (el.matches('[aria-selected="true"],[data-selected-category]')
+                                    || el.parentElement.querySelector('button,[role="button"]')));
+                            if (selected) return true;
+                            await new Promise(resolve => setTimeout(resolve, 100));
+                        }
+                        return false;
+                    }""", opt_text)
+                    return bool(selected), "" if selected else "CATEGORY_SELECTION_NOT_VERIFIED"
         return False, "CATEGORY_NOT_FOUND"
-
     async def ensure_personal_profile(self, context, page, acc_name):
         """Chuyển đổi danh tính từ Fanpage về lại tài khoản cá nhân trên giao diện."""
         cookies = await context.cookies("https://www.facebook.com/")
@@ -5705,11 +5795,15 @@ class MainToolApp:
                     await self.human_click(page, switch_btn)
                     await asyncio.sleep(4.0)
 
-            # 2. Xóa triệt để cookie i_user kèm theo domain chuẩn
-            await context.clear_cookies(name="i_user", domain=".facebook.com")
+            # 2. Xóa triệt để cookie i_user và làm sạch storage
+            try:
+                await context.clear_cookies(name="i_user")
+                await page.evaluate("() => { try { localStorage.removeItem('active_profile'); } catch(e){} }")
+            except Exception:
+                pass
             
             # 3. Reload về trang chủ kiểm tra trạng thái
-            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=40000)
+            await page.goto("https://www.facebook.com/me", wait_until="domcontentloaded", timeout=40000)
             await asyncio.sleep(3.0)
 
             updated_cookies = await context.cookies("https://www.facebook.com/")
@@ -5992,7 +6086,7 @@ class MainToolApp:
                     ))
                     self.set_account_failure(idx, "invalid_login", reason)
                     return results
-                if "/pages/creation" not in cur_url:
+                if not re.search(r'/pages/creat', cur_url):
                     self.log(
                         f"[-] [{acc_name}] Facebook đã chuyển khỏi trang tạo Page ({page.url}). "
                         "Tài khoản có thể chưa được cấp quyền tạo Trang hoặc giao diện đã thay đổi."
@@ -6840,47 +6934,33 @@ class MainToolApp:
                 # --- BẮT ĐẦU LOGIC ĐĂNG NHẬP CHUẨN XÁC ---
                 is_valid_session = False
                 
-                # Nạp Cookie Facebook
-                if cookies:
-                    await context.add_cookies(cookies)
-                    
-                    self.log(f"[*] [{acc_name}] Đang mở trang chủ để kích hoạt Cookie...")
-                    await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=40000)
-                    await self.guard_facebook_checkpoint(page, idx)
-                    await asyncio.sleep(4)
-                    
-                    is_valid_session, session_detail = await self.verify_facebook_session(page, context)
-                    if not is_valid_session:
-                        reason = f"[{acc_name}] Phiên Cookie không hợp lệ: {session_detail}"
-                        self.set_account_failure(idx, "invalid_cookie", reason)
-                        self.update_tree_row(str(idx), status="DIE")
-                        return
-                    self.log(f"[✔] [{acc_name}] {session_detail}")
+                # Yêu cầu tool: Luôn đăng nhập bằng Cookie
+                if not cookies:
+                    self.set_account_failure(idx, "invalid_cookie", f"[{acc_name}] Thiếu Cookie.")
+                    self.update_tree_row(str(idx), status="DIE")
+                    return
 
-                # Đăng nhập Facebook bằng UID/email và mật khẩu
-                elif account_type == "RAW" and login_user and login_password:
+                await context.add_cookies(cookies)
+                self.log(f"[*] [{acc_name}] Đang mở trang chủ để nạp phiên Cookie...")
+                await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=40000)
+                await self.guard_facebook_checkpoint(page, idx)
+                await asyncio.sleep(4)
+
+                is_valid_session, session_detail = await self.verify_facebook_session(page, context)
+                if not is_valid_session:
+                    self.log(f"[!] [{acc_name}] Cookie không hợp lệ: {session_detail}. Fallback đăng nhập UID/PASSWORD...")
                     login_result, login_detail = await self.login_facebook_user_pass(
                         page, context, login_user, login_password
                     )
                     await self.guard_facebook_checkpoint(page, idx)
-                    if login_result == LOGIN_TECHNICAL_ERROR:
-                        reason = f"[{acc_name}] Lỗi kỹ thuật khi đăng nhập: {login_detail}"
-                        self.set_account_failure(idx, "automation", reason)
-                        self.update_tree_row(str(idx), status="ERROR")
+                    if login_result != LOGIN_SUCCESS:
+                        reason = f"[{acc_name}] Đăng nhập UID/PASS thất bại: {login_detail}"
+                        self.set_account_failure(idx, "invalid_login", reason)
+                        self.update_tree_row(str(idx), status="DIE")
                         return
-                    is_valid_session = login_result == LOGIN_SUCCESS
+                    self.log(f"[✔] [{acc_name}] Đăng nhập bằng UID/PASSWORD + 2FA thành công!")
                 else:
-                    reason = f"[{acc_name}] Thiếu dữ liệu đăng nhập hợp lệ."
-                    self.set_account_failure(idx, "input", reason)
-                    self.update_tree_row(str(idx), status="ERROR")
-                    return
-                
-                # Chốt chặn: Nếu không đăng nhập thành công thì thoát luôn, không chạy tác vụ bên dưới
-                if not is_valid_session:
-                    reason = f"[{acc_name}] Đăng nhập không hợp lệ: {login_detail}"
-                    self.set_account_failure(idx, "invalid_login", reason)
-                    self.update_tree_row(str(idx), status="DIE")
-                    return  
+                    self.log(f"[✔] [{acc_name}] Đăng nhập bằng Cookie thành công: {session_detail}")  
                 # --- KẾT THÚC LOGIC ĐĂNG NHẬP ---
 
                 await self.guard_facebook_checkpoint(page, idx)
@@ -7262,21 +7342,15 @@ class MainToolApp:
                 continue
 
             acc_name = account_display_name(parsed, idx)
-            cookie_str = parsed.get("cookie", "")
-            if parsed["type"] == "TOKEN":
+            cookie_str = (parsed.get("cookie") or "").strip()
+
+            # Yêu cầu cốt lõi: Bắt buộc phải có Cookie để chạy tài khoản
+            if not cookie_str:
                 self.set_account_failure(
                     idx,
                     "input",
-                    f"[{acc_name}] Token EAAB/EAAA không thể thay thế Cookie đăng nhập.",
+                    f"[{acc_name}] Thiếu chuỗi Cookie hợp lệ (Tool chạy hoàn toàn bằng Cookie).",
                 )
-                continue
-            has_raw_login = bool(
-                parsed["type"] == "RAW"
-                and parsed.get("uid")
-                and (parsed.get("password") or parsed.get("pwd"))
-            )
-            if not cookie_str and not has_raw_login:
-                self.set_account_failure(idx, "input", f"[{acc_name}] Thiếu dữ liệu đăng nhập.")
                 continue
 
             assigned_proxy_str = resolve_account_proxy(
@@ -7287,7 +7361,6 @@ class MainToolApp:
                 and config.get("proxy_mode") not in {"account", "rotating_api"}
                 and proxy_lines
             ):
-                # Compatibility for non-UI callers without a captured proxy map.
                 if config.get("proxy_mode") in {"round_robin", "random"}:
                     assigned_proxy_str = proxy_lines[(idx - 1) % len(proxy_lines)]
                 else:
@@ -7299,7 +7372,7 @@ class MainToolApp:
                 "acc_name": acc_name,
                 "cookie_str": cookie_str,
                 "assigned_proxy_str": assigned_proxy_str,
-                "account_type": parsed["type"],
+                "account_type": "COOKIE",
                 "login_user": parsed.get("uid", ""),
                 "login_password": parsed.get("password") or parsed.get("pwd", ""),
                 "two_factor": parsed.get("2fa", ""),
@@ -7452,11 +7525,13 @@ class MainToolApp:
 
         item = selected[0]
         vals = self.tree.item(item, "values")
-        acc_name = vals[3] if len(vals) > 3 else vals[1]
-        proxy_str = vals[8] if len(vals) > 8 else "Không dùng"
-
-        parsed_account = self.get_parsed_account_for_item(item)
-        cookie_str = parsed_account.get("cookie", "") if parsed_account else ""
+        
+        stt = int(vals[1])
+        parsed_account = self.account_states.get(stt)
+        if not parsed_account: return
+        acc_name = parsed_account.get("name", str(stt))
+        proxy_str = parsed_account.get("proxy", "Không dùng")
+        cookie_str = parsed_account.get("cookie", "")
 
         profiles_dir = os.path.join(APP_DATA_DIR, "browser_profiles")
         os.makedirs(profiles_dir, exist_ok=True)

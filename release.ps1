@@ -4,9 +4,9 @@ param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
     [string]$Version,
 
-    [Parameter(Mandatory = $true, Position = 1)]
+    [Parameter(Position = 1)]
     [ValidateNotNullOrEmpty()]
-    [string]$Changelog
+    [string]$Changelog = 'Cập nhật Tool'
 )
 
 Set-StrictMode -Version Latest
@@ -89,11 +89,79 @@ function Set-JsonProperty {
     }
 }
 
+function Remove-PathWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$Recurse,
+        [int]$RetryCount = 3
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
+        try {
+            if ($Recurse) {
+                Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            }
+            else {
+                Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+            }
+            return
+        }
+        catch {
+            $lastError = $_
+            if ($attempt -lt $RetryCount) {
+                Start-Sleep -Seconds 1
+            }
+        }
+    }
+
+    $message = if ($null -ne $lastError) { $lastError.Exception.Message } else { 'Không rõ lỗi.' }
+    throw "Không thể xóa '$Path' sau $RetryCount lần thử. Có thể file đang bị client_app.exe, python.exe hoặc PyInstaller giữ. Chi tiết: $message"
+}
+
+function Invoke-PytestGate {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonPath
+    )
+
+    Write-Host "`n==> Chạy unit test" -ForegroundColor Cyan
+    $result = Invoke-NativeCapture $PythonPath @('-m', 'pytest', '-v', '--color=no')
+    $lines = @($result.Output | ForEach-Object { "$_" })
+    foreach ($line in $lines) {
+        Write-Host $line
+    }
+
+    $testText = $lines -join "`n"
+    $passedMatch = [regex]::Matches($testText, '\b(\d+)\s+passed\b')
+    $failedMatch = [regex]::Matches($testText, '\b(\d+)\s+failed\b')
+    $skippedMatch = [regex]::Matches($testText, '\b(\d+)\s+skipped\b')
+
+    $passed = if ($passedMatch.Count -gt 0) { $passedMatch[$passedMatch.Count - 1].Groups[1].Value } else { 'N/A' }
+    $failed = if ($failedMatch.Count -gt 0) { $failedMatch[$failedMatch.Count - 1].Groups[1].Value } else { '0' }
+    $skipped = if ($skippedMatch.Count -gt 0) { $skippedMatch[$skippedMatch.Count - 1].Groups[1].Value } else { '0' }
+
+    Write-Host "Tests passed:  $passed"
+    Write-Host "Tests failed:  $failed"
+    Write-Host "Tests skipped: $skipped"
+
+    # Nguồn quyết định duy nhất là exit code của pytest. Không hard-code số test.
+    if ($result.ExitCode -ne 0) {
+        throw "Chạy unit test thất bại (exit code $($result.ExitCode))."
+    }
+
+    Write-Host 'Result: PASS' -ForegroundColor Green
+}
+
 $projectRoot = $PSScriptRoot
 $clientPath = Join-Path $projectRoot 'client_app.py'
 $versionJsonPath = Join-Path $projectRoot 'version.json'
 $specPath = Join-Path $projectRoot 'client_app.spec'
 $exePath = Join-Path $projectRoot 'dist\client_app.exe'
+$buildWorkPath = Join-Path $projectRoot 'build\client_app'
 $tagName = "v$Version"
 $originalClientContent = $null
 $sourceCommitted = $false
@@ -105,6 +173,10 @@ try {
     $git = Get-RequiredCommand 'git'
     $gh = Get-RequiredCommand 'gh'
     $python = Get-RequiredCommand 'python'
+
+    Write-Host "Release target: $tagName" -ForegroundColor Green
+    Write-Host "Changelog: $Changelog"
+    Write-Host 'Test count: dynamic (pytest exit code quyết định PASS/FAIL)' -ForegroundColor DarkGray
 
     foreach ($requiredFile in @($clientPath, $versionJsonPath, $specPath)) {
         if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
@@ -175,22 +247,12 @@ try {
     Write-Utf8NoBom $clientPath $updatedClientContent
     Write-Host "Đã cập nhật CURRENT_VERSION thành $Version." -ForegroundColor Green
 
-    $testOutput = Invoke-NativeChecked $python @('-m', 'pytest', '-v', '--color=no') 'Chạy unit test'
-    $testText = $testOutput -join "`n"
-    # Invoke-NativeChecked validates the process exit code; counts are display-only.
-    $testSummary = [regex]::Matches($testText, '\b(\d+)\s+passed\b')
-    if ($testSummary.Count -gt 0) {
-        $testsPassed = $testSummary[$testSummary.Count - 1].Groups[1].Value
-        Write-Host "Tests passed: $testsPassed"
-    }
-    else {
-        Write-Host 'Tests passed: N/A (pytest không báo số passed).'
-    }
-    Write-Host 'Result: PASS' -ForegroundColor Green
+    Invoke-PytestGate $python
 
-    if (Test-Path -LiteralPath $exePath) {
-        Remove-Item -LiteralPath $exePath -Force
-    }
+    # Dọn output cũ trước khi build để tránh PyInstaller dùng state cũ.
+    # Nếu Windows đang khóa file/thư mục, lỗi sẽ nêu rõ thay vì fail khó hiểu ở giữa build.
+    Remove-PathWithRetry -Path $buildWorkPath -Recurse
+    Remove-PathWithRetry -Path $exePath
     Invoke-NativeChecked $python @('-m', 'PyInstaller', '--noconfirm', '--clean', $specPath) 'Build client_app.exe' | Out-Null
     if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
         throw "Build hoàn tất nhưng không tìm thấy $exePath."
@@ -279,6 +341,9 @@ catch {
     if (-not $sourceCommitted -and $null -ne $originalClientContent) {
         Write-Utf8NoBom $clientPath $originalClientContent
         Write-Host 'Đã hoàn nguyên CURRENT_VERSION vì release dừng trước commit source.' -ForegroundColor Yellow
+    }
+    elseif ($sourceCommitted) {
+        Write-Host 'Lưu ý: source release đã được commit. Không chạy lại cùng version một cách mù quáng; hãy kiểm tra tag/release trước.' -ForegroundColor Yellow
     }
 }
 finally {
