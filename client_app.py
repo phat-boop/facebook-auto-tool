@@ -44,7 +44,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.2.9"
+CURRENT_VERSION = "2.3.0"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -1880,7 +1880,7 @@ def parse_any_account_line(raw_line: str, idx: int = 1):
     if not normalized_line or normalized_line.startswith("#"):
         return None
 
-    fields = [field.strip() for field in normalized_line.split("|") if field.strip()]
+    fields = [field.strip() for field in normalized_line.split("|")]
     if not fields:
         return None
 
@@ -1891,9 +1891,20 @@ def parse_any_account_line(raw_line: str, idx: int = 1):
     token = ""
     email = ""
     proxy = ""
+    prefix = fields[0].upper()
+    start_index = 0
+    if prefix in {"FACEBOOK", "COOKIE", "TOKEN"}:
+        start_index = 1
+        if prefix == "FACEBOOK":
+            uid = fields[1] if len(fields) > 1 else ""
+            password = fields[2] if len(fields) > 2 else ""
+        elif prefix == "TOKEN":
+            token = fields[1] if len(fields) > 1 else ""
 
     # Tự động quét và phân loại từng trường dữ liệu dựa vào đặc thù nhận diện
-    for field in fields:
+    for index, field in enumerate(fields):
+        if index < start_index or not field:
+            continue
         norm_cookie = normalize_cookie_input(field)
         if norm_cookie and not cookie:
             cookie = field
@@ -1911,9 +1922,6 @@ def parse_any_account_line(raw_line: str, idx: int = 1):
             two_factor = field
             continue
         if not uid and (field.isdigit() and len(field) >= 5):
-            uid = field
-            continue
-        if not password and not uid:
             uid = field
             continue
         if uid and not password and field != cookie and field != token:
@@ -1955,93 +1963,6 @@ def parse_any_account_line(raw_line: str, idx: int = 1):
         "timezone": "",
     }
 
-    def cookie_value(value):
-        return normalize_cookie_input(value)
-
-    if prefix == "FACEBOOK":
-        recognized.add(0)
-        uid = fields[1] if len(fields) > 1 else ""
-        password = fields[2] if len(fields) > 2 else ""
-        recognized.update(index for index in (1, 2) if index < len(fields))
-    elif prefix == "COOKIE":
-        recognized.add(0)
-    elif prefix == "TOKEN":
-        recognized.add(0)
-        token = fields[1] if len(fields) > 1 else ""
-        recognized.add(1) if len(fields) > 1 else None
-    else:
-        uid = fields[0] if fields else ""
-        password = fields[1] if len(fields) > 1 else ""
-        recognized.update(index for index in (0, 1) if index < len(fields))
-
-    for index, field in enumerate(fields):
-        if not field:
-            continue
-        normalized_cookie = cookie_value(field)
-        if normalized_cookie and not cookie:
-            cookie = field
-            recognized.add(index)
-            continue
-        if not token and field.startswith(("EAAB", "EAAA")):
-            token = field
-            recognized.add(index)
-            continue
-        if not email and "@" in field and "." in field:
-            email = field
-            recognized.add(index)
-            continue
-        if not proxy and parse_proxy(field):
-            proxy = field
-            recognized.add(index)
-            continue
-        if not two_factor and index >= 2 and len(field) in (16, 32) and field.isalnum():
-            two_factor = field
-            recognized.add(index)
-
-    if not cookie:
-        return None
-
-    cookie_uid = re.search(
-        r"(?:^|;)\s*c_user\s*=\s*(\d+)", cookie_value(cookie)
-    )
-    if cookie_uid and (not uid or cookie_value(uid)):
-        uid = cookie_uid.group(1)
-    if prefix == "COOKIE" and not uid:
-        uid = cookie_uid.group(1) if cookie_uid else ""
-
-    if not uid:
-        uid = f"UID_{idx}"
-    if not password and len(fields) > 1 and prefix not in {"COOKIE", "TOKEN"}:
-        password = fields[1]
-
-    account_type = "COOKIE"
-    if prefix == "TOKEN" and not cookie:
-        account_type = "TOKEN"
-    unknown_fields = [
-        {"index": index, "value": field}
-        for index, field in enumerate(fields)
-        if field and index not in recognized
-    ]
-    return {
-        "type": account_type,
-        "raw_line": raw_value,
-        "source_line": normalized_line,
-        "fields": normalized_line.split("|"),
-        "unknown_fields": unknown_fields,
-        "uid": uid,
-        "name": uid,
-        "pwd": password,
-        "password": password,
-        "2fa": two_factor,
-        "cookie": cookie,
-        "token": token,
-        "email": email or (uid if "@" in uid else ""),
-        "proxy": proxy,
-        "data": cookie or token or normalized_line,
-        "locale": "AUTO",
-        "country": "",
-        "timezone": "",
-    }
 
 
 def serialize_account_line(account):
@@ -2334,7 +2255,10 @@ class MainToolApp:
             values = self.tree.item(item, "values")
             if values and str(values[1]).isdigit():
                 account_index = int(values[1])
-                resolved_proxies[account_index] = values[8] if len(values) > 8 else ""
+                state = self.account_states.get(account_index)
+                resolved_proxies[account_index] = (
+                    state.get("proxy", "") if state else ""
+                )
                 if values[0] == "[✔]":
                     checked_indexes.add(account_index)
 
