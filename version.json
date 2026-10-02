@@ -1,7 +1,7 @@
 {
-    "version":  "2.2.8",
-    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.2.8/client_app.exe",
-    "sha256":  "ED1866AF278D1898690ABFB5B03EFFFF5CB85D7AF4F0823E2961B16059D2AFE0",
-    "changelog":  "Tối ưu hóa chạy Cookie và chuẩn hóa dữ liệu UID/Pass",
+    "version":  "2.2.9",
+    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.2.9/client_app.exe",
+    "sha256":  "5FA60089B9F5E69E79214D09D70AE694BF57808E3EF1634DB53627B023043026",
+    "changelog":  "Tối ưu hóa chạy Cookie và chuẩn hóa dữ liệu",
     "mandatory":  false
 }
