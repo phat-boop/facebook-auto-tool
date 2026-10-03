@@ -1,6 +1,7 @@
 dist/ 
 build/ 
 *.spec 
+!/client_app.spec
 license.lic 
 settings.json 
 admin_key_gen.py 
@@ -11,3 +12,6 @@ dist_rebuild/
 .wrangler/
 license_worker/.wrangler/
 *.pyc
+.pytest_cache/
+.venv/
+.venv-build/

@@ -141,7 +141,8 @@ def test_effective_proxy_obeys_selected_mode(mode, expected, calls):
     app.tree.item.return_value = list(range(10))
     app.refresh_account_state_row = mock.Mock()
     callback()
-    assert app.tree.item.call_args.kwargs["values"][8] == expected
+    app.refresh_account_state_row.assert_called_once_with(1)
+    app.tree.item.assert_not_called()  # Proxy must not overwrite the new STATUS column.
 
 
 def test_proxy_resolution_isolated_between_accounts():

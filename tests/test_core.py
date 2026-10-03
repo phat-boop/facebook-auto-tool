@@ -347,6 +347,9 @@ class CoreHelpersTest(unittest.TestCase):
             async def is_visible(self):
                 return True
 
+            def nth(self, _index):
+                return self
+
         class FakePage:
             def __init__(self, final_url, login_error=None):
                 self.url = final_url  # Gán thẳng final_url ngay từ đầu để test nhận diện đúng URL bất thường (như /disabled/, /checkpoint/)
@@ -363,12 +366,19 @@ class CoreHelpersTest(unittest.TestCase):
                     return FakeLocator(on_click=lambda: setattr(self, "url", self.final_url))
                 if selector == 'input[name="email"], input[name="pass"], form[action*="login"]':
                     return FakeLocator(count=0)
+                if selector == client_app.FACEBOOK_2FA_INPUT_SELECTOR:
+                    return FakeLocator(count=0)
+                if selector == client_app.FACEBOOK_AUTHENTICATED_SELECTOR:
+                    return FakeLocator(count=1 if self.url == "https://www.facebook.com/" else 0)
                 return FakeLocator()
 
             async def wait_for_timeout(self, _milliseconds):
                 return None
 
         class FakeContext:
+            async def clear_cookies(self):
+                return None
+
             async def add_cookies(self, cookies):
                 self.loaded_cookies = cookies
 
@@ -1340,7 +1350,12 @@ class CheckpointRuntimeTests(unittest.IsolatedAsyncioTestCase):
         page.goto = mock.AsyncMock()
         empty = mock.Mock()
         empty.count = mock.AsyncMock(return_value=0)
-        page.locator.return_value = empty
+        authenticated = mock.Mock()
+        authenticated.count = mock.AsyncMock(return_value=1)
+        authenticated.nth.return_value.is_visible = mock.AsyncMock(return_value=True)
+        page.locator.side_effect = lambda selector: (
+            authenticated if selector == client_app.FACEBOOK_AUTHENTICATED_SELECTOR else empty
+        )
         context = mock.Mock()
         context.add_cookies = mock.AsyncMock()
         context.cookies = mock.AsyncMock(return_value=[{"name": "c_user", "value": "123456789"}])
@@ -1428,7 +1443,8 @@ class CheckpointRuntimeTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(self.run_worker(1, resources))
         await asyncio.wait_for(entered.wait(), timeout=7)
         resources[2].url = "https://www.facebook.com/checkpoint/"
-        await asyncio.wait_for(task, timeout=2)
+        # The watcher now starts after login and polls every 2.5 seconds.
+        await asyncio.wait_for(task, timeout=4)
         self.assertEqual(self.app.account_states.get(1)["status"], "CHECKPOINT")
         self.app.run_create_page.assert_not_awaited()
         resources[2].close.assert_awaited_once()
@@ -1548,6 +1564,10 @@ class RunLifecycleTests(unittest.TestCase):
 
     def test_completed_run_can_start_again(self):
         app = self.make_app()
+        app.txt_accounts = mock.Mock()
+        app.txt_accounts.get.return_value = "12345|Pass||c_user=12345;|"
+        app.account_states = client_app.AccountStateStore()
+        app.account_states.sync([{"stt": 1, "account_id": "12345"}])
         app.save_settings = mock.Mock()
         app.tree = mock.Mock()
         app.tree.get_children.return_value = []
@@ -1584,6 +1604,10 @@ class RunLifecycleTests(unittest.TestCase):
 
     def test_thread_start_failure_restores_buttons_and_can_retry(self):
         app = self.make_app()
+        app.txt_accounts = mock.Mock()
+        app.txt_accounts.get.return_value = "12345|Pass||c_user=12345;|"
+        app.account_states = client_app.AccountStateStore()
+        app.account_states.sync([{"stt": 1, "account_id": "12345"}])
         app.is_running = False
         app.save_settings = mock.Mock()
         app.tree = mock.Mock()

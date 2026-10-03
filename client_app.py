@@ -19,7 +19,7 @@ import time
 import tkinter as tk
 import urllib.request
 import urllib.error
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import math
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 from urllib.parse import quote, urlparse
@@ -28,7 +28,15 @@ import copy
 import ipaddress
 import unicodedata
 import uuid
-from account_history import AccountHistoryStore, safe_proxy_label
+from dataclasses import asdict, dataclass
+from collections.abc import Mapping
+from types import MappingProxyType
+from account_history import AccountHistoryStore, COUNTER_FIELDS, history_account_id, redact_history_text, safe_proxy_label
+from result_center import (
+    RESULT_COLUMNS, RESULT_HEADERS, RESULT_TABS, SUMMARY_KEYS, report_record,
+    result_matches, result_summary, result_values, write_result_csv, write_result_workbook,
+)
+from long_run import DuplicatePageResult, ModuleCircuitBreaker, SingleInstanceLock, app_circuit_breaker
 from cryptography.fernet import Fernet, InvalidToken
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 # ==================== CẤU HÌNH EVENT LOOP AN TOÀN CHO WINDOWS ====================
@@ -44,7 +52,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.3.0"
+CURRENT_VERSION = "2.3.1"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -146,22 +154,64 @@ ACCOUNT_STATUS_COLORS = {
 }
 ACCOUNT_STATUS_PALETTE = {
     "UNKNOWN": {"background": "#28323C", "foreground": "#E7EDF2"},
-    "CHECKING": {"background": "#594418", "foreground": "#FFF3C4"},
+    "CHECKING": {"background": "#153F60", "foreground": "#DCEFFF"},
     "LIVE": {"background": "#164535", "foreground": "#D5FBE5"},
-    "CHECKPOINT": {"background": "#49315D", "foreground": "#F0DEFF"},
+    "CHECKPOINT": {"background": "#594418", "foreground": "#FFF3C4"},
     "DIE": {"background": "#57252C", "foreground": "#FFE1E5"},
     "ERROR": {"background": "#623B1D", "foreground": "#FFE9CD"},
 }
 TASK_RESULTS = {"PENDING", "RUNNING", "SUCCESS", "FAILED", "ERROR", "SKIPPED"}
+RUN_STATUSES = {"RUNNING", "COMPLETED", "COMPLETED_WITH_ERRORS", "CANCELLED", "FAILED"}
+ACCOUNT_TABLE_PALETTE = {
+    "background": "#19232C", "foreground": "#E7EDF2",
+    "header_background": "#24323D", "header_foreground": "#F4FAFC",
+    "selected_background": "#285D69", "selected_foreground": "#FFFFFF",
+    "RUNNING": ACCOUNT_STATUS_PALETTE["CHECKING"],
+}
+ACCOUNT_MANAGEMENT_COLUMNS = (
+    "select", "id", "uid", "password", "2fa", "cookie", "token", "login_mode",
+    "status", "action", "page", "friend", "last_update",
+)
 
 
 def configure_account_table_style(style, *trees):
-    style.configure("Account.Treeview", rowheight=30, foreground="#E7EDF2", background="#19232C", fieldbackground="#19232C", font=("Segoe UI", 9))
-    style.map("Account.Treeview", background=[("selected", "#285D69")], foreground=[("selected", "#FFFFFF")])
+    palette = ACCOUNT_TABLE_PALETTE
+    if isinstance(style, ttk.Style) and "clam" in style.theme_names():
+        # Clone only table elements: native Windows borders can ignore dark backgrounds.
+        for element in ("Treeview.field", "Treeheading.cell", "Treeheading.border"):
+            name = "Account." + element
+            if name not in style.element_names():
+                style.element_create(name, "from", "clam", element)
+        style.layout("Account.Treeview", [("Account.Treeview.field", {"sticky": "nswe", "border": 1,
+            "children": [("Treeview.padding", {"sticky": "nswe", "children": [("Treeview.treearea", {"sticky": "nswe"})]})]})])
+        style.layout("Account.Treeview.Heading", [("Account.Treeheading.cell", {"sticky": "nswe"}),
+            ("Account.Treeheading.border", {"sticky": "nswe", "children": [("Treeheading.padding", {"sticky": "nswe", "children": [
+                ("Treeheading.image", {"side": "right", "sticky": ""}),
+                ("Treeheading.text", {"sticky": "we"})]})]})])
+    style.configure("Account.Treeview", rowheight=32, foreground=palette["foreground"], background=palette["background"], fieldbackground=palette["background"], font=("Segoe UI", 9))
+    style.configure("Account.Treeview.Heading", background=palette["header_background"], foreground=palette["header_foreground"], font=("Segoe UI", 9, "bold"), padding=(8, 7))
+    style.map("Account.Treeview", background=[("selected", palette["selected_background"])], foreground=[("selected", palette["selected_foreground"])])
     for tree in trees:
         tree.configure(style="Account.Treeview")
         for status, palette in ACCOUNT_STATUS_PALETTE.items():
             tree.tag_configure(status, **palette)
+
+
+def management_account_values(state, checked=True):
+    timestamp = str(state.get("last_update") or "")
+    try:
+        timestamp = datetime.fromisoformat(timestamp).astimezone().strftime("%Y-%m-%d %H:%M:%S") if timestamp else "-"
+    except ValueError:
+        timestamp = "-"
+    return (
+        "[✔]" if checked else "[ ]", state["stt"], state.get("uid", ""),
+        "********" if state.get("password") else "", "********" if state.get("2fa") else "",
+        "YES" if state.get("cookie") else "NO", "YES" if state.get("token") else "NO",
+        state.get("login_mode") or "-", state.get("status", "UNKNOWN"),
+        redact_history_text(state.get("current_action", ""), state),
+        f"{state.get('page_success_count', 0)} / {state.get('page_failed_count', 0)}",
+        f"{state.get('friend_success_count', 0)} / {state.get('friend_failed_count', 0)}", timestamp,
+    )
 
 
 def task_result_status(tasks):
@@ -270,6 +320,27 @@ def verify_page_job_evidence(url, evidence, job, owner_account_id):
 LOGIN_SUCCESS = "SUCCESS"
 LOGIN_INVALID = "INVALID"
 LOGIN_TECHNICAL_ERROR = "TECHNICAL_ERROR"
+LOGIN_CHECKPOINT = "CHECKPOINT"
+
+FACEBOOK_LOGIN_FORM_SELECTOR = 'input[name="email"], input[name="pass"], form[action*="login"]'
+FACEBOOK_AUTHENTICATED_SELECTOR = (
+    'a[href*="/logout.php"], form[action*="/logout"], '
+    '[data-testid="blue_bar_profile_link"], '
+    '[role="navigation"] a[href*="/messages"], [role="banner"] a[href*="/messages"], '
+    '[role="navigation"] a[href*="/settings"], [role="banner"] a[href*="/settings"], '
+    '[role="banner"] [role="button"][aria-label="Your profile" i], '
+    '[role="navigation"] [role="button"][aria-label="Your profile" i], '
+    '[role="banner"] [role="button"][aria-label="Trang cá nhân của bạn" i], '
+    '[role="navigation"] [role="button"][aria-label="Trang cá nhân của bạn" i]'
+)
+FACEBOOK_2FA_INPUT_SELECTOR = (
+    'input[id="approvals_code"], input[name="approvals_code"], input[autocomplete="one-time-code"]'
+)
+FACEBOOK_2FA_SUBMIT_SELECTOR = (
+    'button[id="checkpointSubmitButton"], '
+    'form:has(input[name="approvals_code"]) button[type="submit"], '
+    'form:has(input[autocomplete="one-time-code"]) button[type="submit"]'
+)
 
 
 class FacebookCheckpointStopped(asyncio.CancelledError):
@@ -390,66 +461,9 @@ def keep_unprocessed_account_lines(lines, processed_source_lines):
     ]
 
 
-def write_create_page_results_xlsx(file_path, categorized_records):
-    """Write LIVE/DIE account results to a styled Excel workbook."""
-    try:
-        from openpyxl import Workbook
-        from openpyxl.styles import Alignment, Font, PatternFill
-        from openpyxl.utils import get_column_letter
-    except ImportError as exc:
-        raise RuntimeError("Thiếu thư viện openpyxl để xuất Excel.") from exc
-
-    workbook = Workbook()
-    workbook.remove(workbook.active)
-    headers = (
-        "STT", "UID", "Mật khẩu (Pass)", "Trạng thái", "Page đã tạo",
-        "Chỉ tiêu Page", "Kết quả / Lý do", "Thời gian", "Dữ liệu gốc",
-    )
-    sheet_specs = (
-        ("LIVE", categorized_records.get("completed", []), "16A34A"),
-        ("DIE", categorized_records.get("die", []), "DC2626"),
-    )
-    result_key_by_sheet = {"LIVE": "completed", "DIE": "die"}
-    for sheet_name, records, accent in sheet_specs:
-        if result_key_by_sheet[sheet_name] not in categorized_records:
-            continue
-        sheet = workbook.create_sheet(sheet_name)
-        sheet.append(headers)
-        for record in records:
-            sheet.append((
-                record.get("stt", ""),
-                record.get("uid") or record.get("account_id", ""),
-                record.get("password") or record.get("pwd", ""),
-                sheet_name,
-                int(record.get("created_count") or 0),
-                int(record.get("target_count") or 0),
-                (
-                    "Đã tạo đủ Page"
-                    if sheet_name == "LIVE"
-                    else record.get("reason") or "Tài khoản không còn đăng nhập hợp lệ"
-                ),
-                record.get("time", ""),
-                record.get("raw_line", ""),
-            ))
-
-        header_fill = PatternFill("solid", fgColor=accent)
-        for cell in sheet[1]:
-            cell.fill = header_fill
-            cell.font = Font(color="FFFFFF", bold=True)
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-        for row in sheet.iter_rows(min_row=2):
-            for cell in row:
-                cell.alignment = Alignment(vertical="top", wrap_text=True)
-        sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = f"A1:H{max(1, sheet.max_row)}"
-        sheet.row_dimensions[1].height = 26
-        widths = (8, 24, 12, 14, 14, 48, 22, 58)
-        for column_index, width in enumerate(widths, 1):
-            sheet.column_dimensions[get_column_letter(column_index)].width = width
-
-    if not workbook.sheetnames:
-        raise ValueError("Không có danh sách LIVE/DIE để xuất Excel.")
-    workbook.save(file_path)
+def write_create_page_results_xlsx(file_path, categorized_records, result_rows=None):
+    """Preserve the A-I account report and optionally include the realtime result schema."""
+    write_result_workbook(file_path, categorized_records, result_rows)
 
 
 class AccountStateStore:
@@ -458,18 +472,23 @@ class AccountStateStore:
         self._states = {}
         self.history = history
 
-    def _persist(self, state, module="ACCOUNT", event_type="STATE", message=""):
+    def _persist(self, state, module="ACCOUNT", event_type="STATE", message="", task_event=None):
+        state["last_update"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         if self.history is not None:
-            self.history.save(state, module, event_type, message)
+            self.history.save(state, module, event_type, message, task_event=task_event)
 
     def sync(self, accounts):
         with self._lock:
+            previous = {history_account_id(state): state for state in self._states.values()}
             active_indexes = set()
             for account in accounts:
                 index = int(account["stt"])
                 active_indexes.add(index)
                 account_id = str(account.get("account_id") or f"Tài khoản {index}")
                 account_payload = {
+                    "account_record": account.get("account_record"),
+                    "canonical_line": str(account.get("canonical_line") or ""),
+                    "import_fields": list(account.get("import_fields") or []),
                     "raw_line": str(account.get("raw_line") or ""),
                     "source_line": str(account.get("source_line") or ""),
                     "name": account_display_name(account, index),
@@ -485,8 +504,8 @@ class AccountStateStore:
                     "proxy": str(account.get("proxy") or ""),
                     "type": str(account.get("type") or ""),
                 }
-                existing = self._states.get(index)
-                if existing is None or existing["account_id"] != account_id:
+                existing = previous.get(history_account_id({**account_payload, "account_id": account_id}))
+                if existing is None:
                     self._states[index] = {
                         "stt": index,
                         "account_id": account_id,
@@ -502,6 +521,10 @@ class AccountStateStore:
                         "last_task_result": "PENDING",
                         "page_wait_remaining": None,
                         "next_page_at": "",
+                        "last_error": "",
+                        "last_update": "",
+                        "_counter_events": set(),
+                        **{field: 0 for field in COUNTER_FIELDS},
                         **account_payload,
                     }
                     saved = self.history.load(self._states[index]) if self.history else None
@@ -510,8 +533,16 @@ class AccountStateStore:
                             status=saved["last_status"], current_action=saved["last_action"],
                             tasks=saved["tasks"], last_task_result=saved["last_task_result"],
                             history_logs=saved["logs"],
+                            last_error=saved.get("last_error") or "",
+                            last_update=saved.get("last_update") or saved.get("last_seen_at") or "",
+                            **{field: int(saved.get(field) or 0) for field in COUNTER_FIELDS},
                         )
+                        if saved.get("login_mode"):
+                            self._states[index]["login_mode"] = saved["login_mode"]
                 else:
+                    self._states[index] = existing
+                    existing["stt"] = index
+                    existing["account_id"] = account_id
                     existing["country"] = str(account.get("country") or "")
                     existing["locale"] = normalize_account_locale(account.get("locale"))
                     existing["timezone"] = normalize_account_timezone(account.get("timezone"))
@@ -531,6 +562,7 @@ class AccountStateStore:
             if state is None:
                 return None
             snapshot = dict(state)
+            snapshot.pop("_counter_events", None)
             snapshot["logs"] = list(state["logs"])
             snapshot["history_logs"] = list(state.get("history_logs", []))
             snapshot["tasks"] = copy.deepcopy(state.get("tasks", {}))
@@ -557,6 +589,7 @@ class AccountStateStore:
                 state["tasks"] = {}
                 state["friend_attempts"] = set()
                 state["last_task_result"] = "PENDING"
+                state["_counter_events"] = set()
             if state.get("checkpoint_stopped") and status != "CHECKPOINT":
                 return self.get(index)
             if status is not None:
@@ -568,6 +601,8 @@ class AccountStateStore:
                     state["checkpoint_stopped"] = True
             if current_action is not None:
                 state["current_action"] = str(current_action)
+            if status in {"DIE", "ERROR", "CHECKPOINT"}:
+                state["last_error"] = state["current_action"]
             self._persist(state)
             return self.get(index)
 
@@ -576,6 +611,15 @@ class AccountStateStore:
             state = self._states[int(index)]
             state["proxy"] = state["effective_proxy"] = str(proxy or "")
             self._persist(state, event_type="PROXY", message=safe_proxy_label(proxy))
+
+    def set_login_mode(self, index, mode):
+        if mode not in {"COOKIE", "FALLBACK_LOGIN"}:
+            raise ValueError("Invalid login mode.")
+        with self._lock:
+            state = self._states.get(int(index))
+            if state is not None:
+                state["login_mode"] = mode
+                self._persist(state, event_type="LOGIN_MODE", message=f"Login mode: {mode}")
 
     def mark_friend_attempt(self, index, target):
         with self._lock:
@@ -603,8 +647,11 @@ class AccountStateStore:
             for module, task in state.get("tasks", {}).items():
                 if task["status"] in {"PENDING", "RUNNING"}:
                     task.update(status=status, detail=reason)
+                    if status == "ERROR":
+                        state["last_error"] = reason
+                    self._count_task_result(state, module, status, reason)
                     state["last_task_result"] = task_result_status(state["tasks"])
-                    self._persist(state, module, "TASK", reason)
+                    self._persist(state, module, "TASK", reason, {"status": status, "detail": reason})
 
     def record_task(self, index, module, status, detail="", outcome=None, preserve_outcomes=False):
         if status not in TASK_RESULTS:
@@ -612,7 +659,10 @@ class AccountStateStore:
         with self._lock:
             state = self._states.get(int(index))
             if state is None or state.get("checkpoint_stopped"):
-                return
+                return False
+            state = dict(state)
+            state["tasks"] = copy.deepcopy(state.get("tasks", {}))
+            state["_counter_events"] = set(state.get("_counter_events", set()))
             task = state.setdefault("tasks", {}).setdefault(module, {"status": "PENDING", "detail": "", "outcomes": []})
             if status == "RUNNING":
                 if not preserve_outcomes:
@@ -625,9 +675,48 @@ class AccountStateStore:
                 if (task["status"] not in {"FAILED", "ERROR"} or status == "ERROR") and not (status == "SKIPPED" and task["status"] == "SUCCESS"):
                     task.update(status=status, detail=detail)
             state["last_task_result"] = task_result_status(state["tasks"])
+            self._count_task_result(state, module, status, detail, outcome)
+            if status in {"FAILED", "ERROR"}:
+                state["last_error"] = str(detail)
             if task["status"] in {"FAILED", "ERROR"}:
                 state["current_action"] = f"{module} {task['status']}: {task['detail']}"
-            self._persist(state, module, "TASK", detail)
+            self._persist(state, module, "TASK", detail, {
+                "status": status, "detail": detail,
+                "outcomes": [outcome] if outcome is not None else [],
+            })
+            self._states[int(index)] = state
+            return True
+
+    def _count_task_result(self, state, module, status, detail, outcome=None):
+        prefix = {"CREATE_PAGE": "page", "FRIEND_REQUEST": "friend"}.get(module)
+        if prefix is None or status not in {"SUCCESS", "FAILED", "ERROR"}:
+            return
+        # Outcome identity avoids counting a repeated notification as another result.
+        identity = None
+        if isinstance(outcome, dict):
+            identity = (outcome.get("page_job_id") or outcome.get("page_id")
+                        or outcome.get("page_url") or outcome.get("target"))
+        if not identity:
+            identity = json.dumps(outcome, sort_keys=True, default=str) if outcome is not None else str(detail)
+        key = (module, "SUCCESS" if status == "SUCCESS" else "FAILED", identity)
+        counted = state.setdefault("_counter_events", set())
+        if key not in counted:
+            counted.add(key)
+            field = f"{prefix}_{'success' if status == 'SUCCESS' else 'failed'}_count"
+            state[field] = state.get(field, 0) + 1
+
+    def run_result(self, indexes=None):
+        with self._lock:
+            selected = set(indexes) if indexes is not None else set(self._states)
+            for index, state in self._states.items():
+                if index not in selected:
+                    continue
+                if state["status"] in {"DIE", "ERROR", "CHECKPOINT", "CHECKING"}:
+                    return "COMPLETED_WITH_ERRORS"
+                if any(task["status"] in {"FAILED", "ERROR", "RUNNING", "PENDING"}
+                       for task in state.get("tasks", {}).values()):
+                    return "COMPLETED_WITH_ERRORS"
+            return "COMPLETED"
 
     def task_summary(self, indexes=None):
         with self._lock:
@@ -947,6 +1036,7 @@ def build_create_page_result(
     account_index=None,
     proxy="",
     flow_state="",
+    structural_failure="",
 ):
     return {
         "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -964,6 +1054,7 @@ def build_create_page_result(
         "technical_error": technical_error,
         "retry_count": int(retry_count),
         "flow_state": str(flow_state or status).upper(),
+        "structural_failure": structural_failure,
     }
 
 
@@ -1162,16 +1253,71 @@ async def retry_create_page_operation(operation, max_attempts=3, base_delay=1.0)
     raise last_error
 
 
+@dataclass(frozen=True, repr=False)
+class RunConfig(Mapping):
+    """Detached, recursively immutable values captured on the UI thread."""
+    data: Mapping
+
+    def __post_init__(self):
+        def freeze(value):
+            if isinstance(value, Mapping):
+                return MappingProxyType({key: freeze(item) for key, item in value.items()})
+            if isinstance(value, (list, tuple)):
+                return tuple(freeze(item) for item in value)
+            if isinstance(value, (set, frozenset)):
+                return frozenset(freeze(item) for item in value)
+            return value
+        object.__setattr__(self, "data", freeze(self.data))
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+    def __iter__(self):
+        return iter(self.data)
+
+    def __len__(self):
+        return len(self.data)
+
+
+def consume_cleanup_result(task):
+    if not task.cancelled():
+        task.exception()
+
+
 async def close_browser_resources(context=None, browser=None, page=None, close_timeout=5):
-    """Close isolated resources on success, failure, or cancellation."""
-    errors = []
-    for resource in (page, context, browser):
-        if resource is None:
-            continue
+    """Bound each close independently; cancellation cannot skip remaining resources."""
+    async def close_all():
+        errors = []
+        for resource in (page, context, browser):
+            if resource is None:
+                continue
+            try:
+                task = asyncio.ensure_future(resource.close())
+                done, _ = await asyncio.wait({task}, timeout=close_timeout)
+                if not done:
+                    task.cancel()
+                    task.add_done_callback(consume_cleanup_result)
+                    errors.append(TimeoutError("Browser resource close timed out"))
+                    continue
+                task.result()
+            except asyncio.CancelledError:
+                errors.append(RuntimeError("Browser resource close was cancelled"))
+            except Exception as exc:
+                errors.append(exc)
+        return errors
+
+    cleanup = asyncio.create_task(close_all())
+    cancelled = False
+    while True:
         try:
-            await asyncio.wait_for(resource.close(), timeout=close_timeout)
-        except Exception as exc:
-            errors.append(exc)
+            errors = await asyncio.shield(cleanup)
+            break
+        except asyncio.CancelledError:
+            if cleanup.cancelled():
+                raise
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError()
     return errors
 
 
@@ -1873,8 +2019,65 @@ def send_telegram_alert(bot_token: str, chat_id: str, message: str):
     except Exception:
         pass
 
-def parse_any_account_line(raw_line: str, idx: int = 1):
-    """Parse account lines flexibly, auto-detecting UID, Password, Cookie, Token, and trimming extra trailing metadata."""
+@dataclass(frozen=True, repr=False)
+class AccountRecord:
+    uid: str
+    password: str
+    twofa: str
+    cookie: str
+    token: str
+    raw_line: str
+    proxy: str = ""
+    email: str = ""
+    locale: str = "AUTO"
+    country: str = ""
+    timezone: str = ""
+    import_fields: tuple = ()
+
+    def __post_init__(self):
+        if not self.uid.strip() or not normalize_cookie_input(self.cookie):
+            raise ValueError("Account requires a UID and a recognized cookie.")
+        if any("|" in value or "\n" in value or "\r" in value
+               for value in (self.uid, self.password, self.twofa, self.cookie, self.token)):
+            raise ValueError("Account fields cannot contain the canonical separator or newlines.")
+
+    @property
+    def canonical_line(self):
+        return "|".join((self.uid, self.password, self.twofa, self.cookie, self.token))
+
+    def to_account_dict(self):
+        return {
+            "account_record": self, "canonical_line": self.canonical_line,
+            "raw_line": self.raw_line, "source_line": self.canonical_line,
+            "fields": self.canonical_line.split("|"),
+            "import_fields": list(self.import_fields), "unknown_fields": [],
+            "type": "COOKIE", "uid": self.uid, "name": self.uid,
+            "password": self.password, "pwd": self.password, "2fa": self.twofa,
+            "cookie": self.cookie, "data": self.cookie, "token": self.token,
+            "proxy": self.proxy, "email": self.email, "locale": self.locale,
+            "country": self.country, "timezone": self.timezone,
+        }
+
+
+def parse_canonical_account_line(line):
+    """Read exactly five positional slots; never infer password, 2FA or token."""
+    raw = str(line or "")
+    fields = normalize_account_source_line(raw).split("|")
+    if (len(fields) != 5 or not fields[0].strip()
+            or fields[0].upper() in {"FACEBOOK", "COOKIE", "TOKEN"}):
+        return None
+    cookie = normalize_cookie_input(fields[3])
+    if not cookie:
+        return None
+    try:
+        return AccountRecord(fields[0].strip(), fields[1], fields[2], cookie,
+                             fields[4], raw, import_fields=tuple(fields))
+    except ValueError:
+        return None
+
+
+def parse_legacy_account_line(raw_line: str, idx: int = 1):
+    """Compatibility detection for IMPORT only; callers normalize the result."""
     raw_value = str(raw_line or "").rstrip("\r\n")
     normalized_line = re.sub(r"^\s*\d+[\.\-\s]+", "", raw_value).strip()
     if not normalized_line or normalized_line.startswith("#"):
@@ -1898,8 +2101,41 @@ def parse_any_account_line(raw_line: str, idx: int = 1):
         if prefix == "FACEBOOK":
             uid = fields[1] if len(fields) > 1 else ""
             password = fields[2] if len(fields) > 2 else ""
+            start_index = 3
+            if len(fields) > 4 and normalize_cookie_input(fields[4]):
+                two_factor = fields[3]
+                start_index = 4
         elif prefix == "TOKEN":
             token = fields[1] if len(fields) > 1 else ""
+
+    # Known UID/password layouts take precedence over length-based detection.
+    if prefix not in {"FACEBOOK", "COOKIE", "TOKEN"} and len(fields) >= 3:
+        cookie_indexes = [i for i, field in enumerate(fields)
+                          if i >= 2 and normalize_cookie_input(field)]
+        if fields[0].isdigit() and len(fields[0]) >= 5 and cookie_indexes and cookie_indexes[0] >= 2:
+            uid, password = fields[0], normalized_line.split("|")[1]
+            start_index = 2
+            if (cookie_indexes[0] >= 3 and not fields[2].startswith(("EAAB", "EAAA"))
+                    and "@" not in fields[2] and not parse_proxy(fields[2])):
+                two_factor = fields[2]
+                start_index = 3
+
+    # Preserve recognized tokens before considering an opaque positional token.
+    if not token:
+        token = next((field for field in fields[start_index:]
+                      if not normalize_cookie_input(field) and (
+                          field.startswith(("EAAB", "EAAA"))
+                          or len(field) > 50 and "." in field and "@" not in field)), "")
+    if not token and uid:
+        cookie_index = next((i for i in range(start_index, len(fields))
+                             if normalize_cookie_input(fields[i])), -1)
+        positional_token = cookie_index in {2, 3} or (
+            cookie_index == 5 and not fields[3] and not fields[4]
+        ) or (prefix == "FACEBOOK" and cookie_index == 4)
+        if positional_token and cookie_index + 1 < len(fields):
+            candidate = fields[cookie_index + 1]
+            if candidate and "@" not in candidate and not parse_proxy(candidate):
+                token = candidate
 
     # Tự động quét và phân loại từng trường dữ liệu dựa vào đặc thù nhận diện
     for index, field in enumerate(fields):
@@ -1908,6 +2144,8 @@ def parse_any_account_line(raw_line: str, idx: int = 1):
         norm_cookie = normalize_cookie_input(field)
         if norm_cookie and not cookie:
             cookie = field
+            continue
+        if token and field == token:
             continue
         if not token and (field.startswith(("EAAB", "EAAA")) or len(field) > 50 and "." in field and not "@" in field):
             token = field
@@ -1965,9 +2203,48 @@ def parse_any_account_line(raw_line: str, idx: int = 1):
 
 
 
+def import_account_record(raw_line, idx=1):
+    """Import canonical or supported legacy data, retaining original provenance."""
+    canonical = parse_canonical_account_line(raw_line)
+    if canonical and not parse_proxy(canonical.token):
+        return canonical
+    parsed = parse_legacy_account_line(raw_line, idx)
+    if not parsed:
+        return None
+    try:
+        return AccountRecord(
+            parsed["uid"], parsed["password"], parsed["2fa"],
+            normalize_cookie_input(parsed["cookie"]), parsed["token"], str(raw_line),
+            proxy=parsed["proxy"], email=parsed["email"],
+            import_fields=tuple(normalize_account_source_line(raw_line).split("|")),
+        )
+    except ValueError:
+        return None
+
+
+def parse_any_account_line(raw_line: str, idx: int = 1):
+    """Compatibility entry point for import; returns canonical account data."""
+    record = import_account_record(raw_line, idx)
+    return record.to_account_dict() if record else None
+
+
+def runtime_account_record(account):
+    """Accept only a normalized model or its canonical serialization at runtime."""
+    if isinstance(account, AccountRecord):
+        return account
+    account = account or {}
+    record = account.get("account_record")
+    if isinstance(record, AccountRecord):
+        return record
+    return parse_canonical_account_line(account.get("canonical_line", ""))
+
+
 def serialize_account_line(account):
-    """Return the exact user-provided account line for lossless UI refresh/export."""
-    return str((account or {}).get("raw_line", ""))
+    """UI serialization is canonical; original input remains in record.raw_line."""
+    record = runtime_account_record(account)
+    if record is None:
+        raise ValueError("Account must be normalized before serialization.")
+    return record.canonical_line
 
 
 def serialize_account_lines(accounts):
@@ -2126,26 +2403,18 @@ class ImportAccountDialog(tk.Toplevel):
         btn_close.pack(side="right", padx=5)
 
     def process_import(self):
-        raw_data = self.txt_input.get("1.0", "end").strip()
-        if not raw_data:
+        raw_data = self.txt_input.get("1.0", "end")
+        if not raw_data.strip():
             messagebox.showwarning("Thông báo", "Vui lòng nhập ít nhất 1 dòng dữ liệu!", parent=self)
             return
 
-        lines = [l.strip() for l in raw_data.splitlines() if l.strip()]
+        lines = [line for line in raw_data.splitlines() if line.strip()]
         parsed_accounts = []
 
         for idx, line in enumerate(lines, 1):
             parsed = parse_any_account_line(line, idx)
             if parsed:
-                parsed_accounts.append({
-                    "name": parsed["name"],
-                    "uid": parsed["uid"],
-                    "pwd": parsed["pwd"],
-                    "2fa": parsed["2fa"],
-                    "cookie": parsed["cookie"],
-                    "proxy": parsed["proxy"] or "Không dùng",
-                    "raw": line,
-                })
+                parsed_accounts.append(parsed)
 
         self.on_import_callback(parsed_accounts)
         messagebox.showinfo("Thành công", f"Đã nạp thành công {len(parsed_accounts)} tài khoản vào bảng!", parent=self)
@@ -2182,14 +2451,27 @@ class MainToolApp:
         self.is_running = False
         self.stop_requested = False
         self.run_error = None
+        self.run_status = None
+        self.run_account_indexes = None
         self.run_thread = None
         self.worker_loop = None
         self.worker_tasks = []
         self.proxy_api_lock = None
         self.run_config = {}
+        self._account_import_records = {}
         self.ui_queue = queue.Queue()
         self.close_requested = False
-        self.account_states = AccountStateStore(AccountHistoryStore(output_path("account_history.db")))
+        history = AccountHistoryStore(output_path("account_history.db"))
+        if not history.page_identity_bootstrapped():
+            identities = set()
+            csv_path = output_path("created_pages.csv")
+            if os.path.exists(csv_path):
+                with open(csv_path, newline="", encoding="utf-8-sig") as stream:
+                    for record in csv.DictReader(stream):
+                        identities.update(page_identity_keys(record.get("page_url"), record.get("page_id")))
+            history.bootstrap_page_identities(identities)
+        self.account_states = AccountStateStore(history)
+        self.module_breaker = ModuleCircuitBreaker()
         self.account_log_context = contextvars.ContextVar("account_log_context", default=None)
         self.global_logs = []
         self.global_log_lock = threading.RLock()
@@ -2271,7 +2553,7 @@ class MainToolApp:
             for index in self.account_states.indexes()
         }
 
-        return {
+        values = {
             "accounts": self.txt_accounts.get("1.0", "end").strip(),
             "proxies": self.txt_proxies.get("1.0", "end").strip(),
             "targets": self.txt_targets.get("1.0", "end").strip(),
@@ -2312,6 +2594,28 @@ class MainToolApp:
                 "cancel_old": bool(self.chk_cancel_old.get()),
             },
         }
+        values["auto_headless"] = values["threads"] > 12 and not values["headless"]
+        if values["auto_headless"]:
+            values["headless"] = True
+        # Bind proxies once before starting workers; preserve per-account API failures.
+        selected = self.parse_range_string(values["selected_indexes"]) or checked_indexes
+        proxy_errors = {}
+        for index, account in parsed_accounts.items():
+            if selected and index not in selected:
+                continue
+            proxy = resolve_account_proxy(account.get("proxy"), resolved_proxies, index)
+            if values["proxy_mode"] == "rotating_api" and values["proxy_api"]:
+                try:
+                    proxy = fetch_proxy_from_api(values["proxy_api"])
+                    if not proxy or not parse_proxy(proxy):
+                        raise ValueError("API proxy không trả về proxy hợp lệ.")
+                except Exception as exc:
+                    proxy_errors[index] = f"{type(exc).__name__}: {exc}"
+                    proxy = ""
+            resolved_proxies[index] = proxy
+        values["proxy_errors"] = proxy_errors
+        values["proxy_snapshot_complete"] = True
+        return RunConfig(values)
 
     def _build_layout(self):
         self.root.configure(bg="#0B1117")
@@ -2695,19 +2999,23 @@ class MainToolApp:
         self.lbl_batch_info.pack(side="left", expand=True)
         tk.Button(f_batch_nav, text="Đợt sau ▶", font=("Segoe UI", 7, "bold"), bg="#1E293B", fg="#E2E8F0", relief="flat", cursor="hand2", command=lambda: self.change_batch(1)).pack(side="right")
 
-        state_columns = ("stt", "account", "status", "task", "next_page", "action")
+        state_columns = ("stt", "account", "status", "task", "next_page", "pages", "friends", "action")
         self.account_state_tree = ttk.Treeview(card_reg, columns=state_columns, show="headings", selectmode="browse", height=5)
         self.account_state_tree.heading("stt", text="STT")
         self.account_state_tree.heading("account", text="Tài khoản")
         self.account_state_tree.heading("status", text="Trạng thái")
         self.account_state_tree.heading("task", text="Kết quả tác vụ")
         self.account_state_tree.heading("next_page", text="Page tiếp / Còn lại")
+        self.account_state_tree.heading("pages", text="Page OK / Lỗi")
+        self.account_state_tree.heading("friends", text="Bạn OK / Lỗi")
         self.account_state_tree.heading("action", text="Tác vụ hiện tại")
         self.account_state_tree.column("stt", width=40, anchor="center", stretch=False)
         self.account_state_tree.column("account", width=120, anchor="w")
         self.account_state_tree.column("status", width=105, anchor="center", stretch=False)
         self.account_state_tree.column("task", width=100, anchor="center", stretch=False)
         self.account_state_tree.column("next_page", width=155, anchor="center", stretch=False)
+        self.account_state_tree.column("pages", width=105, anchor="center", stretch=False)
+        self.account_state_tree.column("friends", width=105, anchor="center", stretch=False)
         self.account_state_tree.column("action", width=190, anchor="w")
         configure_account_table_style(self.style, self.account_state_tree)
         self.account_state_tree.pack(fill="both", expand=True)
@@ -2938,44 +3246,35 @@ class MainToolApp:
         frame_tree = tk.Frame(paned_data, bg="#0A0E1A")
         paned_data.add(frame_tree, minsize=200)
 
-        columns = ("select", "id", "uid", "password", "2fa", "status", "action")
+        columns = ACCOUNT_MANAGEMENT_COLUMNS
         self.tree = ttk.Treeview(frame_tree, columns=columns, show="headings", selectmode="extended")
         self.tree.tag_configure("empty", foreground="#8EA3B5")
         configure_account_table_style(self.style, self.tree)
+        self.tree.tag_configure("RUNNING", **ACCOUNT_TABLE_PALETTE["RUNNING"])
 
-        self.tree.heading("select", text="[✔]")
-        self.tree.heading("id", text="STT")
-        self.tree.heading("uid", text="UID")
-        self.tree.heading("password", text="PASSWORD")
-        self.tree.heading("2fa", text="2FA")
-        self.tree.heading("status", text="STATUS")
-        self.tree.heading("action", text="ACTION")
-
-        self.tree.column("select", width=45, anchor="center")
-        self.tree.column("id", width=45, anchor="center")
-        self.tree.column("uid", width=130, anchor="center")
-        self.tree.column("password", width=120, anchor="center")
-        self.tree.column("2fa", width=100, anchor="center")
-        self.tree.column("status", width=110, anchor="center")
-        self.tree.column("action", width=250, anchor="w")
+        headings = ("[✔]", "STT", "UID", "PASSWORD", "2FA", "COOKIE", "TOKEN", "LOGIN MODE",
+                    "STATUS", "ACTION", "PAGE", "FRIEND", "LAST UPDATE")
+        widths = (45, 45, 140, 110, 95, 85, 85, 150, 115, 300, 95, 95, 170)
+        for column, title, width in zip(columns, headings, widths):
+            self.tree.heading(column, text=title)
+            self.tree.column(column, width=width, minwidth=width, anchor="w" if column == "action" else "center", stretch=column == "action")
 
         # Context Menu
         self.tree_menu = tk.Menu(self.tree, tearoff=0, bg="#131C2E", fg="#FFFFFF")
-        self.tree_menu.add_command(label="Copy UID", command=lambda: self.copy_tree_data("uid"))
-        self.tree_menu.add_command(label="Copy Password", command=lambda: self.copy_tree_data("password"))
-        self.tree_menu.add_command(label="Copy UID | Password", command=lambda: self.copy_tree_data("uid|pass"))
-        self.tree_menu.add_command(label="Copy UID | Password | 2FA", command=lambda: self.copy_tree_data("uid|pass|2fa"))
+        self._management_menu_account = None
+        for label, mode in (
+            ("Copy UID", "uid"), ("Copy Password", "password"), ("Copy 2FA", "2fa"),
+            ("Copy Cookie", "cookie"), ("Copy Token", "token"),
+            ("Copy UID|Password", "uid|pass"), ("Copy UID|Password|2FA", "uid|pass|2fa"),
+            ("Copy canonical line", "canonical"), ("Copy raw line", "raw"),
+        ):
+            self.tree_menu.add_command(label=label, command=lambda mode=mode: self.copy_tree_data(mode, self._management_menu_account))
         self.tree_menu.add_separator()
-        self.tree_menu.add_command(label="Copy dòng gốc", command=lambda: self.copy_tree_data("raw"))
+        self.tree_menu.add_command(label="Mở Chrome kiểm tra", command=lambda: self.open_account_inspector(self._management_menu_account))
+        self.tree_menu.add_command(label="Xem log", command=lambda: self.show_management_account_logs(self._management_menu_account))
+        self.tree_menu.add_command(label="Xem lịch sử", command=lambda: self.show_management_account_logs(self._management_menu_account, history=True))
 
-        def show_context_menu(event):
-            item = self.tree.identify_row(event.y)
-            if item:
-                if item not in self.tree.selection():
-                    self.tree.selection_set(item)
-                self.tree_menu.tk_popup(event.x_root, event.y_root)
-
-        self.tree.bind("<Button-3>", show_context_menu)
+        self.tree.bind("<Button-3>", self.show_account_context_menu)
         self.tree.bind("<Control-c>", lambda e: self.copy_tree_data("raw"))
 
         def toggle_row_check(event):
@@ -3013,206 +3312,330 @@ class MainToolApp:
         self.lbl_footer_status = tk.Label(self.tab_data, text="Tổng số nick: 0 | Sẵn sàng hoạt động.", font=("Segoe UI", 9), fg="#94A3B8", bg="#131C2E", anchor="w", padx=10, pady=4)
         self.lbl_footer_status.pack(fill="x", side="bottom")
 
-    def copy_tree_data(self, mode):
-        selected = self.tree.selection()
-        if not selected:
+    def management_account_for_item(self, item):
+        values = self.tree.item(item, "values")
+        if len(values) < 3 or not str(values[1]).isdigit():
+            return None
+        state = self.account_states.get(int(values[1]))
+        return state if state and str(state.get("uid", "")) == str(values[2]) else None
+
+    def show_account_context_menu(self, event):
+        item = self.tree.identify_row(event.y)
+        self._management_menu_account = self.management_account_for_item(item) if item else None
+        if self._management_menu_account is None:
             return
+        self.tree.selection_set(item)
+        try:
+            self.tree_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.tree_menu.grab_release()
+
+    def copy_tree_data(self, mode, account=None):
+        accounts = [account] if account is not None else [
+            self.management_account_for_item(item) for item in self.tree.selection()
+        ]
         result = []
-        for item in selected:
-            vals = self.tree.item(item, "values")
-            stt = int(vals[1])
-            parsed = self.account_states.get(stt)
+        for parsed in accounts:
             if not parsed: continue
             
             if mode == "uid":
                 result.append(parsed["uid"])
             elif mode == "password":
                 result.append(parsed["password"])
+            elif mode in {"2fa", "cookie", "token"}:
+                result.append(parsed.get(mode, ""))
             elif mode == "uid|pass":
                 result.append(f"{parsed['uid']}|{parsed['password']}")
             elif mode == "uid|pass|2fa":
                 result.append(f"{parsed['uid']}|{parsed['password']}|{parsed['2fa']}")
             elif mode == "raw":
                 result.append(parsed["raw_line"])
+            elif mode == "canonical":
+                record = runtime_account_record(parsed)
+                if record is not None:
+                    result.append(record.canonical_line)
                 
         if result:
             self.root.clipboard_clear()
             self.root.clipboard_append("\n".join(result))
             self.log(f"[+] Đã copy {len(result)} dòng (Chế độ: {mode})")
+
+    def show_management_account_logs(self, account, history=False):
+        if account is None:
+            return
+        key = history_account_id(account)
+        current = next((self.account_states.get(index) for index in self.account_states.indexes()
+                        if history_account_id(self.account_states.get(index)) == key), account)
+        if history:
+            saved = self.account_states.history.load(account) if self.account_states.history else None
+            lines = saved["logs"] if saved else current.get("history_logs", [])
+        else:
+            lines = current.get("logs", [])
+        palette = ACCOUNT_TABLE_PALETTE
+        window = tk.Toplevel(self.root)
+        window.title(f"{'Lịch sử' if history else 'Nhật ký'} - {account.get('uid', '')}")
+        window.geometry("900x520")
+        text = scrolledtext.ScrolledText(window, wrap="word", bg=palette["background"], fg=palette["foreground"],
+                                        insertbackground=palette["foreground"], font=("Consolas", 10))
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", "\n".join(redact_history_text(line, account) for line in lines))
+        text.configure(state="disabled")
+
+    def refresh_management_account_row(self, index):
+        if not hasattr(self, "tree") or not self.tree.exists(str(index)):
+            return
+        state = self.account_states.get(index)
+        if state is None:
+            return
+        previous = self.tree.item(str(index), "values")
+        tag = state["status"]
+        if tag == "LIVE" and task_result_status(state.get("tasks", {})) == "RUNNING":
+            tag = "RUNNING"
+        self.tree.item(str(index), values=management_account_values(state, bool(previous and previous[0] == "[✔]")), tags=(tag,))
+
     def open_create_page_results_dialog(self):
-        window = self.create_page_results_window
+        window = getattr(self, "create_page_results_window", None)
         if window is not None and window.winfo_exists():
             window.deiconify()
             window.lift()
             self.refresh_create_page_results_dialog()
             return
-
+        palette = ACCOUNT_TABLE_PALETTE
         window = tk.Toplevel(self.root)
         self.create_page_results_window = window
-        window.title("Kết quả tạo Page theo tài khoản")
-        window.geometry("1080x620")
-        window.minsize(820, 480)
-        window.configure(bg="#0B1117")
-
-        header = tk.Frame(window, bg="#101820", padx=16, pady=12)
+        window.title("Create Page - Result Center")
+        width = max(960, min(1500, self.root.winfo_screenwidth() - 80))
+        height = max(500, min(760, self.root.winfo_screenheight() - 100))
+        window.geometry(f"{width}x{height}")
+        window.minsize(960, 500)
+        window.configure(bg=palette["background"])
+        header = tk.Frame(window, bg=palette["header_background"], padx=14, pady=12)
         header.pack(fill="x")
-        header_text = tk.Frame(header, bg="#101820")
-        header_text.pack(side="left")
-        tk.Label(
-            header_text, text="KẾT QUẢ CREATE PAGE", font=("Segoe UI", 13, "bold"),
-            fg="#F8FAFC", bg="#101820",
-        ).pack(anchor="w")
-        tk.Label(
-            header_text,
-            text="Theo dõi tài khoản đã hoàn tất và tài khoản ngừng do mất phiên đăng nhập",
-            font=("Segoe UI", 8), fg="#94A3B8", bg="#101820",
-        ).pack(anchor="w", pady=(2, 0))
-
-        summary = tk.Frame(header, bg="#101820")
-        summary.pack(side="right")
-        self.lbl_create_page_live_count = tk.Label(
-            summary, text="LIVE  0", font=("Segoe UI", 10, "bold"),
-            fg="#4ADE80", bg="#17332A", padx=12, pady=7,
-        )
-        self.lbl_create_page_live_count.pack(side="left", padx=4)
-        self.lbl_create_page_die_count = tk.Label(
-            summary, text="DIE  0", font=("Segoe UI", 10, "bold"),
-            fg="#F87171", bg="#3B1D24", padx=12, pady=7,
-        )
-        self.lbl_create_page_die_count.pack(side="left", padx=4)
-
-        notebook = ttk.Notebook(window)
+        tk.Label(header, text="CREATE PAGE · RESULT CENTER", font=("Segoe UI", 13, "bold"),
+                 bg=palette["header_background"], fg=palette["header_foreground"]).pack(anchor="w")
+        summary = tk.Frame(header, bg=palette["header_background"])
+        summary.pack(fill="x", pady=(10, 0))
+        self.result_center_summary_labels = {}
+        for position, key in enumerate(SUMMARY_KEYS):
+            summary.grid_columnconfigure(position, weight=1)
+            color_key = {"RUNNING": "CHECKING", "PAGE SUCCESS": "LIVE", "PAGE FAILED": "ERROR"}.get(key, key)
+            colors = ACCOUNT_STATUS_PALETTE.get(color_key, palette)
+            block = tk.Frame(summary, bg=colors["background"], padx=5, pady=5)
+            block.grid(row=0, column=position, sticky="nsew", padx=2)
+            tk.Label(block, text=key, font=("Segoe UI", 8, "bold"),
+                     bg=colors["background"], fg=colors["foreground"]).pack()
+            label = tk.Label(block, text="0", font=("Segoe UI", 16, "bold"),
+                             bg=colors["background"], fg=colors["foreground"])
+            label.pack()
+            self.result_center_summary_labels[key] = label
+        self.style.configure("Result.TNotebook", background=palette["background"], borderwidth=0)
+        self.style.configure("Result.TNotebook.Tab", background=palette["header_background"],
+                             foreground=palette["foreground"], padding=(12, 8))
+        self.style.map("Result.TNotebook.Tab", background=[("selected", palette["selected_background"])],
+                       foreground=[("selected", palette["selected_foreground"])])
+        notebook = ttk.Notebook(window, style="Result.TNotebook")
         notebook.pack(fill="both", expand=True, padx=12, pady=(12, 6))
         self.create_page_results_notebook = notebook
         self.create_page_result_trees = {}
-
-        for result_type, title in (
-            ("completed", "LIVE - ĐÃ TẠO XONG PAGE"),
-            ("die", "DIE - ĐÃ DỪNG"),
-            ("checkpoint", "CHECKPOINT - CẦN XÁC MINH"),
-        ):
-            frame = tk.Frame(notebook, bg="#0B1117")
+        widths = (55, 150, 120, 150, 125, 120, 140, 140, 120, 300, 220, 150, 300, 170)
+        for key, title in RESULT_TABS:
+            frame = tk.Frame(notebook, bg=palette["background"])
             notebook.add(frame, text=title)
-            columns = ("stt", "account", "pages", "detail", "time")
-            tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="extended")
-            tree.heading("stt", text="STT")
-            tree.heading("account", text="Tài khoản / UID")
-            tree.heading("pages", text="Số Page")
-            tree.heading("detail", text="Kết quả / Lý do")
-            tree.heading("time", text="Thời gian")
-            tree.column("stt", width=55, anchor="center", stretch=False)
-            tree.column("account", width=180)
-            tree.column("pages", width=90, anchor="center", stretch=False)
-            tree.column("detail", width=430)
-            tree.column("time", width=145, anchor="center", stretch=False)
-            scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-            tree.configure(yscrollcommand=scrollbar.set)
-            tree.pack(side="left", fill="both", expand=True)
-            scrollbar.pack(side="right", fill="y")
-            self.create_page_result_trees[result_type] = tree
-
-        footer = tk.Frame(window, bg="#0B1117", padx=12, pady=10)
-        footer.pack(fill="x", side="bottom")
-        self.lbl_create_page_result_summary = tk.Label(
-            footer, text="", font=("Segoe UI", 9, "bold"),
-            fg="#E2E8F0", bg="#0B1117",
-        )
+            frame.grid_rowconfigure(0, weight=1)
+            frame.grid_columnconfigure(0, weight=1)
+            tree = ttk.Treeview(frame, columns=RESULT_COLUMNS, show="headings", selectmode="browse")
+            configure_account_table_style(self.style, tree)
+            tree.tag_configure("RUNNING", **palette["RUNNING"])
+            tree.tag_configure("TASK_FAILED", **ACCOUNT_STATUS_PALETTE["ERROR"])
+            for column, heading, column_width in zip(RESULT_COLUMNS, RESULT_HEADERS, widths):
+                tree.heading(column, text=heading)
+                tree.column(column, width=column_width, minwidth=column_width,
+                            anchor="w" if column in {"action", "reason", "page_name"} else "center",
+                            stretch=column in {"action", "reason"})
+            vertical = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+            horizontal = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+            tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+            tree.grid(row=0, column=0, sticky="nsew")
+            vertical.grid(row=0, column=1, sticky="ns")
+            horizontal.grid(row=1, column=0, sticky="ew")
+            tree.bind("<Button-3>", lambda event, tree=tree: self.show_result_center_context_menu(event, tree))
+            self.create_page_result_trees[key] = tree
+        self.result_center_menu = tk.Menu(window, tearoff=0, bg=palette["header_background"], fg=palette["foreground"])
+        self._result_center_menu_account = None
+        self._result_center_menu_values = ()
+        self._result_center_menu_page_url = ""
+        for label, mode in (("Copy UID", "uid"), ("Copy canonical account", "canonical"),
+                            ("Copy Page ID", "page_id"), ("Copy Page URL", "page_url"),
+                            ("Copy reason", "reason"), ("Copy result row", "row")):
+            self.result_center_menu.add_command(label=label, command=lambda mode=mode: self.copy_result_center_data(mode))
+        self.result_center_menu.add_separator()
+        self.result_center_menu.add_command(label="Mở Chrome kiểm tra",
+            command=lambda: self.open_account_inspector(self._result_center_menu_account))
+        self.result_center_menu.add_command(label="Xem log account",
+            command=lambda: self.show_management_account_logs(self._result_center_menu_account))
+        footer = tk.Frame(window, bg=palette["background"], padx=12, pady=10)
+        footer.pack(fill="x")
+        self.lbl_create_page_result_summary = tk.Label(footer, text="", font=("Segoe UI", 9),
+            bg=palette["background"], fg=palette["foreground"])
         self.lbl_create_page_result_summary.pack(side="left")
-        tk.Button(
-            footer, text="XUẤT TẤT CẢ", command=lambda: self.export_create_page_results_excel(),
-            font=("Segoe UI", 8, "bold"), bg="#0369A1", fg="#FFFFFF",
-            relief="flat", padx=12, pady=6, cursor="hand2",
-        ).pack(side="right", padx=(5, 0))
-        tk.Button(
-            footer, text="XUẤT DIE", command=lambda: self.export_create_page_results_excel("die"),
-            font=("Segoe UI", 8, "bold"), bg="#B91C1C", fg="#FFFFFF",
-            relief="flat", padx=12, pady=6, cursor="hand2",
-        ).pack(side="right", padx=(5, 0))
-        tk.Button(
-            footer, text="XUẤT LIVE", command=lambda: self.export_create_page_results_excel("completed"),
-            font=("Segoe UI", 8, "bold"), bg="#047857", fg="#FFFFFF",
-            relief="flat", padx=12, pady=6, cursor="hand2",
-        ).pack(side="right", padx=(5, 0))
-        tk.Button(
-            footer, text="ĐÓNG", command=window.destroy,
-            font=("Segoe UI", 9, "bold"), bg="#1E293B", fg="#FFFFFF",
-            relief="flat", padx=14, pady=5, cursor="hand2",
-        ).pack(side="right", padx=(10, 0))
-        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        ttk.Button(footer, text="Xuất Excel", command=self.export_create_page_results_excel).pack(side="right", padx=4)
+        ttk.Button(footer, text="Xuất CSV", command=self.export_result_center_csv).pack(side="right", padx=4)
+        notebook.bind("<<NotebookTabChanged>>", lambda _event: self.update_result_center_footer())
+        def close():
+            window.destroy()
+            self.create_page_results_window = None
+            self.create_page_result_trees = {}
+            self.result_center_summary_labels = {}
+            self._result_center_menu_account = None
+        window.protocol("WM_DELETE_WINDOW", close)
         self.refresh_create_page_results_dialog()
 
-    def refresh_create_page_results_dialog(self):
+    def result_center_accounts(self):
+        # Project the existing live store and its SQLite history, including removed input rows.
+        states = [self.account_states.get(index) for index in self.account_states.indexes()]
+        accounts = {history_account_id(state): state for state in states if state is not None}
+        config = getattr(self, "run_config", {})
+        legacy = {}
+        if hasattr(self, "create_page_result_lock"):
+            with self.create_page_result_lock:
+                for category, records in self.create_page_account_results.items():
+                    for record in records.values():
+                        legacy[history_account_id(record)] = (category, record)
+        for index, source in config.get("parsed_accounts", {}).items():
+            key = history_account_id(source)
+            if key in accounts:
+                continue
+            saved = self.account_states.history.load(source, include_logs=False) if self.account_states.history else None
+            if saved:
+                accounts[key] = {**source, "stt": int(index), "status": saved["last_status"],
+                    "current_action": saved["last_action"], "last_task_result": saved["last_task_result"],
+                    "last_error": saved.get("last_error"), "last_update": saved.get("last_update"),
+                    "login_mode": saved.get("login_mode"), "tasks": saved["tasks"],
+                    **{field: int(saved.get(field) or 0) for field in COUNTER_FIELDS}}
+            elif key in legacy:
+                category, record = legacy[key]
+                accounts[key] = {**source, "stt": int(index),
+                    "status": {"completed": "LIVE", "die": "DIE", "checkpoint": "CHECKPOINT"}[category],
+                    "page_success_count": record["created_count"], "last_error": record["reason"],
+                    "current_action": record["reason"], "last_update": record["time"],
+                    "last_task_result": "SUCCESS" if category == "completed" else "SKIPPED"}
+        return sorted(accounts.values(), key=lambda state: (int(state["stt"]), history_account_id(state)))
+
+    @staticmethod
+    def result_center_item_id(account):
+        return "result_" + hashlib.sha256(history_account_id(account).encode()).hexdigest()
+
+    def result_center_active_tab(self):
+        notebook = self.create_page_results_notebook
+        return RESULT_TABS[notebook.index(notebook.select())][0]
+
+    def update_result_center_footer(self):
         window = getattr(self, "create_page_results_window", None)
         if window is None or not window.winfo_exists():
             return
-        counts = {}
-        for result_type in ("completed", "die", "checkpoint"):
-            tree = self.create_page_result_trees.get(result_type)
-            if tree is None:
-                continue
-            for item in tree.get_children():
-                tree.delete(item)
-            records = self.get_create_page_account_results(result_type)
-            counts[result_type] = len(records)
-            for position, record in enumerate(records, 1):
-                pages = f"{record['created_count']}/{record['target_count']}"
-                if result_type == "die" and not record["target_count"]:
-                    pages = str(record["created_count"])
-                detail = (
-                    "Đã tạo đủ Page"
-                    if result_type == "completed"
-                    else record["reason"] or "Tài khoản không còn đăng nhập hợp lệ"
-                )
-                tree.insert(
-                    "", "end", iid=f"{result_type}_{position}",
-                    values=(
-                        record["stt"], record["account_id"] or record["uid"],
-                        pages, detail, record["time"],
-                    ),
-                )
-        if hasattr(self, "lbl_create_page_result_summary"):
-            self.lbl_create_page_result_summary.config(
-                text=(
-                    f"LIVE đã tạo xong: {counts.get('completed', 0)}   |   "
-                    f"DIE: {counts.get('die', 0)}   |   CHECKPOINT: {counts.get('checkpoint', 0)}"
-                )
-            )
-        if hasattr(self, "lbl_create_page_live_count"):
-            self.lbl_create_page_live_count.config(
-                text=f"LIVE  {counts.get('completed', 0)}"
-            )
-        if hasattr(self, "lbl_create_page_die_count"):
-            self.lbl_create_page_die_count.config(text=f"DIE  {counts.get('die', 0)}")
+        tree = self.create_page_result_trees.get(self.result_center_active_tab())
+        if tree is not None:
+            self.lbl_create_page_result_summary.config(text=f"{len(tree.get_children())} tài khoản")
+
+    def refresh_create_page_results_dialog(self, index=None):
+        window = getattr(self, "create_page_results_window", None)
+        if window is None or not window.winfo_exists():
+            return
+        accounts = self.result_center_accounts()
+        changed = self.account_states.get(index) if index is not None else None
+        rows = [changed] if changed else accounts
+        for key, tree in self.create_page_result_trees.items():
+            if index is None or changed is None:
+                visible = {self.result_center_item_id(state) for state in rows if result_matches(state, key)}
+                for item in tree.get_children():
+                    if item not in visible:
+                        tree.delete(item)
+            for state in rows:
+                item = self.result_center_item_id(state)
+                if not result_matches(state, key):
+                    if tree.exists(item):
+                        tree.delete(item)
+                    continue
+                values = result_values(state)
+                tag = state["status"]
+                if tag not in {"DIE", "ERROR", "CHECKPOINT", "CHECKING"}:
+                    if values[8] in {"FAILED", "ERROR"}:
+                        tag = "TASK_FAILED"
+                    elif values[8] == "RUNNING":
+                        tag = "RUNNING"
+                if tree.exists(item):
+                    tree.item(item, values=values, tags=(tag,))
+                else:
+                    tree.insert("", "end", iid=item, values=values, tags=(tag,))
+        for key, value in result_summary(accounts).items():
+            self.result_center_summary_labels[key].config(text=str(value))
+        self.update_result_center_footer()
+
+    def show_result_center_context_menu(self, event, tree):
+        item = tree.identify_row(event.y)
+        account = next((state for state in self.result_center_accounts()
+                        if self.result_center_item_id(state) == item), None)
+        self._result_center_menu_account = None
+        if account is None:
+            return
+        values = tuple(tree.item(item, "values"))
+        if len(values) != len(RESULT_COLUMNS) or str(account.get("uid") or account.get("account_id")) != str(values[1]):
+            return
+        self._result_center_menu_account = account
+        self._result_center_menu_values = values
+        outcomes = account.get("tasks", {}).get("CREATE_PAGE", {}).get("outcomes", [])
+        self._result_center_menu_page_url = next((str(outcome.get("page_url") or "") for outcome in reversed(outcomes)
+            if isinstance(outcome, dict) and str(outcome.get("page_id") or "") == str(values[11])
+            and redact_history_text(outcome.get("page_name"), account) == str(values[10])), "")
+        tree.selection_set(item)
+        try:
+            self.result_center_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.result_center_menu.grab_release()
+
+    def copy_result_center_data(self, mode):
+        account = self._result_center_menu_account
+        if account is None:
+            return
+        values = self._result_center_menu_values
+        if mode == "canonical":
+            self.copy_tree_data("canonical", account)
+            return
+        data = {"uid": values[1], "page_id": values[11], "page_url": self._result_center_menu_page_url,
+                "reason": values[12], "row": "\t".join(map(str, values))}[mode]
+        self.root.clipboard_clear()
+        self.root.clipboard_append(str(data))
 
     def export_create_page_results_excel(self, result_type=None):
-        result_types = (result_type,) if result_type else ("completed", "die")
-        categorized_records = {
-            key: self.get_create_page_account_results(key)
-            for key in result_types
-        }
-        if not any(categorized_records.values()):
-            messagebox.showwarning("Xuất Excel", "Danh sách được chọn đang trống.")
+        self.export_result_center("xlsx", result_type)
+
+    def export_result_center_csv(self):
+        self.export_result_center("csv")
+
+    def export_result_center(self, extension, result_type=None):
+        key = result_type or self.result_center_active_tab()
+        accounts = [state for state in self.result_center_accounts() if result_matches(state, key)]
+        if not accounts:
+            messagebox.showwarning("Xuất kết quả", "Danh sách được chọn đang trống.")
             return
-        suffix = {None: "LIVE_DIE", "completed": "LIVE", "die": "DIE"}[result_type]
-        file_path = filedialog.asksaveasfilename(
-            parent=self.create_page_results_window,
-            title=f"Xuất danh sách {suffix}",
-            defaultextension=".xlsx",
-            initialfile=f"create_page_{suffix}_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
-            filetypes=[("Excel Workbook", "*.xlsx")],
-        )
-        if not file_path:
+        rows = [result_values(state) for state in accounts]
+        target = int(getattr(self, "run_config", {}).get("page_target") or 0)
+        records = [report_record(state, target) for state in accounts]
+        parent = getattr(self, "create_page_results_window", None)
+        path = filedialog.asksaveasfilename(parent=parent, title="Xuất kết quả",
+            defaultextension=f".{extension}", initialfile=f"results_{key}_{datetime.now():%Y%m%d_%H%M%S}.{extension}",
+            filetypes=[("Excel Workbook" if extension == "xlsx" else "CSV", f"*.{extension}")])
+        if not path:
             return
         try:
-            write_create_page_results_xlsx(file_path, categorized_records)
-        except (OSError, RuntimeError, ValueError) as exc:
-            messagebox.showerror("Xuất Excel thất bại", str(exc), parent=self.create_page_results_window)
+            if extension == "xlsx":
+                write_create_page_results_xlsx(path, {key: records}, result_rows=rows)
+            else:
+                write_result_csv(path, rows)
+        except Exception as exc:
+            messagebox.showerror("Xuất kết quả thất bại", str(exc), parent=parent)
             return
-        messagebox.showinfo(
-            "Xuất Excel thành công",
-            f"Đã lưu báo cáo tại:\n{file_path}",
-            parent=self.create_page_results_window,
-        )
+        messagebox.showinfo("Xuất kết quả thành công", f"Đã lưu báo cáo tại:\n{path}", parent=parent)
 
     def remove_processed_create_page_accounts_from_input(self):
         processed_sources = self.get_processed_create_page_sources()
@@ -3253,6 +3676,7 @@ class MainToolApp:
         return self._bounded_int(self.ent_batch_size.get(), 5, 1, 10000)
 
     def refresh_account_state_table(self, reset_batch=False):
+        self.refresh_create_page_results_dialog()
         if not hasattr(self, "account_state_tree"):
             return
         batches = split_account_batches(self.account_states.indexes(), self.get_batch_size())
@@ -3284,6 +3708,8 @@ class MainToolApp:
                     ACCOUNT_STATUS_LABELS[state["status"]],
                     state["last_task_result"],
                     page_wait_label(state),
+                    f"{state['page_success_count']} / {state['page_failed_count']}",
+                    f"{state['friend_success_count']} / {state['friend_failed_count']}",
                     state["current_action"],
                 ),
                 tags=(state["status"],),
@@ -3297,6 +3723,8 @@ class MainToolApp:
         self.refresh_state_summary()
 
     def refresh_account_state_row(self, index):
+        self.refresh_management_account_row(index)
+        self.refresh_create_page_results_dialog(index)
         if not hasattr(self, "account_state_tree"):
             return
         item_id = f"account_state_{int(index)}"
@@ -3314,6 +3742,8 @@ class MainToolApp:
                 ACCOUNT_STATUS_LABELS[state["status"]],
                 state["last_task_result"],
                 page_wait_label(state),
+                f"{state['page_success_count']} / {state['page_failed_count']}",
+                f"{state['friend_success_count']} / {state['friend_failed_count']}",
                 state["current_action"],
             ),
             tags=(state["status"],),
@@ -3401,8 +3831,45 @@ class MainToolApp:
         self.post_ui(lambda idx=int(index): self.refresh_account_state_row(idx))
 
     def record_task_result(self, index, module, status, detail="", outcome=None, preserve_outcomes=False):
-        self.account_states.record_task(index, module, status, detail, outcome, preserve_outcomes)
+        committed = self.account_states.record_task(index, module, status, detail, outcome, preserve_outcomes)
         self.post_ui(lambda idx=int(index): self.refresh_account_state_row(idx))
+        return committed
+
+    def skip_paused_module(self, index, module):
+        reason = app_circuit_breaker(self).paused_reason(module)
+        if not reason:
+            return False
+        self.record_task_result(index, module, "SKIPPED", reason, preserve_outcomes=True)
+        self.set_account_state(index, current_action=f"{module}: {reason}")
+        return True
+
+    def publish_create_page_result(self, index, result):
+        status = str(result.get("status") or "ERROR").upper()
+        state = self.account_states.get(index) or {}
+        if status == "SUCCESS":
+            if (result.get("owner_account_id") != state.get("account_id")
+                    or not result.get("page_job_id")
+                    or not page_identity_keys(result.get("page_url"), result.get("page_id"))):
+                raise ValueError("Verified Page result lacks matching owner/job/identity.")
+        detail = str(result.get("reason") or result.get("technical_error")
+                     or result.get("page_url") or result.get("page_id") or result.get("page_name") or "")
+        # Commit the result and counter before publishing SUCCESS or writing exports.
+        if not self.record_task_result(index, "CREATE_PAGE", status, detail, result):
+            return False
+        if app_circuit_breaker(self).observe("CREATE_PAGE", state.get("account_id"), result, state.get("status")):
+            self.log(app_circuit_breaker(self).paused_reason("CREATE_PAGE"), account_index=index)
+        self.set_account_state(index, current_action=f"Create Page [{status}]: {detail[:140]}")
+        for exporter in ((save_created_page_success,) if status == "SUCCESS" else ()) + (save_create_page_outcome,):
+            try:
+                exporter(result)
+            except Exception as exc:
+                self.log(f"[EXPORT_ERROR] Kết quả đã lưu; không xuất được {getattr(exporter, '__name__', 'result')}: {exc}", account_index=index)
+        try:
+            append_create_page_account_log(index, result.get("account_id", state.get("account_id", "")),
+                                           f"[{status}][PAGE_FLOW] {result.get('page_name', '')} | {detail}")
+        except Exception as exc:
+            self.log(f"[EXPORT_ERROR] Không xuất được log Create Page: {exc}", account_index=index)
+        return True
 
     def finalize_active_account_tasks(self, index, status, reason):
         self.account_states.finalize_active_tasks(index, status, reason)
@@ -3415,7 +3882,12 @@ class MainToolApp:
         proxy_api = str(config.get("proxy_api") or "").strip()
         proxy_list_configured = bool(str(config.get("proxies") or "").strip())
         has_proxy_source = bool(effective_proxy or proxy_api or proxy_list_configured)
-        if mode == "rotating_api" and proxy_api:
+        if config.get("proxy_snapshot_complete", False):
+            error = config.get("proxy_errors", {}).get(index)
+            if error:
+                raise ConnectionError(error)
+            effective_proxy = config.get("resolved_proxies", {}).get(index, "")
+        elif mode == "rotating_api" and proxy_api:
             async with self.proxy_api_lock:
                 effective_proxy = await asyncio.to_thread(fetch_proxy_from_api, proxy_api)
             if not effective_proxy:
@@ -3430,10 +3902,6 @@ class MainToolApp:
             raise ValueError("Thiếu proxy bắt buộc hoặc proxy sai định dạng; không dùng IP thật.")
         self.account_states.set_proxy(index, effective_proxy)
         def update_proxy():
-            if hasattr(self, "tree") and self.tree.exists(str(index)):
-                values = list(self.tree.item(str(index), "values"))
-                values[8] = effective_proxy or "Không dùng"
-                self.tree.item(str(index), values=values)
             self.refresh_account_state_row(index)
         self.post_ui(update_proxy)
         return effective_proxy
@@ -3554,28 +4022,10 @@ class MainToolApp:
         return filter_targets_for_mode(targets, mode, available_modes)
 
     def update_tree_row(self, item_id, current_friends=None, sent_today=None, status=None):
-        """Cập nhật dữ liệu hàng trong bảng Treeview chính xác vào cột Trạng Thái (Index 8)"""
+        """Render management cells from account state, never positional credential cells."""
         def _update():
-            if self.tree.exists(item_id):
-                vals = list(self.tree.item(item_id, "values"))
-                msg_parts = []
-                account_state = None
-                if str(item_id).isdigit():
-                    account_state = self.account_states.get(int(item_id))
-                if account_state:
-                    msg_parts.append(ACCOUNT_STATUS_LABELS[account_state["status"]])
-                # Gom các thông tin phụ vào chung cột Status để không đè lên Cookie/Email/Proxy
-                if current_friends is not None:
-                    msg_parts.append(f"Bạn bè: {current_friends}")
-                if sent_today is not None:
-                    msg_parts.append(f"Đã gửi: {sent_today}")
-                if status is not None and not account_state:
-                    msg_parts.append(status)
-                
-                if msg_parts:
-                    vals[5] = " | ".join(msg_parts)
-                row_status = account_state["status"] if account_state else "UNKNOWN"
-                self.tree.item(item_id, values=vals, tags=(row_status,))
+            if str(item_id).isdigit():
+                self.refresh_management_account_row(int(item_id))
         self.post_ui(_update)
 
     def log(self, text, account_index=None):
@@ -3637,24 +4087,17 @@ class MainToolApp:
         ImportAccountDialog(self.root, self.add_accounts_to_table)
 
     def add_accounts_to_table(self, account_list):
-        source_lines = [
-            line.strip()
-            for line in self.txt_accounts.get("1.0", "end").splitlines()
-            if line.strip() and not line.startswith("#")
-        ]
-        source_lines.extend(
-            acc.get("raw", "").strip()
-            for acc in account_list
-            if acc.get("raw", "").strip()
-        )
-
+        source_lines = self._normalize_account_input()
+        for account in account_list:
+            record = runtime_account_record(account)
+            if record is None:
+                record = import_account_record(account.get("raw", ""), len(source_lines) + 1)
+            if record is not None:
+                source_lines.append(record.canonical_line)
+                self._account_import_records[len(source_lines)] = record
         self.txt_accounts.delete("1.0", "end")
-        numbered_lines = [
-            f"{index}. {re.sub(r'^\\d+[.\\-\\s]+', '', line)}"
-            for index, line in enumerate(source_lines, start=1)
-        ]
-        if numbered_lines:
-            self.txt_accounts.insert("1.0", "\n".join(numbered_lines) + "\n")
+        if source_lines:
+            self.txt_accounts.insert("1.0", "\n".join(source_lines) + "\n")
         self.reload_table_from_text()
         if hasattr(self, 'lbl_acc_count'):
             self.lbl_acc_count.config(text=f"Tổng: {len(self.tree.get_children())} nick")
@@ -3680,14 +4123,17 @@ class MainToolApp:
             line for index, line in enumerate(source_lines, start=1)
             if index not in selected_indexes
         ]
+        remaining_records = [
+            getattr(self, "_account_import_records", {}).get(index)
+            for index in range(1, len(source_lines) + 1) if index not in selected_indexes
+        ]
+        self._account_import_records = {
+            index: record for index, record in enumerate(remaining_records, 1) if record is not None
+        }
 
         self.txt_accounts.delete("1.0", "end")
         if remaining_lines:
-            numbered_lines = [
-                f"{index}. {re.sub(r'^\\d+[.\\-\\s]+', '', line)}"
-                for index, line in enumerate(remaining_lines, start=1)
-            ]
-            self.txt_accounts.insert("1.0", "\n".join(numbered_lines) + "\n")
+            self.txt_accounts.insert("1.0", "\n".join(remaining_lines) + "\n")
 
         self.reload_table_from_text()
         if hasattr(self, 'lbl_stat_total'):
@@ -3702,6 +4148,10 @@ class MainToolApp:
         data = {
             "selected_theme": self.current_theme,
             "accounts": protect_setting(self.txt_accounts.get("1.0", "end").strip()),
+            "account_import_records": protect_setting(json.dumps({
+                str(index): asdict(record)
+                for index, record in getattr(self, "_account_import_records", {}).items()
+            }, ensure_ascii=False)),
             "proxies": protect_setting(self.txt_proxies.get("1.0", "end").strip()),
             "targets": self.txt_targets.get("1.0", "end").strip(),
             "selected_modes": modes_saved,
@@ -3745,6 +4195,14 @@ class MainToolApp:
                 self.cbo_theme.set(data["selected_theme"])
                 self.apply_theme(data["selected_theme"])
             if "accounts" in data: self.txt_accounts.insert("1.0", unprotect_setting(data["accounts"]))
+            if "account_import_records" in data:
+                saved_records = json.loads(unprotect_setting(data["account_import_records"]))
+                self._account_import_records = {}
+                for index, payload in saved_records.items():
+                    payload["import_fields"] = tuple(payload.get("import_fields", ()))
+                    record = AccountRecord(**payload)
+                    if parse_canonical_account_line(record.canonical_line):
+                        self._account_import_records[int(index)] = record
             if "proxies" in data: self.txt_proxies.insert("1.0", unprotect_setting(data["proxies"]))
             if "targets" in data: self.txt_targets.insert("1.0", data["targets"])
             if "selected_modes" in data and hasattr(self, 'mode_vars'):
@@ -3821,12 +4279,10 @@ class MainToolApp:
         file_path = filedialog.askopenfilename(filetypes=[("Text & CSV", "*.txt *.csv"), ("All Files", "*.*")])
         if file_path:
             with open(file_path, "r", encoding="utf-8") as f:
-                lines = [re.sub(r'^\d+[\.\-\s]+', '', line.strip()) for line in f if line.strip() and not line.startswith("#")]
-            
-            # Tự động thêm STT 1. 2. 3... cho từng dòng nạp từ file
-            numbered_lines = [f"{idx}. {line}" for idx, line in enumerate(lines, 1)]
+                lines = [line.rstrip("\r\n") for line in f if line.strip() and not line.lstrip().startswith("#")]
+            self._account_import_records = {}
             self.txt_accounts.delete("1.0", "end")
-            self.txt_accounts.insert("1.0", "\n".join(numbered_lines) + "\n")
+            self.txt_accounts.insert("1.0", "\n".join(lines) + "\n")
             self.reload_table_from_text()
             if hasattr(self, 'lbl_acc_count'):
                 self.lbl_acc_count.config(text=f"Tổng: {len(lines)} nick")
@@ -3854,19 +4310,52 @@ class MainToolApp:
                 writer.writerow(["STT", "UID", "PASSWORD", "2FA", "STATUS", "ACTION", "TIME"])
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 for item in items:
-                    vals = list(self.tree.item(item, "values"))
-                    writer.writerow([vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], now_str])
+                    state = self.management_account_for_item(item)
+                    if state:
+                        writer.writerow([state["stt"], state["uid"], state["password"], state["2fa"],
+                                         state["status"], redact_history_text(state["current_action"], state), now_str])
             messagebox.showinfo("Thành công", f"Đã xuất báo cáo tại:\n{file_path}")
-    def reload_table_from_text(self, checked_indexes=None):
-        if getattr(self, "is_running", False):
+    def _normalize_account_input(self):
+        """Import boundary: canonical UI rows retain cached original records."""
+        text = self.txt_accounts.get("1.0", "end")
+        lines = [line for line in text.splitlines()
+                 if line.strip() and not line.lstrip().startswith("#")]
+        previous = getattr(self, "_account_import_records", {})
+        remaining = list(previous.items())
+        records = {}
+        display_lines = []
+        for index, line in enumerate(lines, 1):
+            normalized = normalize_account_source_line(line)
+            match = next(((key, record) for key, record in remaining
+                          if key == index and record.canonical_line == normalized), None)
+            if match is None:
+                match = next(((key, record) for key, record in remaining
+                              if record.canonical_line == normalized), None)
+            if match:
+                remaining.remove(match)
+                record = match[1]
+            else:
+                record = import_account_record(line, index)
+            if record is not None:
+                records[index] = record
+                display_lines.append(record.canonical_line)
+            else:
+                display_lines.append(line)
+        self._account_import_records = records
+        canonical_text = "\n".join(display_lines)
+        if text.rstrip("\r\n") != canonical_text:
+            self.txt_accounts.delete("1.0", "end")
+            if display_lines:
+                self.txt_accounts.insert("1.0", canonical_text + "\n")
+        return display_lines
+
+    def reload_table_from_text(self, checked_indexes=None, normalize_before_run=False):
+        if getattr(self, "is_running", False) and not normalize_before_run:
             return
         for item in self.tree.get_children():
             self.tree.delete(item)
 
-        raw_acc_lines = [
-            line for line in self.txt_accounts.get("1.0", "end").splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
-        ]
+        raw_acc_lines = self._normalize_account_input()
         proxy_lines = [p.strip() for p in self.txt_proxies.get("1.0", "end").splitlines() if p.strip() and not p.startswith("#")]
         ratio = int(self.ent_proxy_ratio.get()) if self.ent_proxy_ratio.get().isdigit() else 20
         proxy_signature = (self.proxy_mode.get(), tuple(proxy_lines), ratio)
@@ -3876,9 +4365,10 @@ class MainToolApp:
         account_records = []
 
         for idx, line in enumerate(raw_acc_lines, 1):
-            parsed = parse_any_account_line(line, idx)
-            if not parsed:
+            record = self._account_import_records.get(idx)
+            if record is None:
                 continue
+            parsed = record.to_account_dict()
             account_record = dict(parsed)
             account_record.update({
                 "stt": idx,
@@ -3910,25 +4400,15 @@ class MainToolApp:
 
             account_records[-1]["proxy"] = "" if assigned_proxy == "Không dùng" else assigned_proxy
 
-            self.tree.insert("", "end", iid=str(idx), values=(
-                "[✔]" if checked_indexes is None or idx in checked_indexes else "[ ]",
-                idx, 
-                parsed["uid"], 
-                parsed["password"], 
-                parsed["2fa"], 
-                "CHƯA KIỂM TRA",
-                "Chưa chạy"
+            self.tree.insert("", "end", iid=str(idx), values=management_account_values(
+                {**parsed, "stt": idx, "status": "UNKNOWN", "current_action": "Chưa chạy"},
+                checked_indexes is None or idx in checked_indexes,
             ), tags=("UNKNOWN",))
 
         self.account_states.sync(account_records)
         for index in self.account_states.indexes():
             item_id = str(index)
-            state = self.account_states.get(index)
-            if self.tree.exists(item_id) and state:
-                values = list(self.tree.item(item_id, "values"))
-                values[5] = ACCOUNT_STATUS_LABELS[state["status"]]
-                values[6] = state["current_action"]
-                self.tree.item(item_id, values=values, tags=(state["status"],))
+            self.refresh_management_account_row(index)
         self.refresh_account_state_table(reset_batch=True)
         
         if hasattr(self, 'lbl_stat_total'):
@@ -3947,18 +4427,33 @@ class MainToolApp:
             self.log("[!] Tiến trình trước vẫn đang dọn dẹp. Vui lòng thử lại sau 2 giây.")
             return
 
-        self.is_running = True
+        self.is_running = False
         self.stop_requested = False
         self.run_error = None
-        self.save_settings()
-        checked_indexes = {
-            int(self.tree.item(item, "values")[1])
-            for item in self.tree.get_children()
-            if str(self.tree.item(item, "values")[0]) == "[✔]"
-            and str(self.tree.item(item, "values")[1]).isdigit()
-        }
-        self.reload_table_from_text(checked_indexes=checked_indexes)
-        self.run_config = self.capture_run_config()
+        self.run_status = None
+        self.run_account_indexes = None
+        try:
+            if not any(line.strip() and not line.lstrip().startswith("#")
+                       for line in self.txt_accounts.get("1.0", "end").splitlines()):
+                raise ValueError("Không có tài khoản để chạy.")
+            checked_indexes = {
+                int(self.tree.item(item, "values")[1])
+                for item in self.tree.get_children()
+                if str(self.tree.item(item, "values")[0]) == "[✔]"
+                and str(self.tree.item(item, "values")[1]).isdigit()
+            }
+            self.reload_table_from_text(checked_indexes=checked_indexes or None)
+            if not self.account_states.indexes():
+                raise ValueError("Không có tài khoản hợp lệ để chạy.")
+            self.run_config = self.capture_run_config()
+            selected = self.parse_range_string(self.run_config.get("selected_indexes", "")) or self.run_config.get("checked_indexes", set())
+            self.run_account_indexes = set(selected) if selected else set(self.account_states.indexes())
+            self.save_settings()
+        except Exception as exc:
+            self.run_error = f"Không chuẩn bị được lượt chạy: {type(exc).__name__}: {exc}"
+            self.log(f"[ERROR] {self.run_error}")
+            self.finish_run()
+            return
         if self.run_config.get("modes", {}).get("create_page", False):
             self.reset_create_page_account_results()
         try:
@@ -3971,12 +4466,13 @@ class MainToolApp:
                 "Ứng dụng sẽ nhận toàn bộ danh sách tài khoản nhưng chỉ mở tối đa 20 trình duyệt đồng thời "
                 "để tránh cạn RAM và nghẽn proxy.",
             )
-        if self.run_config["threads"] > 12 and not self.run_config["headless"]:
-            self.run_config["headless"] = True
+        if self.run_config.get("auto_headless", False):
             self.log("[i] Trên 12 trình duyệt: tự động bật chế độ chạy ẩn để giảm RAM và tránh tràn màn hình.")
         self.stop_requested = False
         self.run_error = None
         self.is_running = True
+        app_circuit_breaker(self).reset()
+        self.run_status = "RUNNING"
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         if hasattr(self, 'lbl_status_indicator'):
@@ -4014,6 +4510,13 @@ class MainToolApp:
             self.root.after(100, self.finish_run)
             return
         was_stopped = self.stop_requested
+        if getattr(self, "run_error", None):
+            self.run_status = "FAILED"
+        elif was_stopped:
+            self.run_status = "CANCELLED"
+        elif getattr(self, "run_status", None) not in RUN_STATUSES - {"RUNNING"}:
+            self.run_status = (self.account_states.run_result(getattr(self, "run_account_indexes", None))
+                               if hasattr(self, "account_states") else "COMPLETED")
         self.is_running = False
         self.stop_requested = False
         self.run_thread = None
@@ -4025,11 +4528,14 @@ class MainToolApp:
         self.btn_stop.config(state="disabled")
         
         if hasattr(self, 'lbl_status_indicator'):
+            text, color = {
+                "FAILED": ("● Lỗi (Sẵn sàng chạy lại)", "#EF4444"),
+                "CANCELLED": ("● Đã dừng (Sẵn sàng chạy lại)", "#F59E0B"),
+                "COMPLETED_WITH_ERRORS": ("● Kết thúc có lỗi", "#F59E0B"),
+                "COMPLETED": ("● Hoàn thành", "#10B981"),
+            }[self.run_status]
             self.lbl_status_indicator.config(
-                text=("● Lỗi (Sẵn sàng chạy lại)" if getattr(self, "run_error", None)
-                      else "● Đã dừng (Sẵn sàng chạy lại)" if was_stopped else "● Hoàn thành"),
-                fg=("#EF4444" if getattr(self, "run_error", None)
-                    else "#F59E0B" if was_stopped else "#10B981"),
+                text=text, fg=color,
             )
 
     def run_process(self):
@@ -4746,14 +5252,25 @@ class MainToolApp:
 # [KẾT THÚC DÁN HÀM REG]
 
 
-    async def login_facebook_user_pass(self, page, context, username, password):
+    async def login_facebook_user_pass(self, page, context, username, password, expected_uid=None, twofa=None):
         """Đăng nhập Facebook bằng tài khoản và mật khẩu đã được parse."""
         if not username or not password:
             return LOGIN_TECHNICAL_ERROR, "Thiếu tài khoản hoặc mật khẩu"
 
         self.log(f"[*] Đang đăng nhập Facebook cho tài khoản: {username}...")
         try:
-            await page.goto("https://www.facebook.com/login/", wait_until="domcontentloaded", timeout=40000)
+            log_context = getattr(self, "account_log_context", None)
+            index = log_context.get() if log_context is not None else None
+            state = self.account_states.get(index) if index is not None else None
+            if expected_uid is None:
+                expected_uid = (state or {}).get("uid") or username
+            if twofa is None:
+                twofa = (state or {}).get("2fa", "")
+            await context.clear_cookies()
+            response = await page.goto("https://www.facebook.com/login/", wait_until="domcontentloaded", timeout=40000)
+            status = getattr(response, "status", None)
+            if isinstance(status, int) and status >= 400:
+                return LOGIN_TECHNICAL_ERROR, f"Login navigation HTTP {status}"
             await page.locator('input[name="email"]').fill(username)
             await page.locator('input[name="pass"]').fill(password)
 
@@ -4765,32 +5282,27 @@ class MainToolApp:
             await login_btn.click()
             await page.wait_for_timeout(5000)
             
-            if "checkpoint" in page.url or "two_factor" in page.url or "id=1501092823525282" in page.url:
-                state = self.account_states.get(int(self.account_log_context.get())) if getattr(self, 'account_log_context', None) else None
-                fa2 = state.get("2fa", "") if state else ""
-                if not fa2:
-                    return LOGIN_INVALID, "Cần mã 2FA nhưng không có trong dữ liệu"
+            code_input = page.locator(FACEBOOK_2FA_INPUT_SELECTOR).first
+            if await code_input.count() > 0 and await code_input.is_visible():
+                if not twofa:
+                    return LOGIN_CHECKPOINT, "Cần mã 2FA nhưng không có trong dữ liệu"
                 self.log(f"[*] [{username}] Đang giải mã 2FA...")
-                code_input = page.locator('input[id="approvals_code"], input[name="approvals_code"]').first
-                if await code_input.count() > 0:
-                    await code_input.fill(generate_totp_code(fa2))
-                    submit_2fa = page.locator('button[id="checkpointSubmitButton"]').first
-                    if await submit_2fa.count() > 0:
-                        await submit_2fa.click()
-                        await page.wait_for_timeout(5000)
-                        for _ in range(4):
-                            cont_btn = page.locator('button[id="checkpointSubmitButton"]').first
-                            if await cont_btn.count() > 0 and await cont_btn.is_visible():
-                                await cont_btn.click()
-                                await page.wait_for_timeout(3000)
+                await code_input.fill(generate_totp_code(twofa))
+                submit_2fa = page.locator(FACEBOOK_2FA_SUBMIT_SELECTOR).first
+                if await submit_2fa.count() == 0 or not await submit_2fa.is_visible():
+                    return LOGIN_TECHNICAL_ERROR, "Không tìm thấy nút xác nhận 2FA"
+                await submit_2fa.click()
+                await page.wait_for_timeout(5000)
 
-            is_valid_session, session_detail = await self.verify_facebook_session(page, context)
-            if not is_valid_session:
+            session_result, session_detail = await self.verify_facebook_session(page, context, expected_uid)
+            if session_result != LOGIN_SUCCESS:
                 self.log(f"[-] [{username}] Đăng nhập Facebook chưa hợp lệ: {session_detail}.")
-                return LOGIN_INVALID, session_detail
+                return session_result, session_detail
 
             self.log(f"[✔] [{username}] {session_detail}.")
             return LOGIN_SUCCESS, session_detail
+        except FacebookCheckpointStopped:
+            return LOGIN_CHECKPOINT, "Facebook yêu cầu xác minh tài khoản"
         except Exception as e:
             self.log(f"[-] [{username}] Lỗi đăng nhập Facebook: {e}")
             return LOGIN_TECHNICAL_ERROR, f"{type(e).__name__}: {e}"
@@ -5063,6 +5575,8 @@ class MainToolApp:
         if not browser:
             raise RuntimeError("Thất bại hoàn toàn khi mở trình duyệt Chromium.")
 
+        context = None
+        page = None
         try:
             # Dùng no_viewport=True để Facebook nhận diện đây là cửa sổ thật
             context_options = {"no_viewport": True, "ignore_https_errors": False}
@@ -5101,15 +5615,13 @@ class MainToolApp:
             if health_response.status == 407 or health_response.status >= 500:
                 raise RuntimeError(f"Proxy trả về HTTP {health_response.status}")
 
-        except Exception as e:
-            try: await context.close()
-            except: pass
-            try: await browser.close()
-            except: pass
-            raise RuntimeError(f"Trình duyệt mở được nhưng Page không phản hồi (Khả năng do Proxy): {e}")
-
-        self.log(f"[*] Đã mở Slot {slot} (Luồng {idx}) tại Tọa độ: {pos_x}x{pos_y}")
-        return browser, context, page
+            self.log(f"[*] Đã mở Slot {slot} (Luồng {idx}) tại Tọa độ: {pos_x}x{pos_y}")
+            return browser, context, page
+        except BaseException as e:
+            await close_browser_resources(context, browser, page)
+            if not isinstance(e, Exception):
+                raise
+            raise RuntimeError(f"Trình duyệt mở được nhưng Page không phản hồi (Khả năng do Proxy): {e}") from e
 
     async def wait_between_page_jobs(self, page, context, acc_name, index, min_delay, max_delay):
         """Browse without reactions during the one configured inter-Page delay."""
@@ -5528,31 +6040,55 @@ class MainToolApp:
             "target": outcome.target, "result": outcome.status, "detail": outcome[1],
         })
 
-    async def verify_facebook_session(self, page, context):
-        """Distinguish a real logged-in session from login/checkpoint shells."""
-        await self.guard_facebook_checkpoint(page)
-        current_url = page.url.lower()
-        if any(marker in current_url for marker in (
-            "/login", "checkpoint", "challenge", "disabled", "suspended"
-        )):
-            return False, "Login / Checkpoint"
+    async def verify_facebook_session(self, page, context, expected_uid=None):
+        """Require matching cookie identity and visible authenticated UI evidence."""
+        try:
+            await self.guard_facebook_checkpoint(page)
+            parsed = urlparse(str(page.url or ""))
+            host = (parsed.hostname or "").casefold()
+            path = parsed.path.casefold()
+            if (parsed.scheme not in {"http", "https"}
+                    or host != "facebook.com" and not host.endswith(".facebook.com")):
+                return LOGIN_TECHNICAL_ERROR, "Chưa tải được trang Facebook hợp lệ"
+            if re.match(r'^/(?:checkpoint|challenge|two_factor)(?:/|$|\.)', path):
+                return LOGIN_CHECKPOINT, "Facebook yêu cầu xác minh tài khoản"
+            if re.match(r'^/(?:disabled|suspended)(?:/|$|\.)', path):
+                return LOGIN_INVALID, f"Phiên không hợp lệ: {path}"
+            code_fields = page.locator(FACEBOOK_2FA_INPUT_SELECTOR)
+            for index in range(await code_fields.count()):
+                if await code_fields.nth(index).is_visible():
+                    return LOGIN_CHECKPOINT, "Facebook đang yêu cầu mã xác minh 2FA"
+            if re.match(r'^/login(?:/|$|\.)', path):
+                return LOGIN_INVALID, f"Phiên không hợp lệ: {path}"
 
-        cookies = await context.cookies("https://www.facebook.com/")
-        cookie_names = {cookie.get("name") for cookie in cookies}
-        if "c_user" not in cookie_names:
-            return False, "Cookie thiếu c_user"
+            if expected_uid is None:
+                log_context = getattr(self, "account_log_context", None)
+                index = log_context.get() if log_context is not None else None
+                state = self.account_states.get(index) if index is not None else None
+                expected_uid = (state or {}).get("uid", "")
+            cookies = await context.cookies("https://www.facebook.com/")
+            cookie_uids = {str(cookie.get("value") or "") for cookie in cookies
+                           if cookie.get("name") == "c_user"}
+            if len(cookie_uids) != 1 or not next(iter(cookie_uids), "").isdigit():
+                return LOGIN_INVALID, "Cookie thiếu c_user hợp lệ hoặc có UID mâu thuẫn"
+            expected_uid = str(expected_uid or "")
+            if expected_uid.isdigit() and cookie_uids != {expected_uid}:
+                return LOGIN_INVALID, "c_user không khớp UID tài khoản cần đăng nhập"
 
-        login_fields = page.locator(
-            'input[name="email"], input[name="pass"], form[action*="login"]'
-        )
-        if await login_fields.count() > 0:
+            login_fields = page.locator(FACEBOOK_LOGIN_FORM_SELECTOR)
             for index in range(await login_fields.count()):
-                try:
-                    if await login_fields.nth(index).is_visible():
-                        return False, "Facebook đang hiển thị biểu mẫu đăng nhập"
-                except Exception:
-                    continue
-        return True, "Phiên Facebook hợp lệ"
+                if await login_fields.nth(index).is_visible():
+                    return LOGIN_INVALID, "Facebook đang hiển thị biểu mẫu đăng nhập"
+
+            authenticated = page.locator(FACEBOOK_AUTHENTICATED_SELECTOR)
+            for index in range(await authenticated.count()):
+                if await authenticated.nth(index).is_visible():
+                    return LOGIN_SUCCESS, "Phiên Facebook hợp lệ, có bằng chứng đăng nhập"
+            return LOGIN_TECHNICAL_ERROR, "Không có bằng chứng đăng nhập; trang có thể rỗng hoặc DOM chưa sẵn sàng"
+        except FacebookCheckpointStopped:
+            return LOGIN_CHECKPOINT, "Facebook yêu cầu xác minh tài khoản"
+        except Exception as exc:
+            return LOGIN_TECHNICAL_ERROR, f"Session verification {type(exc).__name__}: {exc}"
 
     async def get_current_page_identity(self, page):
         candidates = [page.url]
@@ -5814,38 +6350,24 @@ class MainToolApp:
         Tạo Fanpage: Tích hợp check Checkpoint, đa tầng Selector, xử lý Stale Element (DOM refresh), 
         kiểm tra iframe, focus trước khi gõ và chụp ảnh debug.
         """
+        if self.skip_paused_module(idx, "CREATE_PAGE"):
+            return []
         await self.guard_facebook_checkpoint(page, idx)
         created_count = 0
         results = []
         current_page_job = None
 
         def record_result(result):
-            result["owner_account_id"] = (self.account_states.get(idx) or {}).get("account_id", acc_name)
-            result["page_job_id"] = current_page_job["page_job_id"] if current_page_job else ""
+            owner = (self.account_states.get(idx) or {}).get("account_id", acc_name)
+            job = current_page_job["page_job_id"] if current_page_job else ""
+            if result.get("status") == "SUCCESS":
+                if result.get("owner_account_id") != owner or result.get("page_job_id") != job:
+                    raise ValueError("Verified Page owner/job does not match current job.")
+            else:
+                result.update(owner_account_id=owner, page_job_id=job)
+            if not self.publish_create_page_result(idx, result):
+                return None
             results.append(result)
-            result_status = str(result.get("status") or "ERROR").upper()
-            detail = (
-                result.get("reason")
-                or result.get("technical_error")
-                or result.get("page_url")
-                or result.get("page_id")
-                or result.get("page_name")
-            )
-            self.set_account_state(
-                idx,
-                current_action=f"Create Page [{result_status}]: {str(detail)[:140]}",
-            )
-            self.record_task_result(idx, "CREATE_PAGE", result_status, str(detail), result)
-            try:
-                save_create_page_outcome(result)
-                append_create_page_account_log(
-                    idx,
-                    acc_name,
-                    f"[{result['status']}][PAGE_FLOW] "
-                    f"{result['page_name']} | {result['reason'] or result['technical_error'] or result['page_url'] or result['page_id']}",
-                )
-            except OSError as exc:
-                self.log(f"[ERROR] [{acc_name}] Không ghi được kết quả Create Page: {exc}")
             return result
 
         planned_targets = build_create_page_plans(targets, max_pages)
@@ -5869,6 +6391,8 @@ class MainToolApp:
 
         for p_idx in range(effective_max_pages):
             if not self.is_running or created_count >= effective_max_pages:
+                break
+            if self.skip_paused_module(idx, "CREATE_PAGE"):
                 break
 
             page_plan = parse_page_plan(planned_targets[p_idx])
@@ -6037,6 +6561,7 @@ class MainToolApp:
                             technical_error="Form tạo Page không xuất hiện sau retry.",
                             retry_count=retry_count + 1,
                             account_index=idx, proxy=resolved_proxy,
+                            structural_failure="PAGE_NAME_INPUT_MISSING" if name_count_retry == 0 and await page.locator('div[role="main"]').count() > 0 else "",
                         ))
                         continue
 
@@ -6145,6 +6670,7 @@ class MainToolApp:
                     record_result(build_create_page_result(
                         "FAILED", acc_name, page_name, category_name,
                         reason="CATEGORY_INPUT_NOT_FOUND", account_index=idx, proxy=resolved_proxy,
+                        structural_failure="CATEGORY_INPUT_MISSING" if await cat_elements.count() == 0 else "",
                     ))
                     continue
 
@@ -6168,6 +6694,7 @@ class MainToolApp:
                         "ERROR", acc_name, page_name, category_name,
                         technical_error="Không tìm thấy nút Submit tạo Page.",
                         retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                        structural_failure="CREATE_SUBMIT_MISSING" if await create_btn.count() == 0 else "",
                     ))
                     continue
 
@@ -6214,6 +6741,8 @@ class MainToolApp:
                     if before_identity.get("id"):
                         current_page_job["prior_page_ids"].add(before_identity["id"])
                     await create_btn.scroll_into_view_if_needed()
+                    if self.skip_paused_module(idx, "CREATE_PAGE"):
+                        return results
                     await self.human_click(page, create_btn)
                     current_page_job["submitted"] = True
                     await self.guard_facebook_checkpoint(page, idx)
@@ -6395,18 +6924,20 @@ class MainToolApp:
                 page_record.update(owner_account_id=page_identity["owner_account_id"],
                                    page_job_id=page_identity["page_job_id"])
                 await self.guard_facebook_checkpoint(page, idx)
-                if not save_created_page_success(page_record):
+                try:
+                    if record_result(page_record) is None:
+                        return results
+                except DuplicatePageResult:
                     record_result(build_create_page_result(
                         "FAILED", acc_name, page_name, category_name,
                         page_url=page_identity["url"], page_id=page_identity["id"],
-                        reason="Page URL/ID đã tồn tại trong file kết quả.",
+                        reason="Page URL/ID đã tồn tại trong kết quả SQLite.",
                         retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
                     ))
                     self.log(f"[FAILED] [{acc_name}] Bỏ qua Page trùng URL/ID.")
                     continue
 
                 created_count += 1
-                record_result(page_record)
                 self.set_account_state(
                     idx,
                     current_action=f"Create Page [SUCCESS]: {created_count}/{effective_max_pages}",
@@ -6727,6 +7258,40 @@ class MainToolApp:
         except Exception as e:
             self.log(f"[-] [{acc_name}] Lỗi seeding livestream: {e}")
     
+    async def authenticate_facebook_account(self, index, page, context, cookie_str, username, password):
+        """Cookie first; fall back only on affirmative invalid-session evidence."""
+        self.account_states.set_login_mode(index, "COOKIE")
+        state = self.account_states.get(index) or {}
+        expected_uid = state.get("uid") or username
+        try:
+            cookies = parse_cookies(cookie_str)
+            if not cookies:
+                return LOGIN_TECHNICAL_ERROR, "Không đọc được dữ liệu Cookie để khôi phục phiên"
+            await context.add_cookies(cookies)
+            self.log("[LOGIN][COOKIE] Khôi phục Cookie và xác minh phiên Facebook")
+            response = await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=40000)
+            status = getattr(response, "status", None)
+            if isinstance(status, int) and status >= 400:
+                return LOGIN_TECHNICAL_ERROR, f"Cookie navigation HTTP {status}"
+            await asyncio.sleep(4)
+            result, detail = await self.verify_facebook_session(page, context, expected_uid)
+            if result != LOGIN_INVALID:
+                return result, detail
+            path = urlparse(str(page.url or "")).path.casefold()
+            if re.match(r'^/(?:disabled|suspended)(?:/|$|\.)', path):
+                return result, detail
+            if not username or not password:
+                return LOGIN_INVALID, f"{detail}; không có UID/password để fallback"
+            self.account_states.set_login_mode(index, "FALLBACK_LOGIN")
+            self.log(f"[LOGIN][FALLBACK_LOGIN] Cookie được xác nhận không hợp lệ: {detail}")
+            return await self.login_facebook_user_pass(
+                page, context, username, password, expected_uid=expected_uid, twofa=state.get("2fa", "")
+            )
+        except FacebookCheckpointStopped:
+            return LOGIN_CHECKPOINT, "Facebook yêu cầu xác minh tài khoản"
+        except Exception as exc:
+            return LOGIN_TECHNICAL_ERROR, f"Cookie login {type(exc).__name__}: {exc}"
+
     async def process_account_scoped(self, *args, **kwargs):
         account_index = int(args[1])
         context_token = self.account_log_context.set(account_index)
@@ -6765,7 +7330,6 @@ class MainToolApp:
                 f"country={account_country or 'N/A'}; timezone={account_timezone or 'AUTO'}"
             )
 
-            cookies = parse_cookies(cookie_str)
             try:
                 assigned_proxy_str = await self.resolve_effective_proxy(idx, assigned_proxy_str)
             except Exception as exc:
@@ -6808,46 +7372,26 @@ class MainToolApp:
                     account_locale=account_locale,
                     account_timezone=account_timezone,
                 )
-                checkpoint_watcher = asyncio.create_task(
-                    self.watch_facebook_checkpoint(page, idx, asyncio.current_task())
+                login_result, login_detail = await self.authenticate_facebook_account(
+                    idx, page, context, cookie_str, login_user, login_password
                 )
-                await self.guard_facebook_checkpoint(page, idx)
-
-                # --- BẮT ĐẦU LOGIC ĐĂNG NHẬP CHUẨN XÁC ---
-                is_valid_session = False
-                
-                # Yêu cầu tool: Luôn đăng nhập bằng Cookie
-                if not cookies:
-                    self.set_account_failure(idx, "invalid_cookie", f"[{acc_name}] Thiếu Cookie.")
-                    self.update_tree_row(str(idx), status="DIE")
+                if login_result == LOGIN_CHECKPOINT:
+                    self.stop_checkpoint_account(idx)
+                    self.update_tree_row(str(idx), status="CHECKPOINT")
                     return
-
-                await context.add_cookies(cookies)
-                self.log(f"[*] [{acc_name}] Đang mở trang chủ để nạp phiên Cookie...")
-                await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=40000)
-                await self.guard_facebook_checkpoint(page, idx)
-                await asyncio.sleep(4)
-
-                is_valid_session, session_detail = await self.verify_facebook_session(page, context)
-                if not is_valid_session:
-                    self.log(f"[!] [{acc_name}] Cookie không hợp lệ: {session_detail}. Fallback đăng nhập UID/PASSWORD...")
-                    login_result, login_detail = await self.login_facebook_user_pass(
-                        page, context, login_user, login_password
-                    )
-                    await self.guard_facebook_checkpoint(page, idx)
-                    if login_result != LOGIN_SUCCESS:
-                        reason = f"[{acc_name}] Đăng nhập UID/PASS thất bại: {login_detail}"
-                        self.set_account_failure(idx, "invalid_login", reason)
-                        self.update_tree_row(str(idx), status="DIE")
-                        return
-                    self.log(f"[✔] [{acc_name}] Đăng nhập bằng UID/PASSWORD + 2FA thành công!")
-                else:
-                    self.log(f"[✔] [{acc_name}] Đăng nhập bằng Cookie thành công: {session_detail}")  
-                # --- KẾT THÚC LOGIC ĐĂNG NHẬP ---
+                if login_result != LOGIN_SUCCESS:
+                    failure_kind = "invalid_login" if login_result == LOGIN_INVALID else "automation"
+                    self.set_account_failure(idx, failure_kind, f"[{acc_name}] {login_detail}")
+                    self.update_tree_row(str(idx), status="DIE" if login_result == LOGIN_INVALID else "ERROR")
+                    return
+                self.log(f"[LOGIN][SUCCESS] {login_detail}")
 
                 await self.guard_facebook_checkpoint(page, idx)
                 self.set_account_state(idx, status="LIVE", current_action="Đăng nhập Facebook hợp lệ")
                 self.update_tree_row(str(idx), status="LIVE")
+                checkpoint_watcher = asyncio.create_task(
+                    self.watch_facebook_checkpoint(page, idx, asyncio.current_task())
+                )
 
                 if options.get("browse_web"): await self.browse_external_web(page, acc_name)
                 if options.get("warmup"): await self.warm_up_feed(page, acc_name)
@@ -7130,12 +7674,15 @@ class MainToolApp:
             
             finally:
                 # --- SIÊU NĂNG LỰC: DÙ LỖI HAY KHÔNG CŨNG BẮT BUỘC ĐÓNG TRÌNH DUYỆT ĐỂ CHỐNG TREO RAM ---
-                if checkpoint_watcher is not None:
-                    checkpoint_watcher.cancel()
-                    await asyncio.gather(checkpoint_watcher, return_exceptions=True)
-                cleanup_errors = await close_browser_resources(context, browser, page)
-                if cleanup_errors:
-                    self.log(f"[ERROR] [{acc_name}] Lỗi đóng browser/profile: {cleanup_errors[0]}")
+                try:
+                    if checkpoint_watcher is not None:
+                        checkpoint_watcher.cancel()
+                        await asyncio.wait({checkpoint_watcher}, timeout=1)
+                        checkpoint_watcher.add_done_callback(consume_cleanup_result)
+                finally:
+                    cleanup_errors = await close_browser_resources(context, browser, page)
+                    if cleanup_errors:
+                        self.log(f"[ERROR] [{acc_name}] Lỗi đóng browser/profile: {cleanup_errors[0]}")
     def parse_range_string(self, range_str: str) -> set:
         """Tự động phân tách chuỗi số phức hợp dạng '1, 3, 5-9' thành danh sách STT"""
         selected = set()
@@ -7161,11 +7708,6 @@ class MainToolApp:
             line
             for line in config.get("accounts", "").splitlines()
             if line.strip() and not line.lstrip().startswith("#")
-        ]
-        proxy_lines = [
-            line.strip()
-            for line in config.get("proxies", "").splitlines()
-            if line.strip() and not line.startswith("#")
         ]
 
         if not raw_acc_lines:
@@ -7202,6 +7744,7 @@ class MainToolApp:
                 planned_targets, config.get("page_target", 5)
             )
             if not valid_targets:
+                self.run_status = "FAILED"
                 self.log(f"[FAILED][CREATE_PAGE][PRE-FLIGHT] {validation_error}")
                 for index in target_indexes or range(1, len(raw_acc_lines) + 1):
                     self.set_account_state(
@@ -7210,7 +7753,6 @@ class MainToolApp:
                     )
                 return
         batch_size = config.get("batch_size", 5)
-        ratio = config.get("proxy_ratio", 20)
         resolved_proxies = config.get("resolved_proxies", {})
         semaphore = asyncio.Semaphore(threads_count)
         account_jobs = []
@@ -7218,10 +7760,12 @@ class MainToolApp:
             if target_indexes and idx not in target_indexes:
                 continue
             parsed = parsed_accounts.get(idx) or parsed_accounts.get(str(idx))
-            if not parsed:
-                parsed = parse_any_account_line(line, idx)
-            if not parsed:
+            record = runtime_account_record(parsed)
+            if record is None or record.canonical_line != normalize_account_source_line(line):
+                record = parse_canonical_account_line(line)
+            if record is None:
                 continue
+            parsed = record.to_account_dict()
 
             acc_name = account_display_name(parsed, idx)
             cookie_str = (parsed.get("cookie") or "").strip()
@@ -7238,17 +7782,6 @@ class MainToolApp:
             assigned_proxy_str = resolve_account_proxy(
                 parsed.get("proxy"), resolved_proxies, idx
             ) or None
-            if (
-                not assigned_proxy_str
-                and config.get("proxy_mode") not in {"account", "rotating_api"}
-                and proxy_lines
-            ):
-                if config.get("proxy_mode") in {"round_robin", "random"}:
-                    assigned_proxy_str = proxy_lines[(idx - 1) % len(proxy_lines)]
-                else:
-                    proxy_index = (idx - 1) // ratio
-                    assigned_proxy_str = proxy_lines[proxy_index] if proxy_index < len(proxy_lines) else proxy_lines[-1]
-
             account_jobs.append({
                 "idx": idx,
                 "acc_name": acc_name,
@@ -7318,10 +7851,13 @@ class MainToolApp:
                 )
 
         if self.stop_requested:
+            self.run_status = "CANCELLED"
             self.log("\n[!] Tiến trình đã dừng; các luồng đang chạy đã được đóng an toàn.")
             return
 
         final_summary = self.account_states.summary([job["idx"] for job in account_jobs])
+        self.run_account_indexes = {job["idx"] for job in account_jobs}
+        self.run_status = self.account_states.run_result(self.run_account_indexes)
         self.log(
             f"[KẾT THÚC ĐỢT CHẠY] LIVE: {final_summary['LIVE']} • "
             f"DIE: {final_summary['DIE']} • ERROR: {final_summary['ERROR']} • CHECKPOINT: {final_summary['CHECKPOINT']} • "
@@ -7332,7 +7868,11 @@ class MainToolApp:
         t_token = config.get("tele_token", "")
         t_id = config.get("tele_chatid", "")
         if t_token and t_id:
-            send_telegram_alert(t_token, t_id, "🎉 THÔNG BÁO: Toàn bộ dàn nick đã hoàn thành tất cả tiến trình!")
+            send_telegram_alert(t_token, t_id, "THÔNG BÁO: " + (
+                "Đợt chạy kết thúc có lỗi; kiểm tra nhật ký tài khoản."
+                if self.run_status == "COMPLETED_WITH_ERRORS"
+                else "Toàn bộ dàn nick đã hoàn thành tất cả tiến trình!"
+            ))
 
     def check_live_selected(self):
         selected = self.tree.selection() or self.tree.get_children()
@@ -7389,14 +7929,8 @@ class MainToolApp:
             return None
 
         account_index = int(values[1])
-        source_lines = [
-            line.strip()
-            for line in self.txt_accounts.get("1.0", "end").splitlines()
-            if line.strip() and not line.startswith("#")
-        ]
-        if account_index < 1 or account_index > len(source_lines):
-            return None
-        return parse_any_account_line(source_lines[account_index - 1], account_index)
+        record = runtime_account_record(self.account_states.get(account_index))
+        return record.to_account_dict() if record else None
 
 
     def open_selected_profile(self):
@@ -7405,62 +7939,52 @@ class MainToolApp:
             messagebox.showwarning("Chú ý", "Vui lòng chọn 1 dòng tài khoản để mở Profile!")
             return
 
-        item = selected[0]
-        vals = self.tree.item(item, "values")
-        
-        stt = int(vals[1])
-        parsed_account = self.account_states.get(stt)
-        if not parsed_account: return
-        acc_name = parsed_account.get("name", str(stt))
-        proxy_str = parsed_account.get("proxy", "Không dùng")
-        cookie_str = parsed_account.get("cookie", "")
+        self.open_account_inspector(self.management_account_for_item(selected[0]))
 
-        profiles_dir = os.path.join(APP_DATA_DIR, "browser_profiles")
-        os.makedirs(profiles_dir, exist_ok=True)
-        profile_path = os.path.join(profiles_dir, f"profile_{acc_name}")
-
+    def open_account_inspector(self, account):
+        if account is None:
+            return
+        snapshot = RunConfig(account)
         def launch():
-            # Khởi tạo chính sách vòng lặp sự kiện bất đồng bộ an toàn chống gạch ngang cảnh báo
-            if sys.platform == 'win32':
-                try:
-                    if not isinstance(asyncio.get_event_loop_policy(), asyncio.WindowsProactorEventLoopPolicy):
-                        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-                except AttributeError:
-                    pass
-
-            async def run():
-                async with async_playwright() as p:
-                    proxy_cfg = parse_proxy(proxy_str if proxy_str != "Không dùng" else "")
-                    browser_exe = get_installed_browser_path()
-                    launch_kwargs = {
-                        "user_data_dir": profile_path,
-                        "headless": False,
-                        "proxy": proxy_cfg,
-                        "args": ["--disable-blink-features=AutomationControlled"]
-                    }
-                    if browser_exe:
-                        launch_kwargs["executable_path"] = browser_exe
-
-                    context = await p.chromium.launch_persistent_context(**launch_kwargs)
-                    
-                    # Giải pháp gia cố: Ép giải phóng tệp Lock dù người dùng tắt trình duyệt bằng bất cứ cách nào
-                    try:
-                        if cookie_str:
-                            await context.add_cookies(parse_cookies(cookie_str))
-                        page = context.pages[0] if context.pages else await context.new_page()
-                        await page.goto("https://facebook.com")
-                        
-                        # Vòng lặp giữ trình duyệt sống cho đến khi người dùng tắt thủ công cửa sổ cuối cùng
-                        while len(context.pages) > 0:
-                            await asyncio.sleep(1)
-                    except Exception:
-                        pass
-                    finally:
-                        # Buộc phải đóng đóng đóng context để nhả file khóa
-                        await context.close()
-            asyncio.run(run())
-            
+            try:
+                asyncio.run(self.inspect_account_session(snapshot))
+            except Exception as exc:
+                error = redact_history_text(f"{type(exc).__name__}: {exc}", snapshot)
+                self.post_ui(lambda: messagebox.showerror("Chrome kiểm tra", error))
         threading.Thread(target=launch, daemon=True).start()
+
+    async def inspect_account_session(self, account):
+        """Manual inspection owns its driver, browser and ephemeral account context."""
+        proxy = str(account.get("effective_proxy") or account.get("proxy") or "")
+        proxy = "" if proxy == "Không dùng" else proxy
+        proxy_cfg = parse_proxy(proxy)
+        if proxy and not proxy_cfg:
+            raise ValueError("Proxy không hợp lệ; không mở bằng IP thật.")
+        browser = context = page = None
+        async with async_playwright() as p:
+            try:
+                launch_options = {"headless": False}
+                browser_exe = get_installed_browser_path()
+                if browser_exe:
+                    launch_options["executable_path"] = browser_exe
+                if proxy_cfg:
+                    launch_options["proxy"] = proxy_cfg
+                browser = await p.chromium.launch(**launch_options)
+                context_options = {}
+                locale = browser_locale_options(account.get("locale", "AUTO"))["locale"]
+                if locale:
+                    context_options["locale"] = locale
+                zone = normalize_account_timezone(account.get("timezone", ""))
+                if zone:
+                    context_options["timezone_id"] = zone
+                context = await browser.new_context(**context_options)
+                await context.add_cookies(parse_cookies(account.get("cookie", "")))
+                page = await context.new_page()
+                await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=40000)
+                while browser.is_connected() and context.pages:
+                    await asyncio.sleep(0.5)
+            finally:
+                await close_browser_resources(context, browser, page)
 
 
     def get_token_selected(self):
@@ -7536,7 +8060,7 @@ class MainToolApp:
         except Exception:
             messagebox.showerror("Lỗi", "Mã 2FA Secret Key không hợp lệ!")
 
-def main():
+def run_application():
     if os.path.exists(LICENSE_FILE):
         saved_key = load_saved_license()
         is_valid, exp_date = verify_license(saved_key)
@@ -7559,5 +8083,22 @@ def main():
     app = LicenseCheckDialog(root, launch_main)
     root.mainloop()
 
+def main():
+    if not getattr(sys, "frozen", False):
+        return run_application()
+    lock = SingleInstanceLock(output_path("production.lock"))
+    try:
+        if not lock.acquire():
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                messagebox.showinfo("Ứng dụng đang chạy", "Ứng dụng đang chạy", parent=root)
+            finally:
+                root.destroy()
+            return 0
+        return run_application()
+    finally:
+        lock.release()
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
