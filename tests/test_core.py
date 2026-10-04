@@ -1589,6 +1589,7 @@ class RunLifecycleTests(unittest.TestCase):
         for error in (RuntimeError("worker failed"), asyncio.CancelledError()):
             with self.subTest(error=type(error).__name__):
                 app = self.make_app()
+                app.stop_requested = False
                 app.main_worker = mock.AsyncMock(side_effect=error)
                 app.post_ui = mock.Mock()
                 app.run_process()

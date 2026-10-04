@@ -215,6 +215,50 @@ def test_confirmed_invalid_cookie_falls_back_and_verifies_same_uid(tmp_path, coo
     assert context.values == [{"name": "c_user", "value": UID}]
 
 
+@pytest.mark.parametrize("password_mode,expected", [
+    ("valid", "LIVE"), ("invalid", "DIE"), ("checkpoint", "CHECKPOINT"),
+])
+def test_login_supports_unique_visible_role_button_in_credentials_form(tmp_path, password_mode, expected):
+    app, context, page, events = make_app(tmp_path, "invalid", password_mode)
+    original_locator = page.locator
+    seen = []
+
+    def locator(selector):
+        seen.append(selector)
+        if selector == 'button[name="login"], button[type="submit"]':
+            return LoginLocator(page, "old-submit", False)
+        if selector == 'form:has(input[name="email"]):has(input[name="pass"]) [role="button"]:visible':
+            return LoginLocator(page, "password-submit")
+        return original_locator(selector)
+
+    page.locator = locator
+    state = run_account(app)
+    assert state["status"] == expected
+    assert state["login_mode"] == "FALLBACK_LOGIN"
+    assert ('click', 'password-submit') in events
+    assert not any(selector in {'[role="button"]', '[role="button"]:visible'} for selector in seen)
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_login_does_not_guess_role_button_when_form_is_missing_or_ambiguous(tmp_path, count):
+    app, context, page, events = make_app(tmp_path, "invalid")
+    original_locator = page.locator
+
+    def locator(selector):
+        if selector == 'button[name="login"], button[type="submit"]':
+            return LoginLocator(page, "old-submit", False)
+        if selector == 'form:has(input[name="email"]):has(input[name="pass"]) [role="button"]:visible':
+            candidate = LoginLocator(page, "password-submit")
+            candidate.count = mock.AsyncMock(return_value=count)
+            return candidate
+        return original_locator(selector)
+
+    page.locator = locator
+    state = run_account(app)
+    assert state["status"] == "ERROR"
+    assert not any(event[0] == "click" for event in events)
+
+
 @pytest.mark.parametrize("error", [TimeoutError("navigation timeout"), OSError("DNS failure"),
                                    RuntimeError("proxy connection failed"), RuntimeError("browser crashed")])
 def test_cookie_technical_error_does_not_fallback_or_die(tmp_path, error):

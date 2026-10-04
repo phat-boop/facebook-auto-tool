@@ -52,7 +52,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.3.1"
+CURRENT_VERSION = "2.3.2"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -153,18 +153,19 @@ ACCOUNT_STATUS_COLORS = {
     "CHECKPOINT": "#C084FC",
 }
 ACCOUNT_STATUS_PALETTE = {
-    "UNKNOWN": {"background": "#28323C", "foreground": "#E7EDF2"},
-    "CHECKING": {"background": "#153F60", "foreground": "#DCEFFF"},
-    "LIVE": {"background": "#164535", "foreground": "#D5FBE5"},
-    "CHECKPOINT": {"background": "#594418", "foreground": "#FFF3C4"},
-    "DIE": {"background": "#57252C", "foreground": "#FFE1E5"},
-    "ERROR": {"background": "#623B1D", "foreground": "#FFE9CD"},
+    "UNKNOWN": {"background": "#28323C", "foreground": "#E2C891"},
+    "CHECKING": {"background": "#153F60", "foreground": "#8EDB56"},
+    "LIVE": {"background": "#164535", "foreground": "#8FBDFC"},
+    "CHECKPOINT": {"background": "#8F702E", "foreground": "#FFFFFF"},
+    "DIE": {"background": "#57252C", "foreground": "#FFB5BF"},
+    "ERROR": {"background": "#623B1D", "foreground": "#FFD1BC"},
 }
+
 TASK_RESULTS = {"PENDING", "RUNNING", "SUCCESS", "FAILED", "ERROR", "SKIPPED"}
 RUN_STATUSES = {"RUNNING", "COMPLETED", "COMPLETED_WITH_ERRORS", "CANCELLED", "FAILED"}
 ACCOUNT_TABLE_PALETTE = {
-    "background": "#19232C", "foreground": "#E7EDF2",
-    "header_background": "#24323D", "header_foreground": "#F4FAFC",
+    "background": "#19232C", "foreground": "#2BF33C",
+    "header_background": "#24323D", "header_foreground": "#14AACF",
     "selected_background": "#285D69", "selected_foreground": "#FFFFFF",
     "RUNNING": ACCOUNT_STATUS_PALETTE["CHECKING"],
 }
@@ -2456,6 +2457,11 @@ class MainToolApp:
         self.run_thread = None
         self.worker_loop = None
         self.worker_tasks = []
+        self.worker_root_task = None
+        self._run_generation = 0
+        self._finished_run_generation = None
+        self._cancel_requested_generation = None
+        self._ui_run_context = contextvars.ContextVar("ui_run_context", default=None)
         self.proxy_api_lock = None
         self.run_config = {}
         self._account_import_records = {}
@@ -2503,7 +2509,15 @@ class MainToolApp:
     def post_ui(self, callback):
         """Schedule a UI callback without calling Tkinter from a worker thread."""
         if not self.close_requested:
-            self.ui_queue.put(callback)
+            context = getattr(self, "_ui_run_context", None)
+            generation = context.get() if context is not None else None
+            if generation is None:
+                self.ui_queue.put(callback)
+            else:
+                def current_run_callback():
+                    if generation == getattr(self, "_run_generation", 0):
+                        callback()
+                self.ui_queue.put(current_run_callback)
 
     def _drain_ui_queue(self):
         try:
@@ -2824,10 +2838,10 @@ class MainToolApp:
 
         f1_head = tk.Frame(card1, bg="#131C2E")
         f1_head.pack(fill="x", pady=(0, 2))
-        tk.Label(f1_head, text="👤 1. HÀNG ĐỢI TÀI KHOẢN FACEBOOK", font=("Segoe UI", 9, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
+        tk.Label(f1_head, text="👤 1. HÀNG ĐỢI TÀI KHOẢN FACEBOOK", font=("Segoe UI", 11, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
         tk.Button(f1_head, text="📁 Nhập từ file .txt", font=("Segoe UI", 8, "bold"), bg="#1E293B", fg="#F8FAFC", relief="flat", padx=8, pady=1, cursor="hand2", command=self.import_accounts_file).pack(side="right")
 
-        tk.Label(card1, text="Dán Cookie hoặc User|Pass; hỗ trợ xếp hàng 50–100 tài khoản:", font=("Segoe UI", 8), fg="#64748B", bg="#131C2E").pack(anchor="w")
+        tk.Label(card1, text="Dán Cookie hoặc User|Pass; hỗ trợ xếp hàng 50–100 tài khoản:", font=("Segoe UI", 10), fg="#64748B", bg="#131C2E").pack(anchor="w")
         self.txt_accounts = scrolledtext.ScrolledText(card1, bg="#070B14", fg="#E2E8F0", font=("Consolas", 9), insertbackground="#38BDF8", relief="solid", bd=1)
         self.txt_accounts.pack(fill="both", expand=True, pady=2)
         
@@ -2846,7 +2860,7 @@ class MainToolApp:
 
         f3_head = tk.Frame(card3, bg="#131C2E")
         f3_head.pack(fill="x", pady=(0, 2))
-        tk.Label(f3_head, text="⚡ 3. CHỨC NĂNG TỰ ĐỘNG", font=("Segoe UI", 9, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
+        tk.Label(f3_head, text="⚡ 3. CHỨC NĂNG TỰ ĐỘNG", font=("Segoe UI", 11, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
         
         def toggle_all(val):
             for v in self.mode_vars.values(): v.set(val)
@@ -2898,11 +2912,11 @@ class MainToolApp:
             self.mode_vars[val] = var
             tk.Checkbutton(
                 f_modes_grid, text=text, variable=var,
-                font=("Segoe UI", 8), fg="#E2E8F0", bg="#131C2E", selectcolor="#070B14",
+                font=("Segoe UI", 13), fg="#E2E8F0", bg="#131C2E", selectcolor="#070B14",
                 activebackground="#131C2E", activeforeground="#38BDF8", cursor="hand2"
             ).grid(row=r, column=c, sticky="w", padx=2, pady=2)
 
-        tk.Label(card3, text="Nhập Link/ID Group, UID, Pass mới HOẶC File ảnh (mỗi dòng 1 mục):", font=("Segoe UI", 8), fg="#64748B", bg="#131C2E").pack(anchor="w", pady=(2, 1))
+        tk.Label(card3, text="Nhập Link/ID Group, UID, Pass mới HOẶC File ảnh (mỗi dòng 1 mục):", font=("Segoe UI", 10), fg="#64748B", bg="#131C2E").pack(anchor="w", pady=(2, 1))
         self.txt_targets = scrolledtext.ScrolledText(card3, height=2, bg="#070B14", fg="#E2E8F0", font=("Consolas", 9), insertbackground="#38BDF8", relief="solid", bd=1)
         self.txt_targets.pack(fill="x")
 
@@ -2912,7 +2926,7 @@ class MainToolApp:
 
         f_log_head = tk.Frame(card_log, bg="#131C2E")
         f_log_head.pack(fill="x", pady=(0, 2))
-        self.lbl_log_scope = tk.Label(f_log_head, text="📜 NHẬT KÝ TỔNG", font=("Segoe UI", 9, "bold"), fg="#38BDF8", bg="#131C2E")
+        self.lbl_log_scope = tk.Label(f_log_head, text="📜 NHẬT KÝ TỔNG", font=("Segoe UI", 11, "bold"), fg="#38BDF8", bg="#131C2E")
         self.lbl_log_scope.pack(side="left")
         tk.Button(
             f_log_head,
@@ -2937,7 +2951,7 @@ class MainToolApp:
 
         f2_head = tk.Frame(card2, bg="#131C2E")
         f2_head.pack(fill="x", pady=(0, 2))
-        tk.Label(f2_head, text="🌐 2. DANH SÁCH PROXY", font=("Segoe UI", 9, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
+        tk.Label(f2_head, text="🌐 2. DANH SÁCH PROXY", font=("Segoe UI", 11, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
         tk.Button(f2_head, text="📁 Nhập từ file .txt", font=("Segoe UI", 8, "bold"), bg="#1E293B", fg="#F8FAFC", relief="flat", padx=8, pady=1, cursor="hand2", command=self.import_proxies_file).pack(side="right")
 
         tk.Label(card2, text="Nhập danh sách Proxy (IP:Port hoặc IP:Port:User:Pass):", font=("Segoe UI", 8), fg="#64748B", bg="#131C2E").pack(anchor="w")
@@ -2985,8 +2999,8 @@ class MainToolApp:
 
         f_reg_head = tk.Frame(card_reg, bg="#131C2E")
         f_reg_head.pack(fill="x", pady=(0, 3))
-        tk.Label(f_reg_head, text="⇄ 4. TRẠNG THÁI TÀI KHOẢN", font=("Segoe UI", 9, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
-        tk.Label(f_reg_head, text="Số tài khoản/đợt:", font=("Segoe UI", 8), fg="#94A3B8", bg="#131C2E").pack(side="left", padx=(12, 2))
+        tk.Label(f_reg_head, text="⇄ 4. TRẠNG THÁI TÀI KHOẢN", font=("Segoe UI", 11, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
+        tk.Label(f_reg_head, text="Số tài khoản/đợt:", font=("Segoe UI", 10), fg="#94A3B8", bg="#131C2E").pack(side="left", padx=(12, 2))
         self.ent_batch_size = tk.Entry(f_reg_head, width=4, font=("Segoe UI", 8, "bold"), bg="#070B14", fg="#38BDF8", justify="center", relief="solid", bd=1)
         self.ent_batch_size.insert(0, "5")
         self.ent_batch_size.pack(side="left")
@@ -3038,7 +3052,7 @@ class MainToolApp:
         card4 = tk.Frame(paned_right, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
         paned_right.add(card4, minsize=115, height=155)
 
-        tk.Label(card4, text="🛡️ 5. HIỆU NĂNG & ĐIỀU TIẾT", font=("Segoe UI", 9, "bold"), fg="#38BDF8", bg="#131C2E").pack(anchor="w", pady=(0, 2))
+        tk.Label(card4, text="🛡️ 5. HIỆU NĂNG & ĐIỀU TIẾT", font=("Segoe UI", 11, "bold"), fg="#38BDF8", bg="#131C2E").pack(anchor="w", pady=(0, 2))
 
         f4_sys = tk.Frame(card4, bg="#131C2E")
         f4_sys.pack(fill="x", pady=2)
@@ -3073,16 +3087,16 @@ class MainToolApp:
         ]
         for i, (txt, var) in enumerate(c_list):
             r, c = divmod(i, 3)
-            tk.Checkbutton(f4_checks, text=txt, variable=var, font=("Segoe UI", 8), fg="#E2E8F0", bg="#131C2E", selectcolor="#070B14", cursor="hand2").grid(row=r, column=c, sticky="w", padx=2, pady=1)
+            tk.Checkbutton(f4_checks, text=txt, variable=var, font=("Segoe UI", 12), fg="#E2E8F0", bg="#131C2E", selectcolor="#070B14", cursor="hand2").grid(row=r, column=c, sticky="w", padx=2, pady=1)
 
         f4_tele = tk.Frame(card4, bg="#131C2E")
         f4_tele.pack(fill="x", pady=(2, 0))
-        tk.Label(f4_tele, text="Telegram Token:", font=("Segoe UI", 8), fg="#94A3B8", bg="#131C2E").pack(side="left")
-        self.ent_tele_token = tk.Entry(f4_tele, width=16, font=("Segoe UI", 8), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
+        tk.Label(f4_tele, text="Telegram Token:", font=("Segoe UI", 10), fg="#94A3B8", bg="#131C2E").pack(side="left")
+        self.ent_tele_token = tk.Entry(f4_tele, width=16, font=("Segoe UI", 10), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
         self.ent_tele_token.pack(side="left", padx=2)
 
-        tk.Label(f4_tele, text="Chat ID:", font=("Segoe UI", 8), fg="#94A3B8", bg="#131C2E").pack(side="left", padx=(4, 2))
-        self.ent_tele_chatid = tk.Entry(f4_tele, width=10, font=("Segoe UI", 8), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
+        tk.Label(f4_tele, text="Chat ID:", font=("Segoe UI", 10), fg="#94A3B8", bg="#131C2E").pack(side="left", padx=(4, 2))
+        self.ent_tele_chatid = tk.Entry(f4_tele, width=10, font=("Segoe UI", 10), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
         self.ent_tele_chatid.pack(side="left")
 
         # R4: Card Thông số & Điều khiển
@@ -3092,35 +3106,35 @@ class MainToolApp:
         card5 = tk.Frame(f_bottom_right, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=6)
         card5.pack(fill="x", pady=(0, 4))
 
-        tk.Label(card5, text="⚙️ 6. THÔNG SỐ GỬI KẾT BẠN & TƯƠNG TÁC", font=("Segoe UI", 9, "bold"), fg="#38BDF8", bg="#131C2E").pack(anchor="w", pady=(0, 2))
+        tk.Label(card5, text="⚙️ 6. THÔNG SỐ GỬI KẾT BẠN & TƯƠNG TÁC", font=("Segoe UI", 11, "bold"), fg="#38BDF8", bg="#131C2E").pack(anchor="w", pady=(0, 2))
 
         f5_cfg = tk.Frame(card5, bg="#131C2E")
         f5_cfg.pack(fill="x", expand=True)
-        tk.Label(f5_cfg, text="Chỉ tiêu bạn/nick:", font=("Segoe UI", 8), fg="#E2E8F0", bg="#131C2E").pack(side="left")
-        self.ent_target = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 8), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
+        tk.Label(f5_cfg, text="Chỉ tiêu bạn/nick:", font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E").pack(side="left")
+        self.ent_target = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 9), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
         self.ent_target.insert(0, "25")
         self.ent_target.pack(side="left", padx=4)
 
-        tk.Label(f5_cfg, text="Số Page/nick:", font=("Segoe UI", 8), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(10, 2))
-        self.ent_page_target = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 8), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
+        tk.Label(f5_cfg, text="Số Page/nick:", font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(10, 2))
+        self.ent_page_target = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 9), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
         self.ent_page_target.insert(0, "5")
         self.ent_page_target.pack(side="left", padx=2)
 
-        tk.Label(f5_cfg, text="Delay Page (s):", font=("Segoe UI", 8), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(10, 2))
-        self.ent_min_page_delay = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 8), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
+        tk.Label(f5_cfg, text="Delay Page (s):", font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(10, 2))
+        self.ent_min_page_delay = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 9), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
         self.ent_min_page_delay.insert(0, "60")
         self.ent_min_page_delay.pack(side="left", padx=2)
-        tk.Label(f5_cfg, text="-", font=("Segoe UI", 8), fg="#E2E8F0", bg="#131C2E").pack(side="left")
-        self.ent_max_page_delay = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 8), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
+        tk.Label(f5_cfg, text="-", font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E").pack(side="left")
+        self.ent_max_page_delay = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 9), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
         self.ent_max_page_delay.insert(0, "120")
         self.ent_max_page_delay.pack(side="left", padx=2)
 
-        tk.Label(f5_cfg, text="Delay click (s):", font=("Segoe UI", 8), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(15, 2))
-        self.ent_min_delay = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 8), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
+        tk.Label(f5_cfg, text="Delay click (s):", font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(15, 2))
+        self.ent_min_delay = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 9), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
         self.ent_min_delay.insert(0, "25")
         self.ent_min_delay.pack(side="left", padx=2)
-        tk.Label(f5_cfg, text="-", font=("Segoe UI", 8), fg="#E2E8F0", bg="#131C2E").pack(side="left")
-        self.ent_max_delay = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 8), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
+        tk.Label(f5_cfg, text="-", font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E").pack(side="left")
+        self.ent_max_delay = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 9), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
         self.ent_max_delay.insert(0, "35")
         self.ent_max_delay.pack(side="left", padx=2)
 
@@ -3128,23 +3142,23 @@ class MainToolApp:
         f5_page_warmup = tk.Frame(card5, bg="#131C2E")
         f5_page_warmup.pack(fill="x", expand=True, pady=(2, 0))
 
-        tk.Label(f5_page_warmup, text="Lướt Feed đệm (phút):", font=("Segoe UI", 8), fg="#E2E8F0", bg="#131C2E").pack(side="left")
-        self.ent_feed_surf_min = tk.Entry(f5_page_warmup, width=4, font=("Segoe UI", 8), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
+        tk.Label(f5_page_warmup, text="Lướt Feed đệm (phút):", font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E").pack(side="left")
+        self.ent_feed_surf_min = tk.Entry(f5_page_warmup, width=4, font=("Segoe UI", 9), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
         self.ent_feed_surf_min.insert(0, "10")
         self.ent_feed_surf_min.pack(side="left", padx=2)
 
-        tk.Label(f5_page_warmup, text="Xem Review đệm (phút):", font=("Segoe UI", 8), fg="#E2E8F0", bg="#0254F8").pack(side="left", padx=(10, 2))
-        self.ent_watch_review_min = tk.Entry(f5_page_warmup, width=4, font=("Segoe UI", 8), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
+        tk.Label(f5_page_warmup, text="Xem Review đệm (phút):", font=("Segoe UI", 9), fg="#E2E8F0", bg="#0254F8").pack(side="left", padx=(10, 2))
+        self.ent_watch_review_min = tk.Entry(f5_page_warmup, width=4, font=("Segoe UI", 9), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
         self.ent_watch_review_min.insert(0, "5")
         self.ent_watch_review_min.pack(side="left", padx=2)
-        tk.Label(f5_page_warmup, text="Luồng Page/BM:", font=("Segoe UI", 8), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(10, 2))
-        self.ent_max_create_page_workers = tk.Entry(f5_page_warmup, width=3, font=("Segoe UI", 8), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
+        tk.Label(f5_page_warmup, text="Luồng Page/BM:", font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(10, 2))
+        self.ent_max_create_page_workers = tk.Entry(f5_page_warmup, width=3, font=("Segoe UI", 9), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
         self.ent_max_create_page_workers.insert(0, "3")
         self.ent_max_create_page_workers.pack(side="left", padx=2)
         # Ô nhập STT rải rác hoặc dải số (ví dụ: 1, 3, 5-8)
         f_filter_idx = tk.Frame(f_bottom_right, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=6, pady=3)
         f_filter_idx.pack(fill="x", pady=(0, 4))
-        tk.Label(f_filter_idx, text="🎯 Chọn STT chạy:", font=("Segoe UI", 8, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
+        tk.Label(f_filter_idx, text="🎯 Chọn STT chạy:", font=("Segoe UI", 9, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
         self.ent_selected_indexes = tk.Entry(f_filter_idx, font=("Consolas", 9), bg="#070B14", fg="#00FF66", relief="solid", bd=1)
         self.ent_selected_indexes.pack(side="left", fill="x", expand=True, padx=4)
         tk.Label(f_filter_idx, text="(VD: 1, 3, 5-9)", font=("Segoe UI", 7), fg="#64748B", bg="#131C2E").pack(side="right")
@@ -3428,11 +3442,69 @@ class MainToolApp:
                              bg=colors["background"], fg=colors["foreground"])
             label.pack()
             self.result_center_summary_labels[key] = label
-        self.style.configure("Result.TNotebook", background=palette["background"], borderwidth=0)
-        self.style.configure("Result.TNotebook.Tab", background=palette["header_background"],
-                             foreground=palette["foreground"], padding=(12, 8))
-        self.style.map("Result.TNotebook.Tab", background=[("selected", palette["selected_background"])],
-                       foreground=[("selected", palette["selected_foreground"])])
+                # Ép riêng Notebook Result Center dùng element của theme clam
+        # để Windows không tự vẽ nền tab màu trắng.
+        if "ResultNotebook.tab" not in self.style.element_names():
+            self.style.element_create("ResultNotebook.tab", "from", "clam", "Notebook.tab")
+            self.style.element_create("ResultNotebook.padding", "from", "clam", "Notebook.padding")
+            self.style.element_create("ResultNotebook.focus", "from", "clam", "Notebook.focus")
+            self.style.element_create("ResultNotebook.label", "from", "clam", "Notebook.label")
+            self.style.element_create("ResultNotebook.client", "from", "clam", "Notebook.client")
+
+        self.style.layout("Result.TNotebook", [
+            ("ResultNotebook.client", {"sticky": "nswe"})
+        ])
+
+        self.style.layout("Result.TNotebook.Tab", [
+            ("ResultNotebook.tab", {
+                "sticky": "nswe",
+                "children": [
+                    ("ResultNotebook.padding", {
+                        "side": "top",
+                        "sticky": "nswe",
+                        "children": [
+                            ("ResultNotebook.focus", {
+                                "side": "top",
+                                "sticky": "nswe",
+                                "children": [
+                                    ("ResultNotebook.label", {"side": "top", "sticky": ""})
+                                ]
+                            })
+                        ]
+                    })
+                ]
+            })
+        ])
+
+        self.style.configure(
+            "Result.TNotebook",
+            background="#19232C",
+            borderwidth=0
+        )
+
+        self.style.configure(
+            "Result.TNotebook.Tab",
+            background="#24323D",
+            foreground="#D7E3F0",
+            font=("Segoe UI", 9, "bold"),
+            padding=(16, 9),
+            borderwidth=0,
+            lightcolor="#24323D",
+            darkcolor="#24323D",
+            bordercolor="#19232C"
+        )
+
+        self.style.map(
+            "Result.TNotebook.Tab",
+            background=[
+                ("selected", "#0EA5E9"),
+                ("active", "#334155")
+            ],
+            foreground=[
+                ("selected", "#FFFFFF"),
+                ("active", "#FFFFFF")
+            ]
+        )
         notebook = ttk.Notebook(window, style="Result.TNotebook")
         notebook.pack(fill="both", expand=True, padx=12, pady=(12, 6))
         self.create_page_results_notebook = notebook
@@ -3475,12 +3547,42 @@ class MainToolApp:
             command=lambda: self.show_management_account_logs(self._result_center_menu_account))
         footer = tk.Frame(window, bg=palette["background"], padx=12, pady=10)
         footer.pack(fill="x")
-        self.lbl_create_page_result_summary = tk.Label(footer, text="", font=("Segoe UI", 9),
-            bg=palette["background"], fg=palette["foreground"])
+
+        self.lbl_create_page_result_summary = tk.Label(
+            footer, text="", font=("Segoe UI", 9),
+            bg=palette["background"], fg=palette["foreground"]
+        )
         self.lbl_create_page_result_summary.pack(side="left")
-        ttk.Button(footer, text="Xuất Excel", command=self.export_create_page_results_excel).pack(side="right", padx=4)
-        ttk.Button(footer, text="Xuất CSV", command=self.export_result_center_csv).pack(side="right", padx=4)
+
+        tk.Button(
+            footer, text="Xuất Excel",
+            command=self.export_create_page_results_excel,
+            bg="#16A34A", fg="#FFFFFF",
+            activebackground="#15803D", activeforeground="#FFFFFF",
+            font=("Segoe UI", 9, "bold"),
+            padx=14, pady=6, relief="flat", bd=0, cursor="hand2"
+        ).pack(side="right", padx=4)
+
+        tk.Button(
+            footer, text="Xuất CSV",
+            command=self.export_result_center_csv,
+            bg="#2563EB", fg="#FFFFFF",
+            activebackground="#1D4ED8", activeforeground="#FFFFFF",
+            font=("Segoe UI", 9, "bold"),
+            padx=14, pady=6, relief="flat", bd=0, cursor="hand2"
+        ).pack(side="right", padx=4)
+
         notebook.bind("<<NotebookTabChanged>>", lambda _event: self.update_result_center_footer())
+
+        def close():
+            window.destroy()
+            self.create_page_results_window = None
+            self.create_page_result_trees = {}
+            self.result_center_summary_labels = {}
+            self._result_center_menu_account = None
+
+        window.protocol("WM_DELETE_WINDOW", close)
+        self.refresh_create_page_results_dialog()
         def close():
             window.destroy()
             self.create_page_results_window = None
@@ -4161,6 +4263,8 @@ class MainToolApp:
             "batch_size": self.ent_batch_size.get(),
             "headless": self.chk_headless.get(),
             "warmup": self.chk_warmup.get(),
+            "watch_reels": self.chk_watch_reels.get(),
+            "view_stories": self.chk_view_stories.get(),
             "cancel_old": self.chk_cancel_old.get(),
             "target": self.ent_target.get(),
             "page_target": self.ent_page_target.get() if hasattr(self, 'ent_page_target') else "5",
@@ -4215,6 +4319,8 @@ class MainToolApp:
             if "batch_size" in data: self.ent_batch_size.delete(0, "end"); self.ent_batch_size.insert(0, data["batch_size"])
             if "headless" in data: self.chk_headless.set(data["headless"])
             if "warmup" in data: self.chk_warmup.set(data["warmup"])
+            if "watch_reels" in data: self.chk_watch_reels.set(data["watch_reels"])
+            if "view_stories" in data: self.chk_view_stories.set(data["view_stories"])
             if "cancel_old" in data: self.chk_cancel_old.set(data["cancel_old"])
             if "target" in data: self.ent_target.delete(0, "end"); self.ent_target.insert(0, data["target"])
             if "page_target" in data and hasattr(self, 'ent_page_target'):
@@ -4427,6 +4533,12 @@ class MainToolApp:
             self.log("[!] Tiến trình trước vẫn đang dọn dẹp. Vui lòng thử lại sau 2 giây.")
             return
 
+        self._run_generation = getattr(self, "_run_generation", 0) + 1
+        self._finished_run_generation = None
+        self._cancel_requested_generation = None
+        self.worker_root_task = None
+        self.worker_tasks = []
+        self.worker_loop = None
         self.is_running = False
         self.stop_requested = False
         self.run_error = None
@@ -4488,26 +4600,50 @@ class MainToolApp:
     def stop_bot(self):
         if not self.is_running and not (self.run_thread and self.run_thread.is_alive()):
             return
-        self.is_running = False
+        if self.stop_requested:
+            return
         self.stop_requested = True
+        generation = getattr(self, "_run_generation", 0)
         self.log("[!] Đang gửi lệnh dừng đến tất cả các luồng...")
         def mark_stopping():
+            if generation != getattr(self, "_run_generation", 0):
+                return
             self.btn_stop.config(state="disabled")
             if hasattr(self, 'lbl_status_indicator'):
                 self.lbl_status_indicator.config(text="● Đang dừng...", fg="#F59E0B")
         self.post_ui(mark_stopping)
         loop = self.worker_loop
         if loop and loop.is_running():
-            loop.call_soon_threadsafe(self._cancel_worker_tasks)
+            try:
+                loop.call_soon_threadsafe(self._cancel_worker_tasks, generation)
+            except RuntimeError:
+                # The worker may finish and close its loop during this request.
+                pass
 
-    def _cancel_worker_tasks(self):
+    def _cancel_worker_tasks(self, generation=None):
+        current = getattr(self, "_run_generation", 0)
+        if generation is not None and generation != current:
+            return
+        if getattr(self, "_cancel_requested_generation", None) == current:
+            return
+        self._cancel_requested_generation = current
+        root = getattr(self, "worker_root_task", None)
+        if root is not None and not root.done():
+            # Cancelling gather's owner propagates once to all account tasks.
+            root.cancel()
+            return
         for task in list(self.worker_tasks):
             if not task.done():
                 task.cancel()
 
-    def finish_run(self):
+    def finish_run(self, generation=None):
+        current = getattr(self, "_run_generation", 0)
+        if generation is not None and generation != current:
+            return
+        if getattr(self, "_finished_run_generation", None) == current:
+            return
         if self.run_thread and self.run_thread.is_alive():
-            self.root.after(100, self.finish_run)
+            self.root.after(100, lambda: self.finish_run(current))
             return
         was_stopped = self.stop_requested
         if getattr(self, "run_error", None):
@@ -4522,6 +4658,8 @@ class MainToolApp:
         self.run_thread = None
         self.worker_loop = None
         self.worker_tasks = []
+        self.worker_root_task = None
+        self._finished_run_generation = current
 
         # Khôi phục trạng thái nút Bắt đầu để người dùng có thể chạy lại ngay
         self.btn_start.config(state="normal")
@@ -4540,9 +4678,22 @@ class MainToolApp:
 
     def run_process(self):
         """Khởi tạo vòng lặp sự kiện tương thích tuyệt đối với Windows và Playwright"""
+        generation = getattr(self, "_run_generation", 0)
+        ui_context = getattr(self, "_ui_run_context", None)
+        if ui_context is None:
+            ui_context = self._ui_run_context = contextvars.ContextVar("ui_run_context", default=None)
+        token = ui_context.set(generation)
+
+        async def current_run():
+            self.worker_loop = asyncio.get_running_loop()
+            self.worker_root_task = asyncio.current_task()
+            if self.stop_requested:
+                raise asyncio.CancelledError()
+            await self.main_worker()
+
         try:
             # Chạy trực tiếp worker chính, không gọi lại set_event_loop_policy để tránh xung đột luồng
-            asyncio.run(self.main_worker())
+            asyncio.run(current_run())
         except asyncio.CancelledError:
             self.stop_requested = True
             self.log("[!] Luồng chính đã nhận lệnh dừng.")
@@ -4555,7 +4706,11 @@ class MainToolApp:
         finally:
             self.worker_loop = None
             self.worker_tasks = []
-            self.post_ui(self.finish_run)
+            self.worker_root_task = None
+            try:
+                self.post_ui(self.finish_run)
+            finally:
+                ui_context.reset(token)
 
 
     async def run_change_password(self, page, acc_name, idx, old_pass, new_pass):
@@ -5276,8 +5431,14 @@ class MainToolApp:
 
             login_btn = page.locator('button[name="login"], button[type="submit"]').first
             if await login_btn.count() == 0:
-                self.log(f"[-] [{username}] Không tìm thấy nút đăng nhập Facebook.")
-                return LOGIN_TECHNICAL_ERROR, "Không tìm thấy nút đăng nhập Facebook"
+                # New login forms use a role button rather than a native button.
+                candidates = page.locator(
+                    'form:has(input[name="email"]):has(input[name="pass"]) [role="button"]:visible'
+                )
+                if await candidates.count() != 1:
+                    self.log(f"[-] [{username}] Không xác định được nút đăng nhập Facebook duy nhất.")
+                    return LOGIN_TECHNICAL_ERROR, "Không xác định được nút đăng nhập Facebook duy nhất"
+                login_btn = candidates.first
 
             await login_btn.click()
             await page.wait_for_timeout(5000)
@@ -7316,7 +7477,7 @@ class MainToolApp:
         account_timezone="",
     ):
         async with semaphore:
-            if not self.is_running: return
+            if not self.is_running or self.stop_requested: return
 
             config = self.run_config
             modes = config.get("modes", {})
@@ -7647,16 +7808,18 @@ class MainToolApp:
                 return
             except asyncio.CancelledError:
                 current_state = self.account_states.get(idx)
-                interrupted = bool(current_state and current_state["status"] in {"CHECKPOINT", "ERROR"})
+                user_cancelled = self.stop_requested
+                interrupted = bool(not user_cancelled and current_state
+                                   and current_state["status"] in {"CHECKPOINT", "ERROR"})
                 self.finalize_active_account_tasks(
                     idx, "ERROR" if interrupted else "SKIPPED",
                     current_state["current_action"] if interrupted else "Đã dừng theo yêu cầu",
                 )
-                if current_state and current_state["status"] in {"CHECKPOINT", "ERROR"}:
+                if interrupted:
                     return
                 if current_state and current_state["status"] == "CHECKING":
-                    self.set_account_state(idx, status="ERROR", current_action="Đã dừng khi đang kiểm tra")
-                    self.update_tree_row(str(idx), status="ERROR")
+                    self.set_account_state(idx, status="UNKNOWN", current_action="Đã dừng khi đang kiểm tra")
+                    self.update_tree_row(str(idx), status="CHƯA KIỂM TRA")
                 else:
                     self.set_account_state(idx, current_action="Đã dừng")
                 self.log(f"[!] Đã dừng nick {acc_name} theo yêu cầu.")
@@ -7815,6 +7978,8 @@ class MainToolApp:
 
                 tasks = []
                 for job in batch_jobs:
+                    if self.stop_requested:
+                        break
                     tasks.append(asyncio.create_task(self.process_account_scoped(
                         p,
                         job["idx"],
