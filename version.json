@@ -1,7 +1,7 @@
 {
-  "version": "2.3.1",
-  "download_url": "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.3.1/client_app.exe",
-  "sha256": "942395DCADDA113EA947B0472456B53369B3C2FC082E1C65DA6E6793AAA3C36B",
-  "changelog": "Cải thiện đăng nhập cookie, quản lý tài khoản, lịch sử và độ ổn định.",
+  "version": "2.3.2",
+  "download_url": "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.3.2/client_app.exe",
+  "sha256": "98CA2C858B1881B238788DFC8D288FCA08C227E3D5C3AA3D320E48941B0E7E6D",
+  "changelog": "Sửa Dừng/hủy luồng, cải thiện selector đăng nhập, màu chữ và lưu tùy chọn. Create Page chưa xác minh runtime.",
   "mandatory": false
 }
