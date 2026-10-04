@@ -172,7 +172,7 @@ def test_table_header_background_and_selection_use_local_style_only():
         assert style.lookup("Account.Treeview.Heading", "background") == palette["header_background"]
         assert style.lookup("Account.Treeview.Heading", "foreground") == palette["header_foreground"]
         assert style.lookup("Account.Treeview", "fieldbackground") == palette["background"]
-        assert style.lookup("Account.Treeview", "rowheight") == 32
+        assert style.lookup("Account.Treeview", "rowheight") == 34
         assert style.lookup("Account.Treeview", "background", ("selected",)) == palette["selected_background"]
         assert style.lookup("Account.Treeview", "foreground", ("selected",)) == palette["selected_foreground"]
         assert "Account.Treeview.field" in str(style.layout("Account.Treeview"))

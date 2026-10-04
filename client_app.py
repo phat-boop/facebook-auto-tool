@@ -52,7 +52,7 @@ if sys.platform == 'win32':
 
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.3.2"
+CURRENT_VERSION = "2.3.3"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -134,6 +134,7 @@ FRIEND_REQUEST_SENT_SELECTORS = (
 )
 
 RESULT_FILE_LOCK = threading.Lock()
+CORE_AUTOMATION_MODES = ("create_page", "by_name", "by_group", "by_uid")
 
 ACCOUNT_STATUSES = {"UNKNOWN", "CHECKING", "LIVE", "DIE", "ERROR", "CHECKPOINT"}
 ACCOUNT_STATUS_LABELS = {
@@ -189,8 +190,8 @@ def configure_account_table_style(style, *trees):
             ("Account.Treeheading.border", {"sticky": "nswe", "children": [("Treeheading.padding", {"sticky": "nswe", "children": [
                 ("Treeheading.image", {"side": "right", "sticky": ""}),
                 ("Treeheading.text", {"sticky": "we"})]})]})])
-    style.configure("Account.Treeview", rowheight=32, foreground=palette["foreground"], background=palette["background"], fieldbackground=palette["background"], font=("Segoe UI", 9))
-    style.configure("Account.Treeview.Heading", background=palette["header_background"], foreground=palette["header_foreground"], font=("Segoe UI", 9, "bold"), padding=(8, 7))
+    style.configure("Account.Treeview", rowheight=34, foreground=palette["foreground"], background=palette["background"], fieldbackground=palette["background"], font=("Segoe UI", 11))
+    style.configure("Account.Treeview.Heading", background=palette["header_background"], foreground=palette["header_foreground"], font=("Segoe UI", 11, "bold"), padding=(8, 7))
     style.map("Account.Treeview", background=[("selected", palette["selected_background"])], foreground=[("selected", palette["selected_foreground"])])
     for tree in trees:
         tree.configure(style="Account.Treeview")
@@ -2543,6 +2544,16 @@ class MainToolApp:
             return default
         return max(minimum, min(maximum, parsed))
 
+    @staticmethod
+    def activity_duration_seconds(value, label):
+        try:
+            seconds = int(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label}: thời gian phải là số nguyên từ 0 đến 86400 giây.") from exc
+        if not 0 <= seconds <= 86400:
+            raise ValueError(f"{label}: thời gian phải từ 0 đến 86400 giây.")
+        return seconds
+
     def capture_run_config(self):
         """Read every Tk value once on the UI thread before automation starts."""
         checked_indexes = set()
@@ -2590,22 +2601,17 @@ class MainToolApp:
             ),
             "min_page_delay": min(min_page_delay, max_page_delay),
             "max_page_delay": max(min_page_delay, max_page_delay),
-            "feed_surf_min": self._bounded_int(self.ent_feed_surf_min.get(), 10, 0, 1440),
-            "watch_review_min": self._bounded_int(self.ent_watch_review_min.get(), 5, 0, 1440),
+            "warmup_seconds": self.activity_duration_seconds(self.ent_warmup_seconds.get(), "Feed đệm"),
+            "notification_seconds": self.activity_duration_seconds(self.ent_notification_seconds.get(), "Thông báo"),
             "tele_token": self.ent_tele_token.get().strip(),
             "tele_chatid": self.ent_tele_chatid.get().strip(),
             "screen_width": self.root.winfo_screenwidth(),
             "screen_height": self.root.winfo_screenheight(),
-            "modes": {key: bool(value.get()) for key, value in self.mode_vars.items()},
+            "modes": {key: bool(value.get()) for key, value in self.mode_vars.items()
+                      if key in CORE_AUTOMATION_MODES},
             "options": {
-                "browse_web": bool(self.chk_browse_web.get()),
                 "warmup": bool(self.chk_warmup.get()),
-                "watch_reels": bool(self.chk_watch_reels.get()),
-                "view_stories": bool(self.chk_view_stories.get()),
                 "check_notif": bool(self.chk_check_notif.get()),
-                "chat_react": bool(self.chk_chat_react.get()),
-                "interact_page": bool(self.chk_interact_page.get()),
-                "cancel_old": bool(self.chk_cancel_old.get()),
             },
         }
         values["auto_headless"] = values["threads"] > 12 and not values["headless"]
@@ -2856,69 +2862,71 @@ class MainToolApp:
 
         # 3. Chức năng tự động Card
         card3 = tk.Frame(paned_left, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
-        paned_left.add(card3, minsize=140, height=280)
+        paned_left.add(card3, minsize=245, height=280)
+
+        f3_targets = tk.Frame(card3, bg="#131C2E")
+        f3_targets.pack(side="bottom", fill="x")
+        tk.Label(f3_targets, text="Đích kết bạn / Cấu hình Page:", font=("Segoe UI", 12), fg="#64748B", bg="#131C2E").pack(anchor="w", pady=(2, 1))
+        self.txt_targets = scrolledtext.ScrolledText(f3_targets, height=2, bg="#070B14", fg="#E2E8F0", font=("Consolas", 11), insertbackground="#38BDF8", relief="solid", bd=1)
+        self.txt_targets.pack(fill="x")
 
         f3_head = tk.Frame(card3, bg="#131C2E")
         f3_head.pack(fill="x", pady=(0, 2))
-        tk.Label(f3_head, text="⚡ 3. CHỨC NĂNG TỰ ĐỘNG", font=("Segoe UI", 11, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
+        tk.Label(f3_head, text="⚡ 3. CHỨC NĂNG TỰ ĐỘNG", font=("Segoe UI", 13, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
         
         def toggle_all(val):
             for v in self.mode_vars.values(): v.set(val)
 
-        tk.Button(f3_head, text="Bỏ chọn hết", font=("Segoe UI", 7), bg="#1E293B", fg="#94A3B8", relief="flat", cursor="hand2", command=lambda: toggle_all(False)).pack(side="right", padx=2)
-        tk.Button(f3_head, text="Chọn tất cả", font=("Segoe UI", 7), bg="#1E293B", fg="#38BDF8", relief="flat", cursor="hand2", command=lambda: toggle_all(True)).pack(side="right", padx=2)
+        f3_actions = tk.Frame(card3, bg="#131C2E")
+        f3_actions.pack(fill="x", pady=(2, 4))
+        tk.Button(f3_actions, text="Bỏ chọn hết", font=("Segoe UI", 11), bg="#1E293B", fg="#94A3B8", relief="flat", cursor="hand2", command=lambda: toggle_all(False)).pack(side="right", padx=2)
+        tk.Button(f3_actions, text="Chọn tất cả", font=("Segoe UI", 11), bg="#1E293B", fg="#38BDF8", relief="flat", cursor="hand2", command=lambda: toggle_all(True)).pack(side="right", padx=2)
+        f_modes_scroll = tk.Frame(card3, bg="#131C2E")
+        f_modes_scroll.pack(fill="both", expand=True)
+        self.modes_canvas = tk.Canvas(f_modes_scroll, bg="#131C2E", height=135, highlightthickness=0)
+        modes_scrollbar = ttk.Scrollbar(f_modes_scroll, orient="vertical", command=self.modes_canvas.yview)
+        modes_scrollbar.pack(side="right", fill="y")
+        self.modes_canvas.pack(side="left", fill="both", expand=True)
+        self.modes_canvas.configure(yscrollcommand=modes_scrollbar.set)
+        f_modes_grid = tk.Frame(self.modes_canvas, bg="#131C2E")
+        modes_window = self.modes_canvas.create_window((0, 0), window=f_modes_grid, anchor="nw")
+        f_modes_grid.bind("<Configure>", lambda _event: self.modes_canvas.configure(scrollregion=self.modes_canvas.bbox("all")))
+        mode_buttons = []
 
-        canvas_modes = tk.Canvas(card3, bg="#131C2E", highlightthickness=0, bd=0)
-        scroll_modes = ttk.Scrollbar(card3, orient="vertical", command=canvas_modes.yview)
-        f_modes_grid = tk.Frame(canvas_modes, bg="#131C2E")
+        def resize_modes(event):
+            self.modes_canvas.itemconfigure(modes_window, width=event.width)
+            columns = 2 if mode_buttons and event.width >= 2 * max(button.winfo_reqwidth() for button in mode_buttons) + 12 else 1
+            for index, button in enumerate(mode_buttons):
+                row, column = divmod(index, columns)
+                button.grid_configure(row=row, column=column)
 
-        f_modes_grid.bind("<Configure>", lambda e: canvas_modes.configure(scrollregion=canvas_modes.bbox("all")))
-        canvas_window = canvas_modes.create_window((0, 0), window=f_modes_grid, anchor="nw")
-        canvas_modes.configure(yscrollcommand=scroll_modes.set)
+        self.modes_canvas.bind("<Configure>", resize_modes)
 
-        def _on_canvas_configure(e):
-            canvas_modes.itemconfig(canvas_window, width=e.width)
-        canvas_modes.bind("<Configure>", _on_canvas_configure)
+        def scroll_modes(event):
+            self.modes_canvas.yview_scroll(-int(event.delta / 120), "units")
+            return "break"
 
-        def _on_mousewheel(event):
-            canvas_modes.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        card3.bind("<Enter>", lambda e: canvas_modes.bind_all("<MouseWheel>", _on_mousewheel))
-        card3.bind("<Leave>", lambda e: canvas_modes.unbind_all("<MouseWheel>"))
-
-        canvas_modes.pack(side="top", fill="both", expand=True)
-        scroll_modes.pack(side="right", fill="y")
-        for i in range(3): f_modes_grid.columnconfigure(i, weight=1)
+        self.modes_canvas.bind("<MouseWheel>", scroll_modes)
 
         self.mode_vars = {}
         all_modes = [
+            ("🚩 Tạo Page", "create_page"),
             ("🔍 Kết bạn theo tên", "by_name"),
             ("👥 Kết bạn trong nhóm", "by_group"),
             ("📇 Kết bạn theo UID", "by_uid"),
-            ("🚩 Tạo Fanpage", "create_page"),
-            ("🚀 Đăng bài Fanpage", "post_page"),
-            ("👑 Thêm Admin Page", "add_page_admin"),
-            ("🏷️ Đổi tên Fanpage", "update_page_name"),
-            ("👍 Mời bạn Like Page", "invite_like_page"),
-            ("➕ Tham gia nhóm", "join_group"),
-            ("📝 Đăng bài Facebook", "auto_post"),
-            ("ℹ️ Cập nhật tiểu sử", "change_bio"),
-            ("🖼️ Thay Avatar/Bìa", "change_avatar"),
         ]
 
         for i, (text, val) in enumerate(all_modes):
-            r, c = divmod(i, 3)
             var = tk.BooleanVar(value=True if val == "by_name" else False)
             self.mode_vars[val] = var
-            tk.Checkbutton(
+            button = tk.Checkbutton(
                 f_modes_grid, text=text, variable=var,
                 font=("Segoe UI", 13), fg="#E2E8F0", bg="#131C2E", selectcolor="#070B14",
                 activebackground="#131C2E", activeforeground="#38BDF8", cursor="hand2"
-            ).grid(row=r, column=c, sticky="w", padx=2, pady=2)
-
-        tk.Label(card3, text="Nhập Link/ID Group, UID, Pass mới HOẶC File ảnh (mỗi dòng 1 mục):", font=("Segoe UI", 10), fg="#64748B", bg="#131C2E").pack(anchor="w", pady=(2, 1))
-        self.txt_targets = scrolledtext.ScrolledText(card3, height=2, bg="#070B14", fg="#E2E8F0", font=("Consolas", 9), insertbackground="#38BDF8", relief="solid", bd=1)
-        self.txt_targets.pack(fill="x")
+            )
+            button.grid(row=i, column=0, sticky="w", padx=2, pady=2)
+            button.bind("<MouseWheel>", scroll_modes)
+            mode_buttons.append(button)
 
         # Log Card
         card_log = tk.Frame(paned_left, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
@@ -2938,16 +2946,16 @@ class MainToolApp:
             cursor="hand2",
             command=self.show_global_log,
         ).pack(side="right")
-        self.txt_log = scrolledtext.ScrolledText(card_log, bg="#070B14", fg="#00FF66", font=("Consolas", 9), insertbackground="#38BDF8", relief="solid", bd=1, state="disabled")
+        self.txt_log = scrolledtext.ScrolledText(card_log, bg="#070B14", fg="#00FF66", font=("Consolas", 11), insertbackground="#38BDF8", relief="solid", bd=1, state="disabled")
         self.txt_log.pack(fill="both", expand=True)
 
         # ==================== CỘT PHẢI (THIẾT KẾ ĐẦY ĐỦ, CHUYÊN NGHIỆP) ====================
         paned_right = tk.PanedWindow(paned_main, orient="vertical", bg="#0A0E1A", bd=0, sashwidth=5, sashrelief="ridge")
-        paned_main.add(paned_right, minsize=420)
+        paned_main.add(paned_right, minsize=500)
 
         # R1: Card Danh sách Proxy
         card2 = tk.Frame(paned_right, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
-        paned_right.add(card2, minsize=150, height=190)
+        paned_right.add(card2, minsize=190, height=210)
 
         f2_head = tk.Frame(card2, bg="#131C2E")
         f2_head.pack(fill="x", pady=(0, 2))
@@ -2955,8 +2963,7 @@ class MainToolApp:
         tk.Button(f2_head, text="📁 Nhập từ file .txt", font=("Segoe UI", 8, "bold"), bg="#1E293B", fg="#F8FAFC", relief="flat", padx=8, pady=1, cursor="hand2", command=self.import_proxies_file).pack(side="right")
 
         tk.Label(card2, text="Nhập danh sách Proxy (IP:Port hoặc IP:Port:User:Pass):", font=("Segoe UI", 8), fg="#64748B", bg="#131C2E").pack(anchor="w")
-        self.txt_proxies = scrolledtext.ScrolledText(card2, height=4, bg="#070B14", fg="#E2E8F0", font=("Consolas", 9), insertbackground="#38BDF8", relief="solid", bd=1)
-        self.txt_proxies.pack(fill="x", pady=2)
+        self.txt_proxies = scrolledtext.ScrolledText(card2, height=3, bg="#070B14", fg="#E2E8F0", font=("Consolas", 11), insertbackground="#38BDF8", relief="solid", bd=1)
 
         f2_cfg = tk.Frame(card2, bg="#131C2E")
         f2_cfg.pack(fill="x")
@@ -2992,10 +2999,11 @@ class MainToolApp:
         self.lbl_proxy_count = tk.Label(f2_bot, text="Tổng: 0 proxy", font=("Segoe UI", 8), fg="#94A3B8", bg="#131C2E")
         self.lbl_proxy_count.pack(side="left")
         tk.Button(f2_bot, text="🗑 Xóa tất cả", font=("Segoe UI", 8), bg="#131C2E", fg="#F87171", relief="flat", cursor="hand2", command=lambda: self.txt_proxies.delete("1.0", "end")).pack(side="right")
+        self.txt_proxies.pack(fill="both", expand=True, pady=2)
 
         # R2: Trạng thái tài khoản và điều hướng theo đợt
         card_reg = tk.Frame(paned_right, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
-        paned_right.add(card_reg, minsize=135, height=190)
+        paned_right.add(card_reg, minsize=105, height=190)
 
         f_reg_head = tk.Frame(card_reg, bg="#131C2E")
         f_reg_head.pack(fill="x", pady=(0, 3))
@@ -3032,62 +3040,69 @@ class MainToolApp:
         self.account_state_tree.column("friends", width=105, anchor="center", stretch=False)
         self.account_state_tree.column("action", width=190, anchor="w")
         configure_account_table_style(self.style, self.account_state_tree)
-        self.account_state_tree.pack(fill="both", expand=True)
         state_scroll = ttk.Scrollbar(card_reg, orient="horizontal", command=self.account_state_tree.xview)
-        state_scroll.pack(fill="x")
+        state_scroll.pack(side="bottom", fill="x")
         self.account_state_tree.configure(xscrollcommand=state_scroll.set)
         self.account_state_tree.bind("<<TreeviewSelect>>", self.on_account_state_selected)
 
         self.lbl_queue_info = tk.Label(
             card_reg,
             text="Tổng: 0 • LIVE: 0 • DIE: 0 • ERROR: 0",
-            font=("Segoe UI", 7),
+            font=("Segoe UI", 10),
             fg="#CBD5E1",
             bg="#131C2E",
             anchor="w",
         )
-        self.lbl_queue_info.pack(fill="x", pady=(3, 0))
+        self.lbl_queue_info.pack(side="bottom", fill="x", pady=(3, 0))
+        self.account_state_tree.pack(fill="both", expand=True)
 
-        # R3: Card Nuôi Nick Chống Checkpoint
-        card4 = tk.Frame(paned_right, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
-        paned_right.add(card4, minsize=115, height=155)
+        # Settings can scroll; run controls stay visible below them.
+        f_bottom_right = tk.Frame(paned_right, bg="#0A0E1A")
+        paned_right.add(f_bottom_right, minsize=205, height=360)
+        f_run_controls = tk.Frame(f_bottom_right, bg="#0A0E1A")
+        f_run_controls.pack(side="bottom", fill="x")
+        f_settings_scroll = tk.Frame(f_bottom_right, bg="#131C2E")
+        f_settings_scroll.pack(fill="both", expand=True, pady=(0, 4))
+        self.settings_canvas = tk.Canvas(f_settings_scroll, bg="#131C2E", highlightthickness=0)
+        settings_scroll = ttk.Scrollbar(f_settings_scroll, orient="vertical", command=self.settings_canvas.yview)
+        settings_scroll.pack(side="right", fill="y")
+        self.settings_canvas.pack(side="left", fill="both", expand=True)
+        self.settings_canvas.configure(yscrollcommand=settings_scroll.set)
+        f_settings = tk.Frame(self.settings_canvas, bg="#131C2E")
+        settings_window = self.settings_canvas.create_window((0, 0), window=f_settings, anchor="nw")
+        f_settings.bind("<Configure>", lambda _event: self.settings_canvas.configure(scrollregion=self.settings_canvas.bbox("all")))
+        self.settings_canvas.bind("<Configure>", lambda event: self.settings_canvas.itemconfigure(settings_window, width=event.width))
 
-        tk.Label(card4, text="🛡️ 5. HIỆU NĂNG & ĐIỀU TIẾT", font=("Segoe UI", 11, "bold"), fg="#38BDF8", bg="#131C2E").pack(anchor="w", pady=(0, 2))
+        card4 = tk.Frame(f_settings, bg="#131C2E", padx=12, pady=8)
+        card4.pack(fill="x")
+        tk.Label(card4, text="🛡️ 5. HIỆU NĂNG & ĐIỀU TIẾT", font=("Segoe UI", 13, "bold"), fg="#38BDF8", bg="#131C2E").pack(anchor="w", pady=(0, 4))
 
         f4_sys = tk.Frame(card4, bg="#131C2E")
         f4_sys.pack(fill="x", pady=2)
-        tk.Label(f4_sys, text="Trình duyệt đồng thời (1–20):", font=("Segoe UI", 8), fg="#E2E8F0", bg="#131C2E").pack(side="left")
-        self.ent_threads = tk.Entry(f4_sys, width=4, font=("Segoe UI", 8, "bold"), bg="#070B14", fg="#38BDF8", justify="center", relief="solid", bd=1)
+        tk.Label(f4_sys, text="Trình duyệt đồng thời:", font=("Segoe UI", 12), fg="#E2E8F0", bg="#131C2E").pack(side="left")
+        self.ent_threads = tk.Spinbox(f4_sys, from_=1, to=20, width=3, font=("Segoe UI", 12, "bold"), bg="#070B14", fg="#38BDF8", justify="center", relief="solid", bd=1)
+        self.ent_threads.delete(0, "end")
         self.ent_threads.insert(0, "6")
         self.ent_threads.pack(side="left", padx=4)
 
         self.chk_headless = tk.BooleanVar(value=False)
         self.chk_warmup = tk.BooleanVar(value=True)
-        self.chk_cancel_old = tk.BooleanVar(value=True)
-        self.chk_watch_reels = tk.BooleanVar(value=True)
-        self.chk_view_stories = tk.BooleanVar(value=True)
-        self.chk_browse_web = tk.BooleanVar(value=True)
-        self.chk_interact_page = tk.BooleanVar(value=True)
         self.chk_check_notif = tk.BooleanVar(value=True)
-        self.chk_chat_react = tk.BooleanVar(value=True)
+        tk.Checkbutton(f4_sys, text="Chạy ẩn", variable=self.chk_headless, font=("Segoe UI", 13), fg="#E2E8F0", bg="#131C2E", selectcolor="#070B14", cursor="hand2").pack(side="left", padx=8)
 
-        f4_checks = tk.Frame(card4, bg="#131C2E")
-        f4_checks.pack(fill="both", expand=True, pady=2)
-        for i in range(3): f4_checks.columnconfigure(i, weight=1)
-        c_list = [
-            ("Chạy ẩn trình duyệt", self.chk_headless),
-            ("Lướt Newfeed đệm (30s)", self.chk_warmup),
-            ("Hủy lời mời cũ", self.chk_cancel_old),
-            ("Xem Reels Video", self.chk_watch_reels),
-            ("Xem Story bạn bè", self.chk_view_stories),
-            ("Lướt báo ngoài (20s)", self.chk_browse_web),
-            ("Like/Follow Fanpage", self.chk_interact_page),
-            ("Xem Thông báo", self.chk_check_notif),
-            ("Thả tim Messenger", self.chk_chat_react)
-        ]
-        for i, (txt, var) in enumerate(c_list):
-            r, c = divmod(i, 3)
-            tk.Checkbutton(f4_checks, text=txt, variable=var, font=("Segoe UI", 12), fg="#E2E8F0", bg="#131C2E", selectcolor="#070B14", cursor="hand2").grid(row=r, column=c, sticky="w", padx=2, pady=1)
+        for label, variable, attribute, default in (
+            ("Lướt Feed đệm", self.chk_warmup, "ent_warmup_seconds", "30"),
+            ("Xem thông báo", self.chk_check_notif, "ent_notification_seconds", "3"),
+        ):
+            row = tk.Frame(card4, bg="#131C2E")
+            row.pack(fill="x", pady=3)
+            tk.Checkbutton(row, text=label, variable=variable, font=("Segoe UI", 13), fg="#E2E8F0", bg="#131C2E", selectcolor="#070B14", cursor="hand2").pack(side="left")
+            entry = tk.Spinbox(row, from_=0, to=86400, width=5, font=("Segoe UI", 13), bg="#070B14", fg="#38BDF8", justify="center", relief="solid", bd=1)
+            entry.delete(0, "end")
+            entry.insert(0, default)
+            entry.pack(side="left", padx=8)
+            setattr(self, attribute, entry)
+            tk.Label(row, text="giây", font=("Segoe UI", 12), fg="#E2E8F0", bg="#131C2E").pack(side="left")
 
         f4_tele = tk.Frame(card4, bg="#131C2E")
         f4_tele.pack(fill="x", pady=(2, 0))
@@ -3099,87 +3114,86 @@ class MainToolApp:
         self.ent_tele_chatid = tk.Entry(f4_tele, width=10, font=("Segoe UI", 10), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
         self.ent_tele_chatid.pack(side="left")
 
-        # R4: Card Thông số & Điều khiển
-        f_bottom_right = tk.Frame(paned_right, bg="#0A0E1A")
-        paned_right.add(f_bottom_right, minsize=120, height=145)
-
-        card5 = tk.Frame(f_bottom_right, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=6)
+        card5 = tk.Frame(f_settings, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
         card5.pack(fill="x", pady=(0, 4))
 
-        tk.Label(card5, text="⚙️ 6. THÔNG SỐ GỬI KẾT BẠN & TƯƠNG TÁC", font=("Segoe UI", 11, "bold"), fg="#38BDF8", bg="#131C2E").pack(anchor="w", pady=(0, 2))
+        tk.Label(card5, text="⚙️ 6. THÔNG SỐ PAGE & KẾT BẠN", font=("Segoe UI", 13, "bold"), fg="#38BDF8", bg="#131C2E").pack(anchor="w", pady=(0, 4))
 
         f5_cfg = tk.Frame(card5, bg="#131C2E")
-        f5_cfg.pack(fill="x", expand=True)
-        tk.Label(f5_cfg, text="Chỉ tiêu bạn/nick:", font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E").pack(side="left")
-        self.ent_target = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 9), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
+        f5_cfg.pack(fill="x", pady=3)
+        tk.Label(f5_cfg, text="Bạn/nick:", font=("Segoe UI", 12), fg="#E2E8F0", bg="#131C2E").pack(side="left")
+        self.ent_target = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 12), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
         self.ent_target.insert(0, "25")
         self.ent_target.pack(side="left", padx=4)
 
-        tk.Label(f5_cfg, text="Số Page/nick:", font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(10, 2))
-        self.ent_page_target = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 9), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
-        self.ent_page_target.insert(0, "5")
-        self.ent_page_target.pack(side="left", padx=2)
-
-        tk.Label(f5_cfg, text="Delay Page (s):", font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(10, 2))
-        self.ent_min_page_delay = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 9), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
-        self.ent_min_page_delay.insert(0, "60")
-        self.ent_min_page_delay.pack(side="left", padx=2)
-        tk.Label(f5_cfg, text="-", font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E").pack(side="left")
-        self.ent_max_page_delay = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 9), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
-        self.ent_max_page_delay.insert(0, "120")
-        self.ent_max_page_delay.pack(side="left", padx=2)
-
-        tk.Label(f5_cfg, text="Delay click (s):", font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(15, 2))
-        self.ent_min_delay = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 9), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
+        tk.Label(f5_cfg, text="Delay kết bạn (s):", font=("Segoe UI", 12), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(12, 2))
+        self.ent_min_delay = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 12), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
         self.ent_min_delay.insert(0, "25")
         self.ent_min_delay.pack(side="left", padx=2)
-        tk.Label(f5_cfg, text="-", font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E").pack(side="left")
-        self.ent_max_delay = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 9), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
+        tk.Label(f5_cfg, text="-", font=("Segoe UI", 12), fg="#E2E8F0", bg="#131C2E").pack(side="left")
+        self.ent_max_delay = tk.Entry(f5_cfg, width=4, font=("Segoe UI", 12), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
         self.ent_max_delay.insert(0, "35")
         self.ent_max_delay.pack(side="left", padx=2)
 
-        # Thêm cấu hình số phút ngâm giữa các lần tạo Page
-        f5_page_warmup = tk.Frame(card5, bg="#131C2E")
-        f5_page_warmup.pack(fill="x", expand=True, pady=(2, 0))
+        f5_page = tk.Frame(card5, bg="#131C2E")
+        f5_page.pack(fill="x", pady=3)
+        tk.Label(f5_page, text="Page/nick:", font=("Segoe UI", 12), fg="#E2E8F0", bg="#131C2E").pack(side="left")
+        self.ent_page_target = tk.Entry(f5_page, width=4, font=("Segoe UI", 12), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
+        self.ent_page_target.insert(0, "5")
+        self.ent_page_target.pack(side="left", padx=2)
 
-        tk.Label(f5_page_warmup, text="Lướt Feed đệm (phút):", font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E").pack(side="left")
-        self.ent_feed_surf_min = tk.Entry(f5_page_warmup, width=4, font=("Segoe UI", 9), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
-        self.ent_feed_surf_min.insert(0, "10")
-        self.ent_feed_surf_min.pack(side="left", padx=2)
+        tk.Label(f5_page, text="Delay Page (s):", font=("Segoe UI", 12), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(12, 2))
+        self.ent_min_page_delay = tk.Entry(f5_page, width=4, font=("Segoe UI", 12), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
+        self.ent_min_page_delay.insert(0, "60")
+        self.ent_min_page_delay.pack(side="left", padx=2)
+        tk.Label(f5_page, text="-", font=("Segoe UI", 12), fg="#E2E8F0", bg="#131C2E").pack(side="left")
+        self.ent_max_page_delay = tk.Entry(f5_page, width=4, font=("Segoe UI", 12), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
+        self.ent_max_page_delay.insert(0, "120")
+        self.ent_max_page_delay.pack(side="left", padx=2)
 
-        tk.Label(f5_page_warmup, text="Xem Review đệm (phút):", font=("Segoe UI", 9), fg="#E2E8F0", bg="#0254F8").pack(side="left", padx=(10, 2))
-        self.ent_watch_review_min = tk.Entry(f5_page_warmup, width=4, font=("Segoe UI", 9), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
-        self.ent_watch_review_min.insert(0, "5")
-        self.ent_watch_review_min.pack(side="left", padx=2)
-        tk.Label(f5_page_warmup, text="Luồng Page/BM:", font=("Segoe UI", 9), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(10, 2))
-        self.ent_max_create_page_workers = tk.Entry(f5_page_warmup, width=3, font=("Segoe UI", 9), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
+        f5_workers = tk.Frame(card5, bg="#131C2E")
+        f5_workers.pack(fill="x", pady=3)
+        tk.Label(f5_workers, text="Luồng tạo Page:", font=("Segoe UI", 12), fg="#E2E8F0", bg="#131C2E").pack(side="left")
+        self.ent_max_create_page_workers = tk.Entry(f5_workers, width=3, font=("Segoe UI", 12), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
         self.ent_max_create_page_workers.insert(0, "3")
         self.ent_max_create_page_workers.pack(side="left", padx=2)
+
+        def scroll_settings(event):
+            self.settings_canvas.yview_scroll(-int(event.delta / 120), "units")
+            return "break"
+
+        def bind_settings_scroll(widget):
+            widget.bind("<MouseWheel>", scroll_settings)
+            for child in widget.winfo_children():
+                bind_settings_scroll(child)
+
+        self.settings_canvas.bind("<MouseWheel>", scroll_settings)
+        bind_settings_scroll(f_settings)
         # Ô nhập STT rải rác hoặc dải số (ví dụ: 1, 3, 5-8)
-        f_filter_idx = tk.Frame(f_bottom_right, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=6, pady=3)
+        f_filter_idx = tk.Frame(f_run_controls, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=6, pady=3)
         f_filter_idx.pack(fill="x", pady=(0, 4))
-        tk.Label(f_filter_idx, text="🎯 Chọn STT chạy:", font=("Segoe UI", 9, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
-        self.ent_selected_indexes = tk.Entry(f_filter_idx, font=("Consolas", 9), bg="#070B14", fg="#00FF66", relief="solid", bd=1)
+        tk.Label(f_filter_idx, text="🎯 Chọn STT chạy:", font=("Segoe UI", 11, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
+        self.ent_selected_indexes = tk.Entry(f_filter_idx, font=("Consolas", 11), bg="#070B14", fg="#00FF66", relief="solid", bd=1)
         self.ent_selected_indexes.pack(side="left", fill="x", expand=True, padx=4)
         tk.Label(f_filter_idx, text="(VD: 1, 3, 5-9)", font=("Segoe UI", 7), fg="#64748B", bg="#131C2E").pack(side="right")
 
-        f_action_btns = tk.Frame(f_bottom_right, bg="#0A0E1A")
+        f_action_btns = tk.Frame(f_run_controls, bg="#0A0E1A")
         f_action_btns.pack(fill="x", pady=(0, 4))
-        self.btn_start = tk.Button(f_action_btns, text="▶ BẮT ĐẦU CHẠY", font=("Segoe UI", 10, "bold"), bg="#10B981", fg="#FFFFFF", relief="flat", cursor="hand2", command=self.start_thread)
+        self.btn_start = tk.Button(f_action_btns, text="▶ BẮT ĐẦU CHẠY", font=("Segoe UI", 13, "bold"), bg="#10B981", fg="#FFFFFF", relief="flat", cursor="hand2", command=self.start_thread)
         self.btn_start.pack(side="left", fill="both", expand=True, padx=(0, 4))
-        self.btn_stop = tk.Button(f_action_btns, text="⏹ DỪNG LẠI", font=("Segoe UI", 10, "bold"), bg="#EF4444", fg="#FFFFFF", relief="flat", cursor="hand2", state="disabled", command=self.stop_bot)
+        self.btn_stop = tk.Button(f_action_btns, text="⏹ DỪNG LẠI", font=("Segoe UI", 13, "bold"), bg="#EF4444", fg="#FFFFFF", relief="flat", cursor="hand2", state="disabled", command=self.stop_bot)
         self.btn_stop.pack(side="right", fill="both", expand=True, padx=(4, 0))
 
-        f_stats = tk.Frame(f_bottom_right, bg="#0A0E1A")
+        f_stats = tk.Frame(f_run_controls, bg="#0A0E1A")
         f_stats.pack(fill="both", expand=True)
         for i in range(4): f_stats.columnconfigure(i, weight=1)
 
         def make_stat_box(parent, title, val, col_idx, color):
             bx = tk.Frame(parent, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, pady=3)
             bx.grid(row=0, column=col_idx, sticky="nsew", padx=2)
-            lbl_v = tk.Label(bx, text=val, font=("Segoe UI", 11, "bold"), fg=color, bg="#131C2E")
+            lbl_v = tk.Label(bx, text=val, font=("Segoe UI", 13, "bold"), fg=color, bg="#131C2E")
             lbl_v.pack(expand=True)
-            tk.Label(bx, text=title, font=("Segoe UI", 7), fg="#94A3B8", bg="#131C2E").pack(pady=(0, 1))
+            tk.Label(bx, text=title, font=("Segoe UI", 10), fg="#94A3B8", bg="#131C2E").pack(pady=(0, 1))
             return lbl_v
 
         self.lbl_stat_total = make_stat_box(f_stats, "Tổng nick", "0", 0, "#38BDF8")
@@ -4246,7 +4260,8 @@ class MainToolApp:
     
     # [BẮT ĐẦU THAY THẾ save_settings VÀ load_settings:]
     def save_settings(self):
-        modes_saved = {k: v.get() for k, v in self.mode_vars.items()} if hasattr(self, 'mode_vars') else {}
+        modes_saved = {k: v.get() for k, v in self.mode_vars.items()
+                       if k in CORE_AUTOMATION_MODES} if hasattr(self, 'mode_vars') else {}
         data = {
             "selected_theme": self.current_theme,
             "accounts": protect_setting(self.txt_accounts.get("1.0", "end").strip()),
@@ -4263,9 +4278,8 @@ class MainToolApp:
             "batch_size": self.ent_batch_size.get(),
             "headless": self.chk_headless.get(),
             "warmup": self.chk_warmup.get(),
-            "watch_reels": self.chk_watch_reels.get(),
-            "view_stories": self.chk_view_stories.get(),
-            "cancel_old": self.chk_cancel_old.get(),
+            "warmup_seconds": self.ent_warmup_seconds.get(),
+            "notification_seconds": self.ent_notification_seconds.get(),
             "target": self.ent_target.get(),
             "page_target": self.ent_page_target.get() if hasattr(self, 'ent_page_target') else "5",
             "max_create_page_workers": self.ent_max_create_page_workers.get() if hasattr(self, 'ent_max_create_page_workers') else "3",
@@ -4273,13 +4287,8 @@ class MainToolApp:
             "max_page_delay": self.ent_max_page_delay.get() if hasattr(self, 'ent_max_page_delay') else "120",
             "min_delay": self.ent_min_delay.get(),
 
-            "feed_surf_min": self.ent_feed_surf_min.get() if hasattr(self, 'ent_feed_surf_min') else "10",
-            "watch_review_min": self.ent_watch_review_min.get() if hasattr(self, 'ent_watch_review_min') else "5",
             "max_delay": self.ent_max_delay.get(),
-            "browse_web": self.chk_browse_web.get(),
-            "interact_page": self.chk_interact_page.get(),
             "check_notif": self.chk_check_notif.get(),
-            "chat_react": self.chk_chat_react.get(),
             "tele_token": protect_setting(self.ent_tele_token.get().strip()),
             "tele_chatid": self.ent_tele_chatid.get().strip(),
         }
@@ -4311,7 +4320,7 @@ class MainToolApp:
             if "targets" in data: self.txt_targets.insert("1.0", data["targets"])
             if "selected_modes" in data and hasattr(self, 'mode_vars'):
                 for k, val in data["selected_modes"].items():
-                    if k in self.mode_vars:
+                    if k in CORE_AUTOMATION_MODES and k in self.mode_vars:
                         self.mode_vars[k].set(val)
             if "proxy_mode" in data: self.proxy_mode.set(data["proxy_mode"])
             if "proxy_ratio" in data: self.ent_proxy_ratio.delete(0, "end"); self.ent_proxy_ratio.insert(0, data["proxy_ratio"])
@@ -4319,9 +4328,11 @@ class MainToolApp:
             if "batch_size" in data: self.ent_batch_size.delete(0, "end"); self.ent_batch_size.insert(0, data["batch_size"])
             if "headless" in data: self.chk_headless.set(data["headless"])
             if "warmup" in data: self.chk_warmup.set(data["warmup"])
-            if "watch_reels" in data: self.chk_watch_reels.set(data["watch_reels"])
-            if "view_stories" in data: self.chk_view_stories.set(data["view_stories"])
-            if "cancel_old" in data: self.chk_cancel_old.set(data["cancel_old"])
+            for key, entry in (("warmup_seconds", self.ent_warmup_seconds),
+                               ("notification_seconds", self.ent_notification_seconds)):
+                if key in data:
+                    entry.delete(0, "end")
+                    entry.insert(0, data[key])
             if "target" in data: self.ent_target.delete(0, "end"); self.ent_target.insert(0, data["target"])
             if "page_target" in data and hasattr(self, 'ent_page_target'):
                 self.ent_page_target.delete(0, "end")
@@ -4336,16 +4347,9 @@ class MainToolApp:
             if "max_page_delay" in data and hasattr(self, 'ent_max_page_delay'):
                 self.ent_max_page_delay.delete(0, "end")
                 self.ent_max_page_delay.insert(0, data["max_page_delay"])
-            if "feed_surf_min" in data and hasattr(self, 'ent_feed_surf_min'):
-                self.ent_feed_surf_min.delete(0, "end"); self.ent_feed_surf_min.insert(0, data["feed_surf_min"])
-            if "watch_review_min" in data and hasattr(self, 'ent_watch_review_min'):
-                self.ent_watch_review_min.delete(0, "end"); self.ent_watch_review_min.insert(0, data["watch_review_min"])
             if "min_delay" in data: self.ent_min_delay.delete(0, "end"); self.ent_min_delay.insert(0, data["min_delay"])
             if "max_delay" in data: self.ent_max_delay.delete(0, "end"); self.ent_max_delay.insert(0, data["max_delay"])
-            if "browse_web" in data: self.chk_browse_web.set(data["browse_web"])
-            if "interact_page" in data: self.chk_interact_page.set(data["interact_page"])
             if "check_notif" in data: self.chk_check_notif.set(data["check_notif"])
-            if "chat_react" in data: self.chk_chat_react.set(data["chat_react"])
             if "tele_token" in data: self.ent_tele_token.delete(0, "end"); self.ent_tele_token.insert(0, unprotect_setting(data["tele_token"]))
             if "tele_chatid" in data: self.ent_tele_chatid.delete(0, "end"); self.ent_tele_chatid.insert(0, data["tele_chatid"])
             
@@ -5588,67 +5592,35 @@ class MainToolApp:
             self.log(f"[-] [{acc_name}] Lỗi Seeding TikTok: {e}")
         return success_count
 
-    async def warm_up_feed(self, page, acc_name):
-        """Lướt Newfeed kết hợp Health Check, Soft Timeout và Telemetry Metrics"""
-        session_start = time.monotonic()
-        stats = {"scrolls": 0, "likes": 0, "errors": 0, "stuck_count": 0}
-        
-        try:
-            scroll_cycles = random.randint(6, 10)
-            self.log(f"[*] [{acc_name}] Khởi động ngâm Feed ({scroll_cycles} chu kỳ)...")
-            
-            for step in range(scroll_cycles):
-                cycle_start = time.monotonic()
-                
-                # 1. Health Check & Soft Timeout (Giới hạn tối đa ngâm 5 phút = 300s)
-                if not self.is_running or page.is_closed(): break
-                if (time.monotonic() - session_start) > 300:
-                    self.log(f"[WARN] [{acc_name}] Ngâm Feed vượt quá 5 phút. Buộc kết thúc để chạy việc khác.")
-                    break
+    async def _wait_support_activity(self, page, duration_seconds, scroll=False):
+        deadline = time.monotonic() + duration_seconds
+        while self.is_running and not getattr(self, "stop_requested", False):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            await self.guard_facebook_checkpoint(page)
+            if page.is_closed():
+                raise RuntimeError("Profile đã đóng trong lúc chờ")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if scroll:
+                try:
+                    await asyncio.wait_for(page.mouse.wheel(0, 500), timeout=min(5, remaining))
+                except asyncio.TimeoutError:
+                    if time.monotonic() >= deadline:
+                        return
+                    raise
+            await asyncio.sleep(min(5 if scroll else 1, max(0, deadline - time.monotonic())))
 
-                # 2. Ghi nhận vị trí cũ để check stuck
-                old_y = await page.evaluate("window.scrollY")
-                
-                # 3. Lăn chuột phần cứng
-                scroll_distance = random.randint(450, 800)
-                chunks = random.randint(5, 10)
-                for _ in range(chunks):
-                    await page.mouse.wheel(0, scroll_distance // chunks)
-                    await asyncio.sleep(random.uniform(0.05, 0.15))
-                stats["scrolls"] += 1
-                
-                # 4. Kiểm tra có bị kẹt (không cuộn được nữa) không
-                await asyncio.sleep(random.uniform(1.0, 2.0))
-                new_y = await page.evaluate("window.scrollY")
-                if old_y == new_y:
-                    stats["stuck_count"] += 1
-                    if stats["stuck_count"] >= 3:
-                        self.log(f"[DEBUG] [{acc_name}] Feed không thể cuộn thêm (chạm đáy hoặc popup chắn). Kết thúc lướt.")
-                        break
-                else:
-                    stats["stuck_count"] = 0 # Reset nếu vẫn cuộn được
-
-                # Dừng đọc bài
-                await asyncio.sleep(random.randint(4, 10))
-
-                # 5. Tương tác Thích an toàn qua Helper (Tỷ lệ 35%)
-                if random.random() < 0.35:
-                    like_selector = 'div[role="button"][aria-label*="thích" i], div[role="button"][aria-label*="like" i]'
-                    success = await self.safe_action_click(page, like_selector, acc_name, action_name="Thích bài viết")
-                    if success:
-                        stats["likes"] += 1
-                        await asyncio.sleep(random.randint(3, 5))
-
-                elapsed = time.monotonic() - cycle_start
-                self.log(f"[DEBUG] [{acc_name}] Cycle {step+1}/{scroll_cycles} xong trong {elapsed:.2f}s (Cuộn {scroll_distance}px).")
-
-        except Exception as e:
-            stats["errors"] += 1
-            self.log(f"[-] [{acc_name}] Lỗi lướt feed: {e}")
-            await self.take_error_snapshot(page, acc_name, "warm_up_feed")
-        
-        # Thống kê cuối phiên
-        self.log(f"[SUMMARY] [{acc_name}] Ngâm Feed hoàn tất: Cuộn={stats['scrolls']} lần, Thích={stats['likes']} bài, Lỗi={stats['errors']}.")
+    async def warm_up_feed(self, page, acc_name, duration_seconds=30):
+        """Browse the Feed for the configured duration, without reactions."""
+        duration = self.activity_duration_seconds(duration_seconds, "Feed đệm")
+        if duration == 0 or not self.is_running or getattr(self, "stop_requested", False):
+            return
+        self.log(f"[*] [{acc_name}] Lướt Feed đệm trong {duration} giây...")
+        await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=25000)
+        await self._wait_support_activity(page, duration, scroll=True)
 
     async def create_browser_page(
         self,
@@ -5851,164 +5823,18 @@ class MainToolApp:
             self.account_states.set_page_wait(index)
             self.post_ui(lambda idx=int(index): self.refresh_account_state_row(idx))
 
-    async def human_surf_feed(self, page, acc_name, duration_minutes=10):
-        """Lướt Bảng tin như người thật trong khoảng thời gian chỉ định"""
-        self.log(f"[*] [{acc_name}] Bắt đầu lướt Newfeed trong {duration_minutes} phút...")
-        try:
-            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=40000)
-            await asyncio.sleep(4)
-        except Exception:
-            pass
-
-        end_time = time.monotonic() + (duration_minutes * 60)
-        while time.monotonic() < end_time and self.is_running:
-            if page.is_closed(): break
-            
-            # 1. TỶ LỆ 20% CUỘN NGƯỢC LÊN (Đọc lại bài vừa trôi qua)
-            if random.random() < 0.20:
-                up_dist = random.randint(150, 300)
-                up_steps = random.randint(8, 14)
-                for _ in range(up_steps):
-                    await page.mouse.wheel(0, -(up_dist // up_steps))
-                    await asyncio.sleep(random.uniform(0.015, 0.03))
-                await asyncio.sleep(random.uniform(2.0, 4.0))
-
-            # 2. CUỘN XUỐNG MƯỢT CÓ QUÁN TÍNH
-            scroll_dist = random.randint(350, 650)
-            steps = random.randint(14, 24)
-            for _ in range(steps):
-                await page.mouse.wheel(0, scroll_dist // steps)
-                await asyncio.sleep(random.uniform(0.015, 0.035))
-
-            # 3. DỪNG ĐỌC BÀI TỰ NHIÊN
-            read_time = random.uniform(6.0, 12.0) if random.random() < 0.3 else random.uniform(1.5, 3.5)
-            await asyncio.sleep(read_time)
-
-            # 4. TỶ LỆ 10% TƯƠNG TÁC THẢ LIKE
-            if random.random() < 0.10:
-                like_btn = page.locator('div[role="button"][aria-label*="thích" i], div[role="button"][aria-label*="like" i]').first
-                if await like_btn.count() > 0 and await like_btn.is_visible():
-                    try:
-                        await like_btn.click(timeout=2000)
-                        await asyncio.sleep(random.uniform(2.0, 4.0))
-                    except Exception:
-                        pass
-
-    async def human_watch_movie_reviews(self, page, acc_name, duration_minutes=5):
-        """Mở Facebook Watch tìm và xem Review Phim trong khoảng thời gian chỉ định"""
-        self.log(f"[*] [{acc_name}] Bắt đầu xem Video Review Phim trong {duration_minutes} phút...")
-        search_url = "https://www.facebook.com/watch/search/?q=review%20phim"
-        try:
-            await page.goto(search_url, wait_until="domcontentloaded", timeout=40000)
-            await asyncio.sleep(5)
-            video_card = page.locator('div[role="article"] a, a[href*="/watch/"], a[href*="/videos/"]').first
-            if await video_card.count() > 0:
-                await video_card.click()
-                await asyncio.sleep(4)
-        except Exception as e:
-            self.log(f"[DEBUG] [{acc_name}] Lỗi nạp Watch Review Phim: {e}")
-
-        end_time = time.monotonic() + (duration_minutes * 60)
-        while time.monotonic() < end_time and self.is_running:
-            if page.is_closed(): break
-            stay_time = random.randint(30, 60)
-            await asyncio.sleep(stay_time)
-            await page.mouse.wheel(0, 800)
-            await asyncio.sleep(3)
-    async def browse_external_web(self, page, acc_name):
-        """Lướt báo/web ngoài tạo lịch sử tự nhiên"""
-        try:
-            self.log(f"[*] [{acc_name}] Lướt báo đọc tin tức 15s...")
-            await page.goto("https://vnexpress.net/", wait_until="domcontentloaded", timeout=20000)
-            await asyncio.sleep(5)
-            await page.evaluate("window.scrollBy(0, 500)")
-            await asyncio.sleep(5)
-            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=30000)
-        except Exception as e:
-            self.log(f"[-] [{acc_name}] Lỗi lướt web ngoài: {e}")
-
-    async def watch_facebook_reels(self, page, acc_name, count=5):
-        """Xem và lướt Video Reels Facebook tự động như người thật"""
-        try:
-            self.log(f"[*] [{acc_name}] Bắt đầu lướt xem {count} video Reels...")
-            await page.goto("https://www.facebook.com/reel", wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(random.uniform(3.0, 5.0))
-
-            for r_idx in range(count):
-                if not self.is_running or page.is_closed():
-                    break
-
-                # Xem video từ 7 đến 16 giây
-                watch_time = random.randint(7, 16)
-                self.log(f"[*] [{acc_name}] Đang xem Reel {r_idx + 1}/{count} ({watch_time}s)...")
-                await asyncio.sleep(watch_time)
-
-                # Tỷ lệ 15% thả tim video
-                if random.random() < 0.15:
-                    like_btn = page.locator('div[aria-label*="Thích" i], div[aria-label*="Like" i]').first
-                    if await like_btn.count() > 0 and await like_btn.is_visible():
-                        try:
-                            await like_btn.click(timeout=2000)
-                            await asyncio.sleep(1)
-                        except Exception:
-                            pass
-
-                # Chuyển Reel kế tiếp bằng phím mũi tên xuống kết hợp lăn chuột
-                await page.keyboard.press("ArrowDown")
-                await page.mouse.wheel(0, 500)
-                await asyncio.sleep(random.uniform(1.5, 3.0))
-
-            self.log(f"[✔] [{acc_name}] Đã xem xong các video Reels.")
-        except Exception as e:
-            self.log(f"[-] [{acc_name}] Lỗi xem Reels: {e}")
-
-    async def view_facebook_stories(self, page, acc_name):
-        """Xem Story Facebook bạn bè"""
-        try:
-            self.log(f"[*] [{acc_name}] Xem Story bạn bè...")
-            await page.goto("https://www.facebook.com/stories", wait_until="domcontentloaded", timeout=25000)
-            await asyncio.sleep(random.randint(5, 10))
-        except Exception as e:
-            self.log(f"[-] [{acc_name}] Lỗi xem Story: {e}")
-
-    async def check_notifications(self, page, acc_name):
-        """Mở xem thông báo"""
-        try:
-            self.log(f"[*] [{acc_name}] Kiểm tra bảng tin thông báo...")
-            notif_btn = page.locator('div[aria-label*="Thông báo"], div[aria-label*="Notifications"]').first
-            if await notif_btn.count() > 0:
-                await notif_btn.click()
-                await asyncio.sleep(3)
-        except Exception as e:
-            self.log(f"[-] [{acc_name}] Lỗi kiểm tra thông báo: {e}")
-
-    async def react_messenger(self, page, acc_name):
-        """Thả cảm xúc Messenger"""
-        try:
-            self.log(f"[*] [{acc_name}] Kiểm tra tin nhắn Messenger...")
-            msg_btn = page.locator('div[aria-label*="Messenger"]').first
-            if await msg_btn.count() > 0:
-                await msg_btn.click()
-                await asyncio.sleep(3)
-        except Exception as e:
-            self.log(f"[-] [{acc_name}] Lỗi mở Messenger: {e}")
-
-    async def interact_fanpage(self, page, acc_name):
-        """Tương tác Fanpage"""
-        try:
-            await page.evaluate("window.scrollBy(0, 400)")
-            await asyncio.sleep(2)
-        except Exception as e:
-            self.log(f"[-] [{acc_name}] Lỗi tương tác Fanpage: {e}")
-
-    async def cancel_old_requests(self, page, acc_name):
-        """Hủy các lời mời kết bạn gửi đi đã quá lâu"""
-        try:
-            self.log(f"[*] [{acc_name}] Đang kiểm tra lời mời kết bạn cũ...")
-            await page.goto("https://www.facebook.com/friends/requests", wait_until="domcontentloaded", timeout=25000)
-            await asyncio.sleep(3)
-        except Exception as e:
-            self.log(f"[-] [{acc_name}] Lỗi kiểm tra lời mời cũ: {e}")
+    async def check_notifications(self, page, acc_name, duration_seconds=3):
+        """Keep the notification panel open for the configured duration."""
+        duration = self.activity_duration_seconds(duration_seconds, "Thông báo")
+        if duration == 0 or not self.is_running or getattr(self, "stop_requested", False):
+            return
+        self.log(f"[*] [{acc_name}] Xem thông báo trong {duration} giây...")
+        notif_btn = page.locator('div[aria-label*="Thông báo"], div[aria-label*="Notifications"]').first
+        if await notif_btn.count() == 0:
+            self.log(f"[-] [{acc_name}] Không tìm thấy nút thông báo; bỏ qua.")
+            return
+        await notif_btn.click(timeout=5000)
+        await self._wait_support_activity(page, duration)
 
     async def get_current_friends_count(self, page):
         """Lấy số lượng bạn bè hiện tại"""
@@ -7480,7 +7306,7 @@ class MainToolApp:
             if not self.is_running or self.stop_requested: return
 
             config = self.run_config
-            modes = config.get("modes", {})
+            modes = {mode: bool(config.get("modes", {}).get(mode)) for mode in CORE_AUTOMATION_MODES}
             options = config.get("options", {})
 
             self.set_account_state(idx, status="CHECKING", current_action="Khởi tạo tài khoản")
@@ -7554,23 +7380,20 @@ class MainToolApp:
                     self.watch_facebook_checkpoint(page, idx, asyncio.current_task())
                 )
 
-                if options.get("browse_web"): await self.browse_external_web(page, acc_name)
-                if options.get("warmup"): await self.warm_up_feed(page, acc_name)
-                if options.get("watch_reels"): await self.watch_facebook_reels(page, acc_name)
-                if options.get("view_stories"): await self.view_facebook_stories(page, acc_name)
-                if options.get("check_notif"): await self.check_notifications(page, acc_name)
-                if options.get("chat_react"): await self.react_messenger(page, acc_name)
-                if options.get("interact_page"): await self.interact_fanpage(page, acc_name)
-                if options.get("cancel_old"): await self.cancel_old_requests(page, acc_name)
-
-                cur_friends = await self.get_current_friends_count(page)
-                self.update_tree_row(str(idx), current_friends=cur_friends)
+                if options.get("warmup"):
+                    self.set_account_state(idx, current_action="Đang lướt Feed đệm")
+                    await self.warm_up_feed(page, acc_name, config.get("warmup_seconds", 30))
+                if options.get("check_notif"):
+                    self.set_account_state(idx, current_action="Đang xem thông báo")
+                    await self.check_notifications(page, acc_name, config.get("notification_seconds", 3))
 
                 total_sent = 0
                 created_pages = []
                 create_page_completion_action = ""
                 friend_enabled = any(modes.get(mode) for mode in ("by_name", "by_group", "by_uid"))
                 if friend_enabled:
+                    cur_friends = await self.get_current_friends_count(page)
+                    self.update_tree_row(str(idx), current_friends=cur_friends)
                     self.record_task_result(idx, "FRIEND_REQUEST", "RUNNING", "Đang kết bạn")
                 # 1. Kết bạn theo tên
                 if modes.get("by_name", False):
@@ -7589,38 +7412,6 @@ class MainToolApp:
                     if friend_task.get("status") == "RUNNING":
                         self.record_task_result(idx, "FRIEND_REQUEST", "FAILED", "Không có lời mời nào được xác minh")
 
-                # 4. Tham gia nhóm (Join)
-                if modes.get("join_group", False):
-                    await self.run_join_groups(page, acc_name, idx, targets_by_mode["join_group"], target_total, min_del, max_del)
-
-                # 5. Tự động đăng bài
-                if modes.get("auto_post", False):
-                    total_sent += (await self.run_auto_post(page, acc_name, idx, targets_by_mode["auto_post"])) or 0
-
-                # 6. Tự động gửi tin nhắn
-                if modes.get("auto_inbox", False):
-                    total_sent += (await self.run_auto_inbox(page, acc_name, idx, targets_by_mode["auto_inbox"], target_total, min_del, max_del)) or 0
-
-                # 7. Seeding bài viết nhóm
-                if modes.get("seed_group", False):
-                    total_sent += (await self.run_seed_group(page, acc_name, idx, targets_by_mode["seed_group"], target_total, min_del, max_del)) or 0
-
-                # 8. Cập nhật Bio
-                if modes.get("change_bio", False):
-                    await self.run_change_bio(page, acc_name, idx, targets_by_mode["change_bio"])
-
-                # 9. Thay đổi Avatar/Ảnh bìa
-                if modes.get("change_avatar", False):
-                    await self.run_change_avatar(page, acc_name, idx, targets_by_mode["change_avatar"])
-
-                # 10. Mời bạn vào nhóm
-                if modes.get("invite_group", False):
-                    total_sent += (await self.run_invite_friends_to_group(page, acc_name, idx, targets_by_mode["invite_group"], target_total, min_del, max_del)) or 0
-
-                # 11. Quét UID tương tác
-                if modes.get("scrape_uid", False):
-                    await self.run_scrape_uid_post(page, acc_name, idx, targets_by_mode["scrape_uid"])
-                
                 # 12. Tạo Fanpage
                 if modes.get("create_page", False):
                     self.record_task_result(idx, "CREATE_PAGE", "RUNNING", "Đang tạo Page")
@@ -7686,111 +7477,6 @@ class MainToolApp:
                         create_page_completion_action = (
                             f"Chưa hoàn tất Create Page: {len(created_pages)}/{page_target_num}"
                         )
-                # 13. Đăng bài lên Fanpage
-                if modes.get("post_page", False):
-                    await self.run_post_page(page, acc_name, idx, targets_by_mode["post_page"])
-
-                # 14. Seeding Livestream
-                if modes.get("seed_live", False):
-                    await self.run_seed_live(page, acc_name, idx, targets_by_mode["seed_live"])
-
-                # 15. Đổi mật khẩu
-                if modes.get("change_pass", False):
-                    password_targets = targets_by_mode["change_pass"]
-                    new_pwd = password_targets[0].strip() if password_targets else ""
-                    if not login_password or not new_pwd:
-                        self.log(
-                            f"[-] [{acc_name}] Bỏ qua đổi mật khẩu vì thiếu mật khẩu hiện tại hoặc mật khẩu mới."
-                        )
-                    else:
-                        await self.run_change_password(page, acc_name, idx, login_password, new_pwd)
-
-                # 16. Bật 2FA
-                if modes.get("enable_2fa", False):
-                    await self.run_enable_2fa(page, acc_name, idx)
-
-                # 17. Đăng xuất thiết bị cũ
-                if modes.get("logout_sessions", False):
-                    await self.run_logout_other_sessions(page, acc_name, idx)
-
-                # 18. Thêm Admin Fanpage
-                if modes.get("add_page_admin", False):
-                    admin_targets = targets_by_mode["add_page_admin"]
-                    admin_job = select_page_admin_job(admin_targets, idx, acc_name)
-                    if not admin_job:
-                        self.log(
-                            f"[-] [{acc_name}] Thiếu cấu hình ghép Page. Dùng: "
-                            "STT tài khoản|URL Page hoặc AUTO|UID admin"
-                        )
-                    else:
-                        target_page = admin_job["page"]
-                        if target_page.casefold() == "auto":
-                            target_page = next(
-                                (record["page_url"] for record in reversed(created_pages) if record["page_url"]),
-                                "",
-                            )
-                        if not target_page:
-                            self.log(
-                                f"[-] [{acc_name}] Không có URL Page để ghép; xem created_pages.csv."
-                            )
-                        else:
-                            page_access_result = await self.run_add_page_admin(
-                                page, acc_name, idx, target_page, admin_job["admin"]
-                            )
-                            self.log(
-                                f"[PAGE_ACCESS][SUMMARY] [{acc_name}] "
-                                f"status={page_access_result['assignment_status']}"
-                            )
-
-                # 19. Đổi tên Fanpage
-                if modes.get("update_page_name", False):
-                    page_name_targets = targets_by_mode["update_page_name"]
-                    if len(page_name_targets) < 2:
-                        self.log(f"[-] [{acc_name}] Thiếu URL Page hoặc tên mới; không thực hiện đổi tên.")
-                    else:
-                        await self.run_update_page_info(
-                            page, acc_name, idx, page_name_targets[0], page_name_targets[1]
-                        )
-
-                # 20. Mời like Page
-                if modes.get("invite_like_page", False):
-                    like_targets = targets_by_mode["invite_like_page"]
-                    if not like_targets:
-                        self.log(f"[-] [{acc_name}] Thiếu URL Page; không thực hiện mời like.")
-                    else:
-                        await self.run_invite_friends_like_page(page, acc_name, idx, like_targets[0])
-
-                # 21. Nhắn tin người comment
-                if modes.get("inbox_commenters", False):
-                    commenter_targets = targets_by_mode["inbox_commenters"]
-                    post_link = commenter_targets[0] if len(commenter_targets) > 0 else "https://www.facebook.com/"
-                    msg_txt = commenter_targets[1] if len(commenter_targets) > 1 else "Chào {bạn|anh|chị}, em tư vấn ạ!"
-                    await self.run_inbox_post_commenters(page, acc_name, idx, post_link, msg_txt)
-
-                # 22. Đăng bài group đã vào
-                if modes.get("post_joined_groups", False):
-                    post_targets = targets_by_mode["post_joined_groups"]
-                    post_content = post_targets[0] if post_targets else "Nội dung bài viết mẫu {chất lượng|uy tín}!"
-                    await self.run_post_joined_groups(page, acc_name, idx, post_content)
-
-                # 23. Bình luận kèm ảnh
-                if modes.get("comment_with_image", False):
-                    image_targets = targets_by_mode["comment_with_image"]
-                    post_link = image_targets[0] if len(image_targets) > 0 else "https://www.facebook.com/"
-                    cmt_text = image_targets[1] if len(image_targets) > 1 else "{Tư vấn|Quan tâm} ạ!"
-                    img_path = image_targets[2] if len(image_targets) > 2 else ""
-                    await self.run_comment_with_image(page, acc_name, idx, post_link, cmt_text, img_path)
-
-                # 24. Quét member nhóm
-                if modes.get("scrape_group_members", False):
-                    group_targets = targets_by_mode["scrape_group_members"]
-                    group_link = group_targets[0] if group_targets else "https://www.facebook.com/groups/feed"
-                    await self.run_scrape_group_members(page, acc_name, idx, group_link, max_members=target_total)
-
-                # 25. Quét SĐT/Email
-                if modes.get("scrape_contacts", False):
-                    await self.run_scrape_contact_info(page, acc_name, idx, targets_by_mode["scrape_contacts"])
-
                 await self.guard_facebook_checkpoint(page, idx)
                 task_state = self.account_states.get(idx)
                 task_failures = [f"{module} {task['status']}: {task['detail']}"
@@ -7888,8 +7574,8 @@ class MainToolApp:
             target_indexes = set(config.get("checked_indexes", set()))
 
         threads_count = config.get("threads", 3)
-        modes = config.get("modes", {})
-        if modes.get("create_page", False) or modes.get("add_page_admin", False):
+        modes = {mode: bool(config.get("modes", {}).get(mode)) for mode in CORE_AUTOMATION_MODES}
+        if modes.get("create_page", False):
             max_create_workers = max(1, int(config.get("max_create_page_workers", 3)))
             threads_count = effective_account_worker_count(
                 threads_count, modes, max_create_workers

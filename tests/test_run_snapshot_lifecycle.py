@@ -25,14 +25,13 @@ def make_start_app():
         "selected_indexes": "", "proxy_api": "", "target": "1",
         "min_delay": "0", "max_delay": "0", "page_target": "1",
         "max_create_page_workers": "2", "min_page_delay": "0", "max_page_delay": "0",
-        "feed_surf_min": "0", "watch_review_min": "0", "tele_token": "", "tele_chatid": "",
+        "warmup_seconds": "0", "notification_seconds": "0", "tele_token": "", "tele_chatid": "",
     }
     for name, value in entries.items():
         widget = mock.Mock()
         widget.get.return_value = value
         setattr(app, "ent_" + name, widget)
-    for name in ("headless warmup watch_reels view_stories check_notif chat_react interact_page "
-                 "cancel_old browse_web").split():
+    for name in ("headless", "warmup", "check_notif"):
         widget = mock.Mock()
         widget.get.return_value = name == "headless"
         setattr(app, "chk_" + name, widget)
