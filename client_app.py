@@ -19,6 +19,17 @@ from facebook.page_creator import (
     extract_facebook_page_identity,
     is_verified_page_identity,
     PAGE_CREATION_EVIDENCE,
+    NEXT_BUTTON_PATTERN,
+    PAGE_SETUP_FINISH_PATTERN,
+    PAGE_SETUP_SKIP_PATTERN,
+    PAGE_SETUP_FIELDS_SELECTOR,
+    PAGE_BLANK_MARGIN_POINT,
+    get_current_page_identity as _pc_get_current_page_identity,
+    verify_created_page as _pc_verify_created_page,
+    page_setup_transition_detected as _pc_page_setup_transition_detected,
+    get_page_setup_button as _pc_get_page_setup_button,
+    click_page_blank_margin as _pc_click_page_blank_margin,
+    select_page_category as _pc_select_page_category,
 )
 import base64
 import contextvars
@@ -790,44 +801,6 @@ ADD_PAGE_ADMIN_BUTTON_PATTERN = re.compile(
     r"^(Thêm mới|Add new|เพิ่มใหม่|Tambahkan baru|Magdagdag ng bago|新しく追加|새로 추가)$",
     re.IGNORECASE,
 )
-NEXT_BUTTON_PATTERN = re.compile(
-    r"^(Tiếp|Next|ถัดไป|Berikutnya|Susunod|次へ|다음)$",
-    re.IGNORECASE,
-)
-PAGE_SETUP_FINISH_PATTERN = re.compile(r"^(Done|Finish|Xong|Hoàn tất)$", re.IGNORECASE)
-PAGE_SETUP_SKIP_PATTERN = re.compile(r"^(Skip|Bỏ qua)$", re.IGNORECASE)
-PAGE_SETUP_FIELDS_SELECTOR = (
-    'input[type="tel"]:visible, input[type="url"]:visible, '
-    'input[autocomplete="tel"]:visible, input[autocomplete="url"]:visible, '
-    'input[autocomplete="street-address"]:visible, '
-    'input[aria-label*="phone" i]:visible, input[aria-label*="website" i]:visible, '
-    'input[placeholder="Phone number" i]:visible, input[placeholder="Website" i]:visible, '
-    'input[placeholder="Address" i]:visible, input[placeholder="City/town" i]:visible, '
-    'input[placeholder="Số điện thoại" i]:visible, input[placeholder="Địa chỉ" i]:visible, '
-    'div[role="dialog"]:has(input):visible'
-)
-PAGE_BLANK_MARGIN_POINT = r"""() => {
-    const width = document.documentElement.clientWidth;
-    const height = document.documentElement.clientHeight;
-    if (width < 40 || height < 40) return null;
-    if (Array.from(document.querySelectorAll('[role="dialog"]')).some(el => el.getClientRects().length > 0)) return null;
-    const excluded = 'a,button,input,textarea,select,label,form,header,nav,aside,' +
-        'img,video,canvas,[contenteditable="true"],[onclick],[aria-haspopup],' +
-        '[tabindex]:not([tabindex="-1"]),[role="button"],[role="link"],' +
-        '[role="textbox"],[role="combobox"],[role="checkbox"],[role="radio"],' +
-        '[role="switch"],[role="slider"],[role="tab"],[role="menuitem"],' +
-        '[role="banner"],[role="navigation"],[role="dialog"],[role="menu"],' +
-        '[role="listbox"],[role="alert"],[role="status"]';
-    const points = [[width - 20, height / 2], [width - 20, height * 0.75],
-        [width * 0.75, height - 20], [width / 2, height - 20], [20, height * 0.75]];
-    for (const [x, y] of points) {
-        const target = document.elementFromPoint(x, y);
-        if (!target || target.closest(excluded) || getComputedStyle(target).cursor === 'pointer') continue;
-        if (Array.from(target.childNodes).some(node => node.nodeType === Node.TEXT_NODE && node.textContent.trim())) continue;
-        return {x: Math.round(x), y: Math.round(y)};
-    }
-    return null;
-}"""
 GIVE_ACCESS_BUTTON_PATTERN = re.compile(
     r"^(Cấp quyền truy cập|Give access|ให้สิทธิ์การเข้าถึง|Berikan akses|"
     r"Magbigay ng access|アクセスを許可|액세스 권한 부여)$",
@@ -5878,95 +5851,28 @@ class MainToolApp:
             return LOGIN_TECHNICAL_ERROR, f"Session verification {type(exc).__name__}: {exc}"
 
     async def get_current_page_identity(self, page):
-        candidates = [page.url]
-        for selector in ('link[rel="canonical"]', 'meta[property="og:url"]'):
-            locator = page.locator(selector).first
-            if await locator.count() > 0:
-                attribute = "href" if selector.startswith("link") else "content"
-                value = await locator.get_attribute(attribute)
-                if value:
-                    candidates.insert(0, value)
-        return extract_facebook_page_identity(candidates)
+        return await _pc_get_current_page_identity(self, page)
 
     async def verify_created_page(self, page, index, job):
-        await self.guard_facebook_checkpoint(page, index)
-        state = self.account_states.get(index) or {}
-        evidence = await page.evaluate(PAGE_CREATION_EVIDENCE)
-        return verify_page_job_evidence(page.url, evidence, job, state.get("account_id", ""))
+        return await _pc_verify_created_page(self, page, index, job)
 
     async def page_setup_transition_detected(self, page, page_name, body_text, alerts):
-        # A setup form/toast permits onboarding, never a SUCCESS record on its own.
-        if await page.locator(PAGE_SETUP_FIELDS_SELECTOR).count() > 0:
-            return True
-        return any(page_creation_notice_matches(text, page_name) for text in [body_text, *alerts])
+        return await _pc_page_setup_transition_detected(
+            self, page, page_name, body_text, alerts
+        )
 
     async def get_page_setup_button(self, page):
-        # Facebook also renders this wizard inline, outside role="dialog".
-        for pattern in (PAGE_SETUP_FINISH_PATTERN, NEXT_BUTTON_PATTERN, PAGE_SETUP_SKIP_PATTERN):
-            buttons = page.get_by_role("button", name=pattern)
-            for index in range(await buttons.count()):
-                button = buttons.nth(index)
-                if (await button.is_visible() and await button.is_enabled()
-                        and (await button.get_attribute("aria-disabled") or "").casefold() != "true"):
-                    return button
-        buttons = page.locator('div[role="dialog"] button[type="submit"]:visible')
-        if await buttons.count() == 1 and await buttons.first.is_enabled():
-            return buttons.first
-        return None
+        return await _pc_get_page_setup_button(self, page)
 
     async def click_page_blank_margin(self, page, acc_name, index):
-        if not self.is_running or getattr(self, "stop_requested", False):
-            return False
-        try:
-            await self.guard_facebook_checkpoint(page, index)
-            point = await page.evaluate(PAGE_BLANK_MARGIN_POINT)
-            if not isinstance(point, dict):
-                self.log(f"[PAGE][FOCUS] [{acc_name}] Không có vùng rìa trống an toàn; bỏ qua click.")
-                return False
-            if not self.is_running or getattr(self, "stop_requested", False):
-                return False
-            await asyncio.wait_for(page.mouse.click(point["x"], point["y"]), timeout=3)
-            return True
-        except Exception as exc:
-            self.log(f"[PAGE][FOCUS] [{acc_name}] Bỏ qua click vùng trống: {type(exc).__name__}: {exc}")
-            return False
+        return await _pc_click_page_blank_margin(
+            self, page, acc_name, index
+        )
 
     async def select_page_category(self, page, category_input, requested_category):
-        options = page.locator('div[role="listbox"] [role="option"], ul[role="listbox"] li, [role="option"]')
-        try:
-            await options.first.wait_for(state="visible", timeout=5000)
-        except (TimeoutError, PlaywrightTimeoutError):
-            return False, "CATEGORY_SUGGESTIONS_NOT_AVAILABLE"
-        
-        # Mở rộng danh sách từ khóa tương đương cho đa ngôn ngữ
-        req_norm = normalize_ui_text(requested_category)
-        aliases = {req_norm}
-        if req_norm == normalize_ui_text("Blog cá nhân"):
-            aliases.update(normalize_ui_text(x) for x in ["Personal blog", "Blog personnel", "Blog personal", "Blog pessoal", "Persönlicher Blog", "บล็อกส่วนตัว", "Blog Pribadi", "ブログ(個人)", "개인 블로그"])
-            
-        for index in range(await options.count()):
-            option = options.nth(index)
-            if await option.is_visible():
-                opt_text = await option.inner_text()
-                if normalize_ui_text(opt_text) in aliases:
-                    await option.click()
-                    selected = await category_input.evaluate(r"""async (input, matched_text) => {
-                        const normalize = text => (text || '').normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase();
-                        const deadline = Date.now() + 3000;
-                        while (Date.now() < deadline && input.isConnected) {
-                            const root = input.parentElement.parentElement;
-                            const selected = Array.from(root.querySelectorAll('[aria-selected="true"], [data-selected-category], span'))
-                            .some(el => !el.closest('[role="listbox"]') && el.getClientRects().length > 0
-                                && normalize(el.textContent) === normalize(matched_text)
-                                && (el.matches('[aria-selected="true"],[data-selected-category]')
-                                    || el.parentElement.querySelector('button,[role="button"]')));
-                            if (selected) return true;
-                            await new Promise(resolve => setTimeout(resolve, 100));
-                        }
-                        return false;
-                    }""", opt_text)
-                    return bool(selected), "" if selected else "CATEGORY_SELECTION_NOT_VERIFIED"
-        return False, "CATEGORY_NOT_FOUND"
+        return await _pc_select_page_category(
+            self, page, category_input, requested_category
+        )
     async def ensure_personal_profile(self, context, page, acc_name):
         """Chuyển đổi danh tính từ Fanpage về lại tài khoản cá nhân trên giao diện."""
         cookies = await context.cookies("https://www.facebook.com/")
