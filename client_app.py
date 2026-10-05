@@ -9,6 +9,16 @@ from facebook.page_creator import (
     validate_create_page_targets,
     build_page_context as _build_page_context,
     transition_page_context as _transition_page_context,
+    normalize_ui_text,
+    page_creation_notice_matches,
+    verify_page_job_evidence,
+    is_page_policy_rejected,
+    facebook_page_reference,
+    page_reference_matches,
+    page_identity_keys,
+    extract_facebook_page_identity,
+    is_verified_page_identity,
+    PAGE_CREATION_EVIDENCE,
 )
 import base64
 import contextvars
@@ -301,54 +311,12 @@ FRIEND_SCOPE_SNAPSHOT = r"""root => ({
 })"""
 
 
-def normalize_ui_text(value):
-    return " ".join(unicodedata.normalize("NFKC", str(value or "")).casefold().split())
 
 
-def page_creation_notice_matches(text, page_name):
-    name = re.escape(normalize_ui_text(page_name))
-    if not name:
-        return False
-    text = normalize_ui_text(text)
-    return any(re.search(pattern, text) for pattern in (
-        rf"(?<!\w){name}\s+was created(?:[.!]|$|\s+now\b)",
-        rf"success!\s+you['’]ve created\s+{name}(?:[.!]|$)",
-        rf"(?<!\w){name}\s+đã được tạo(?:[.!]|$)",
-        rf"(?:thành công[!:]?\s*)bạn đã tạo\s+{name}(?:[.!]|$)",
-    ))
 
 
-PAGE_CREATION_EVIDENCE = r"""() => {
-    const data = document.querySelector('[data-page-id]');
-    const deepLink = document.querySelector('meta[property="al:android:url"]');
-    const match = (deepLink?.content || '').match(/^fb:\/\/page\/(\d+)/);
-    const pageId = data?.getAttribute('data-page-id') || match?.[1] || '';
-    const heading = Array.from(document.querySelectorAll('h1'))
-        .find(el => el.getClientRects().length > 0);
-    return {page_id: pageId, page_type: pageId ? 'PAGE' : '', name: heading?.innerText || '',
-        canonical: document.querySelector('link[rel="canonical"]')?.href || ''};
-}"""
 
 
-def verify_page_job_evidence(url, evidence, job, owner_account_id):
-    empty = {"url": "", "id": ""}
-    if not evidence or not job.get("submitted") or job.get("owner_account_id") != owner_account_id:
-        return empty
-    identity = extract_facebook_page_identity([url])
-    page_id = str(evidence.get("page_id") or "")
-    if evidence.get("page_type") != "PAGE" or not page_id.isdigit() or len(page_id) < 5:
-        return empty
-    if not identity["url"] or (identity["id"] and identity["id"] != page_id):
-        return empty
-    if normalize_ui_text(evidence.get("name")) != normalize_ui_text(job["page_name"]):
-        return empty
-    canonical = evidence.get("canonical")
-    if canonical and facebook_page_reference(canonical) != facebook_page_reference(url):
-        return empty
-    if page_id == str(job.get("owner_uid") or "") or page_id in job.get("prior_page_ids", set()):
-        return empty
-    return {**identity, "id": page_id, "owner_account_id": owner_account_id,
-            "page_job_id": job["page_job_id"], "verified": True}
 LOGIN_SUCCESS = "SUCCESS"
 LOGIN_INVALID = "INVALID"
 LOGIN_TECHNICAL_ERROR = "TECHNICAL_ERROR"
@@ -407,12 +375,6 @@ async def detect_facebook_account_state(page):
     return "UNKNOWN"
 
 
-def is_page_policy_rejected(text):
-    normalized = " ".join(str(text or "").casefold().split())
-    return (
-        "error occurred while creating the page" in normalized
-        and "page policies" in normalized
-    )
 
 
 def save_checkpoint_account(raw_line):
@@ -936,26 +898,8 @@ def resolve_account_proxy(account_proxy, resolved_proxies, account_index):
     return "" if resolved in {"", "Không dùng"} else resolved
 
 
-def facebook_page_reference(url):
-    """Extract a Page reference from Page and Page-settings URLs."""
-    parsed = urlparse(str(url or "").strip())
-    if (parsed.hostname or "").casefold() not in {
-        "facebook.com", "www.facebook.com", "m.facebook.com"
-    }:
-        return ""
-    query_id = re.search(r"(?:^|&)id=(\d+)(?:&|$)", parsed.query)
-    if query_id:
-        return query_id.group(1)
-    parts = [part for part in parsed.path.split("/") if part]
-    if not parts or parts[0].casefold() in {"pages", "settings", "login"}:
-        return ""
-    return parts[0].casefold()
 
 
-def page_reference_matches(expected_url, current_url):
-    expected = facebook_page_reference(expected_url)
-    current = facebook_page_reference(current_url)
-    return bool(expected and current and expected == current)
 
 
 async def locator_matches_account_target(locator, target):
@@ -1069,15 +1013,6 @@ def save_page_access_result(result):
     append_csv_result("page_admin_jobs.csv", PAGE_ACCESS_RESULT_FIELDS, result)
 
 
-def page_identity_keys(page_url="", page_id=""):
-    keys = set()
-    clean_id = str(page_id or "").strip()
-    clean_url = str(page_url or "").strip().rstrip("/").casefold()
-    if clean_id:
-        keys.add(f"id:{clean_id}")
-    if clean_url:
-        keys.add(f"url:{clean_url}")
-    return keys
 
 
 def save_created_page_success(record):
@@ -1293,45 +1228,8 @@ def select_page_admin_job(targets, account_index: int, account_name: str):
     return None
 
 
-def extract_facebook_page_identity(urls):
-    """Return a stable Page URL/ID from current or canonical Facebook URLs."""
-    for raw_url in urls or []:
-        url = str(raw_url or "").strip()
-        if not url:
-            continue
-        parsed = urlparse(url)
-        host = (parsed.hostname or "").lower()
-        path = parsed.path.rstrip("/")
-        if host not in {"facebook.com", "www.facebook.com", "m.facebook.com"}:
-            continue
-        if path in {"", "/", "/pages", "/pages/creation"} or path.startswith("/pages/creation/"):
-            continue
-        first_segment = path.strip("/").split("/", 1)[0].casefold()
-        if first_segment in {
-            "bookmarks", "events", "friends", "gaming", "groups", "home.php",
-            "login", "manage", "marketplace", "messages", "notifications",
-            "pages", "search", "settings", "watch",
-        }:
-            continue
-        query_id = re.search(r"(?:^|&)id=(\d+)(?:&|$)", parsed.query)
-        path_id = re.search(r"/(?:profile\.php/)?(\d{5,})(?:/|$)", path)
-        page_id = (query_id or path_id).group(1) if (query_id or path_id) else ""
-        clean_url = f"https://www.facebook.com{path}"
-        if query_id and path.endswith("profile.php"):
-            clean_url += f"?id={page_id}"
-        return {"url": clean_url, "id": page_id}
-    return {"url": "", "id": ""}
 
 
-def is_verified_page_identity(identity):
-    """Return True only when Facebook supplied a stable Page URL or Page ID."""
-    return bool(
-        identity
-        and (
-            str(identity.get("url", "")).strip()
-            or str(identity.get("id", "")).strip()
-        )
-    )
 
 
 def append_csv_result(filename: str, fieldnames, row):
