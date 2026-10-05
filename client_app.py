@@ -1,5 +1,8 @@
 import asyncio
-from facebook.page_creator import build_create_page_result
+from facebook.page_creator import (
+    build_create_page_result,
+    is_transient_create_page_error,
+)
 import base64
 import contextvars
 import csv
@@ -1195,14 +1198,6 @@ def append_create_page_account_log(account_index, account_id, message):
             handle.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
 
 
-def is_transient_create_page_error(exc):
-    text = f"{type(exc).__name__}: {exc}".casefold()
-    return isinstance(exc, (TimeoutError, OSError, ConnectionError)) or any(
-        marker in text for marker in (
-            "timeout", "timed out", "connection", "network", "navigation",
-            "net::err_", "temporarily unavailable",
-        )
-    )
 
 
 async def retry_create_page_operation(operation, max_attempts=3, base_delay=1.0):

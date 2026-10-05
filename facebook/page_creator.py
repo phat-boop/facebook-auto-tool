@@ -34,3 +34,12 @@ def build_create_page_result(
         "flow_state": str(flow_state or status).upper(),
         "structural_failure": structural_failure,
     }
+
+def is_transient_create_page_error(exc):
+    text = f"{type(exc).__name__}: {exc}".casefold()
+    return isinstance(exc, (TimeoutError, OSError, ConnectionError)) or any(
+        marker in text for marker in (
+            "timeout", "timed out", "connection", "network", "navigation",
+            "net::err_", "temporarily unavailable",
+        )
+    )
