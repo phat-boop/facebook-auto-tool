@@ -174,7 +174,7 @@ def test_original_fields_and_whitespace_survive_import_and_refresh():
     assert first["import_fields"][3:5] == ["", ""]
     assert first["import_fields"][-1] == "unused"
     assert first["fields"] == ["12345", "Pass", "2FA", COOKIE, "EAABtoken"]
-    assert app.txt_accounts.text.rstrip("\n") == first["canonical_line"]
+    assert app.txt_accounts.text.rstrip("\n") == first["cookie"]
     with mock.patch.object(app_module, "parse_legacy_account_line", side_effect=AssertionError("reimport")):
         app.reload_table_from_text()
     second = app.account_states.get(1)
@@ -241,7 +241,8 @@ def test_worker_only_consumes_canonical_model_and_rejects_legacy_fallback():
         args, kwargs = app.process_account_scoped.call_args
         assert args[3] == COOKIE
         assert args[4] == "127.0.0.1:60001"
-        assert kwargs["login_user"] == "12345" and kwargs["login_password"] == "A" * 16
+        assert kwargs["login_user"] == "12345" and kwargs["login_password"] == ""
+        assert "two_factor" not in kwargs and "token" not in kwargs
         app.process_account_scoped.reset_mock()
         app.run_config["accounts"] = raw
         app.run_config["parsed_accounts"] = {}
@@ -298,4 +299,4 @@ def test_start_normalizes_new_input_even_if_old_state_exists():
         app.start_thread()
     assert app.run_config["parsed_accounts"][1]["uid"] == "22222"
     assert app.run_config["parsed_accounts"][1]["password"] == "B" * 32
-    assert len(app.txt_accounts.text.strip().split("|")) == 5
+    assert app.txt_accounts.text.strip() == "c_user=22222;"

@@ -1,4 +1,4 @@
-"""Cookie-first login, affirmative session evidence and failure classification."""
+"""Cookie-only login, affirmative session evidence and failure classification."""
 import asyncio
 import contextvars
 from unittest import mock
@@ -186,6 +186,16 @@ def run_account(app, username=UID, password="Password", proxy=None):
     return app.account_states.get(1)
 
 
+def run_password_helper(app, page, context, twofa=""):
+    """Keep standalone helper coverage without enabling automatic fallback."""
+    original_sleep = asyncio.sleep
+    async def fast_sleep(_seconds):
+        await original_sleep(0)
+    with mock.patch.object(module.asyncio, "sleep", side_effect=fast_sleep):
+        return asyncio.run(app.login_facebook_user_pass(
+            page, context, UID, "Password", expected_uid=UID, twofa=twofa))
+
+
 @pytest.fixture(autouse=True)
 def private_outputs(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "output_path", lambda name: str(tmp_path / name))
@@ -205,14 +215,16 @@ def test_valid_cookie_is_first_and_never_uses_password_or_token(tmp_path):
 
 
 @pytest.mark.parametrize("cookie_mode", ["invalid", "login-form", "missing-cookie", "mismatch"])
-def test_confirmed_invalid_cookie_falls_back_and_verifies_same_uid(tmp_path, cookie_mode):
+def test_confirmed_invalid_cookie_stops_without_password_fallback(tmp_path, cookie_mode):
     app, context, page, events = make_app(tmp_path, cookie_mode)
+    app.login_facebook_user_pass = mock.AsyncMock(side_effect=AssertionError("Cookie-only must not fallback"))
     state = run_account(app)
-    assert state["status"] == "LIVE" and state["login_mode"] == "FALLBACK_LOGIN"
-    assert next(event for event in events if event[0] == "fill" and event[1] == 'input[name="email"]')[2] == UID
-    assert next(event for event in events if event[0] == "fill" and event[1] == 'input[name="pass"]')[2] == "Password"
-    assert events.index(("clear-cookie",)) > 0
-    assert context.values == [{"name": "c_user", "value": UID}]
+    assert state["status"] == "DIE" and state["login_mode"] == "COOKIE"
+    assert "Cookie" in state["current_action"]
+    app.login_facebook_user_pass.assert_not_awaited()
+    assert not any(event[0] in {"fill", "clear-cookie"} for event in events)
+    app.watch_facebook_checkpoint.assert_not_called()
+    context.close.assert_awaited_once()
 
 
 @pytest.mark.parametrize("password_mode,expected", [
@@ -232,9 +244,9 @@ def test_login_supports_unique_visible_role_button_in_credentials_form(tmp_path,
         return original_locator(selector)
 
     page.locator = locator
-    state = run_account(app)
-    assert state["status"] == expected
-    assert state["login_mode"] == "FALLBACK_LOGIN"
+    result, _detail = run_password_helper(app, page, context)
+    assert result == {"LIVE": module.LOGIN_SUCCESS, "DIE": module.LOGIN_INVALID,
+                      "CHECKPOINT": module.LOGIN_CHECKPOINT}[expected]
     assert ('click', 'password-submit') in events
     assert not any(selector in {'[role="button"]', '[role="button"]:visible'} for selector in seen)
 
@@ -254,8 +266,8 @@ def test_login_does_not_guess_role_button_when_form_is_missing_or_ambiguous(tmp_
         return original_locator(selector)
 
     page.locator = locator
-    state = run_account(app)
-    assert state["status"] == "ERROR"
+    result, _detail = run_password_helper(app, page, context)
+    assert result == module.LOGIN_TECHNICAL_ERROR
     assert not any(event[0] == "click" for event in events)
 
 
@@ -308,7 +320,7 @@ def test_blank_page_with_stale_cookie_is_error_without_password_attempt(tmp_path
     app.login_facebook_user_pass.assert_not_awaited()
 
 
-def test_uid_mismatch_cannot_be_live_without_a_verified_fallback(tmp_path):
+def test_uid_mismatch_cannot_be_live_with_cookie_only(tmp_path):
     app, context, page, _events = make_app(tmp_path, "mismatch")
     state = run_account(app, password="")
     assert state["status"] == "DIE" and "khớp UID" in state["current_action"]
@@ -317,21 +329,21 @@ def test_uid_mismatch_cannot_be_live_without_a_verified_fallback(tmp_path):
 
 @pytest.mark.parametrize("password_mode,expected", [("invalid", "DIE"), ("mismatch", "DIE"),
                                                    ("checkpoint", "CHECKPOINT")])
-def test_fallback_result_classification(tmp_path, password_mode, expected):
+def test_standalone_password_helper_result_classification(tmp_path, password_mode, expected):
     app, context, page, _events = make_app(tmp_path, "invalid", password_mode)
-    state = run_account(app)
-    assert state["status"] == expected and state["login_mode"] == "FALLBACK_LOGIN"
+    result, _detail = run_password_helper(app, page, context)
+    assert result == {"DIE": module.LOGIN_INVALID, "CHECKPOINT": module.LOGIN_CHECKPOINT}[expected]
     app.watch_facebook_checkpoint.assert_not_called()
 
 
 @pytest.mark.parametrize("error", [TimeoutError("password navigation timeout"), OSError("network DNS"),
                                    RuntimeError("proxy failure"), RuntimeError("browser closed")])
-def test_fallback_technical_error_is_error_not_die(tmp_path, error):
+def test_standalone_password_helper_technical_error_is_not_invalid(tmp_path, error):
     app, context, page, _events = make_app(tmp_path, "invalid")
     page.password_error = error
-    state = run_account(app)
-    assert state["status"] == "ERROR" and state["login_mode"] == "FALLBACK_LOGIN"
-    assert str(error) in state["current_action"]
+    result, detail = run_password_helper(app, page, context)
+    assert result == module.LOGIN_TECHNICAL_ERROR
+    assert str(error) in detail
 
 
 @pytest.mark.parametrize("mode,expected", [("checkpoint", "CHECKPOINT"), ("challenge", "CHECKPOINT"),
@@ -350,18 +362,17 @@ def test_password_twofa_uses_same_account_seed_and_verifies_session(tmp_path):
     seed = "JBSWY3DPEHPK3PXP"
     app, context, page, events = make_app(tmp_path, "invalid", "twofa", twofa=seed)
     with mock.patch.object(module, "generate_totp_code", return_value="123456") as totp:
-        state = run_account(app)
+        result, _detail = run_password_helper(app, page, context, twofa=seed)
     totp.assert_called_once_with(seed)
     assert ("fill", "twofa-code", "123456") in events
-    assert state["status"] == "LIVE" and state["login_mode"] == "FALLBACK_LOGIN"
-    app.watch_facebook_checkpoint.assert_called_once()
+    assert result == module.LOGIN_SUCCESS
 
 
 @pytest.mark.parametrize("seed,mode", [("", "twofa"), ("JBSWY3DPEHPK3PXP", "twofa-invalid")])
 def test_unresolved_twofa_remains_checkpoint_not_live_or_die(tmp_path, seed, mode):
     app, context, page, _events = make_app(tmp_path, "invalid", mode, twofa=seed)
-    state = run_account(app)
-    assert state["status"] == "CHECKPOINT" and state["login_mode"] == "FALLBACK_LOGIN"
+    result, _detail = run_password_helper(app, page, context, twofa=seed)
+    assert result == module.LOGIN_CHECKPOINT
     app.watch_facebook_checkpoint.assert_not_called()
 
 
@@ -394,14 +405,15 @@ def test_login_form_blocks_live_despite_cookie_and_positive_evidence(tmp_path):
     assert result == module.LOGIN_INVALID
 
 
-def test_login_mode_and_twofa_context_are_isolated_between_accounts(tmp_path):
+def test_cookie_only_account_does_not_use_twofa_or_change_other_account(tmp_path):
     app, context, page, _events = make_app(tmp_path, "invalid", "twofa", twofa="JBSWY3DPEHPK3PXP")
     other = module.import_account_record("987654321|OtherPass|OTHER_2FA|c_user=987654321;|OTHER_TOKEN")
     first = app.account_states.get(1)
     app.account_states.sync([first, {**other.to_account_dict(), "stt": 2, "account_id": other.uid}])
     with mock.patch.object(module, "generate_totp_code", return_value="123456") as totp:
         state = run_account(app)
-    assert state["login_mode"] == "FALLBACK_LOGIN"
+    assert state["status"] == "DIE" and state["login_mode"] == "COOKIE"
     assert "login_mode" not in app.account_states.get(2)
     assert app.account_states.get(2)["status"] == "UNKNOWN"
-    totp.assert_called_once_with("JBSWY3DPEHPK3PXP")
+    totp.assert_not_called()
+    assert not any(event[0] == "fill" for event in _events)

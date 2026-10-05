@@ -2242,7 +2242,7 @@ def runtime_account_record(account):
 
 
 def serialize_account_line(account):
-    """UI serialization is canonical; original input remains in record.raw_line."""
+    """Serialize the internal model without changing the cookie-only UI view."""
     record = runtime_account_record(account)
     if record is None:
         raise ValueError("Account must be normalized before serialization.")
@@ -2354,7 +2354,7 @@ THEMES = {
     }
 }
 class ImportAccountDialog(tk.Toplevel):
-    """Cửa sổ Pop-up Nhập tài khoản đa định dạng chuyên nghiệp với phân tích dữ liệu thông minh"""
+    """Cookie import dialog with internal provenance for full account inputs."""
     def __init__(self, parent, on_import_callback):
         super().__init__(parent)
         self.title("Thêm tài khoản vào hệ thống")
@@ -2370,27 +2370,13 @@ class ImportAccountDialog(tk.Toplevel):
         frame_top = tk.Frame(self, bg="#131C2E", padx=15, pady=10, highlightbackground="#1E293B", highlightthickness=1)
         frame_top.pack(fill="x", padx=10, pady=10)
 
-        tk.Label(frame_top, text="Chọn định dạng dữ liệu:", font=("Segoe UI", 9, "bold"), bg="#131C2E", fg="#38BDF8").grid(row=0, column=0, sticky="w")
-        
-        self.format_mode = tk.StringVar(value="UID|Pass|2FA|Cookie")
-        formats = [
-            "COOKIE|Cookie Facebook",
-            "TOKEN|Token Facebook",
-            "FACEBOOK|Email/UID|Password",
-            "UID|Pass|2FA|Cookie",
-            "UID|Pass|2FA",
-            "Tên|Cookie",
-            "UID|Pass|2FA|Cookie|Proxy",
-            "Tùy chỉnh (Phân cách bằng |)"
-        ]
-        self.cbo_format = ttk.Combobox(frame_top, values=formats, textvariable=self.format_mode, state="readonly", width=32)
-        self.cbo_format.grid(row=0, column=1, padx=10, sticky="w")
+        tk.Label(frame_top, text="COOKIE FACEBOOK", font=("Segoe UI", 13, "bold"), bg="#131C2E", fg="#38BDF8").pack(anchor="w")
 
         # Khung nhập dữ liệu
         frame_txt = tk.Frame(self, bg="#131C2E", padx=10, pady=10, highlightbackground="#1E293B", highlightthickness=1)
         frame_txt.pack(fill="both", expand=True, padx=10, pady=5)
 
-        tk.Label(frame_txt, text="Dán danh sách tài khoản vào đây (Mỗi dòng 1 nick):", font=("Segoe UI", 9), bg="#131C2E", fg="#94A3B8").pack(anchor="w", pady=(0, 5))
+        tk.Label(frame_txt, text="Cookie (mỗi dòng một tài khoản):", font=("Segoe UI", 12), bg="#131C2E", fg="#94A3B8").pack(anchor="w", pady=(0, 5))
         self.txt_input = scrolledtext.ScrolledText(frame_txt, bg="#070B14", fg="#E2E8F0", font=("Consolas", 10), insertbackground="#38BDF8", relief="solid", bd=1)
         self.txt_input.pack(fill="both", expand=True)
 
@@ -2424,7 +2410,7 @@ class ImportAccountDialog(tk.Toplevel):
 # [ĐOẠN TRƯỚC:]
 class MainToolApp:
     def auto_format_cookie_numbers(self, event=None):
-        """Refresh the numbered table without rewriting the raw account input."""
+        """Refresh cookie input and account-table numbering."""
         raw_text = self.txt_accounts.get("1.0", "end")
         if not raw_text.strip():
             return
@@ -2847,7 +2833,7 @@ class MainToolApp:
         tk.Label(f1_head, text="👤 1. HÀNG ĐỢI TÀI KHOẢN FACEBOOK", font=("Segoe UI", 11, "bold"), fg="#38BDF8", bg="#131C2E").pack(side="left")
         tk.Button(f1_head, text="📁 Nhập từ file .txt", font=("Segoe UI", 8, "bold"), bg="#1E293B", fg="#F8FAFC", relief="flat", padx=8, pady=1, cursor="hand2", command=self.import_accounts_file).pack(side="right")
 
-        tk.Label(card1, text="Dán Cookie hoặc User|Pass; hỗ trợ xếp hàng 50–100 tài khoản:", font=("Segoe UI", 10), fg="#64748B", bg="#131C2E").pack(anchor="w")
+        tk.Label(card1, text="Cookie Facebook (mỗi dòng một tài khoản):", font=("Segoe UI", 12), fg="#64748B", bg="#131C2E").pack(anchor="w")
         self.txt_accounts = scrolledtext.ScrolledText(card1, bg="#070B14", fg="#E2E8F0", font=("Consolas", 9), insertbackground="#38BDF8", relief="solid", bd=1)
         self.txt_accounts.pack(fill="both", expand=True, pady=2)
         
@@ -3594,15 +3580,6 @@ class MainToolApp:
             self.create_page_result_trees = {}
             self.result_center_summary_labels = {}
             self._result_center_menu_account = None
-
-        window.protocol("WM_DELETE_WINDOW", close)
-        self.refresh_create_page_results_dialog()
-        def close():
-            window.destroy()
-            self.create_page_results_window = None
-            self.create_page_result_trees = {}
-            self.result_center_summary_labels = {}
-            self._result_center_menu_account = None
         window.protocol("WM_DELETE_WINDOW", close)
         self.refresh_create_page_results_dialog()
 
@@ -3769,10 +3746,7 @@ class MainToolApp:
         if remaining_lines:
             self.txt_accounts.insert(
                 "1.0",
-                "\n".join(
-                    f"{index}. {normalize_account_source_line(line)}"
-                    for index, line in enumerate(remaining_lines, 1)
-                ) + "\n",
+                "\n".join(normalize_account_source_line(line) for line in remaining_lines) + "\n",
             )
         self.reload_table_from_text()
         self.save_settings()
@@ -4103,6 +4077,7 @@ class MainToolApp:
             "account_id": state.get("account_id", ""),
             "uid": state.get("uid", "") or state.get("account_id", ""),
             "password": state.get("password") or state.get("pwd", ""),
+            "cookie": state.get("cookie", ""),
             "raw_line": (state.get("raw_line") or source_line) if result_type == "checkpoint" else source_line,
             "created_count": int(created_count or 0),
             "target_count": int(target_count or 0),
@@ -4130,7 +4105,8 @@ class MainToolApp:
                 *self.create_page_account_results["completed"].values(),
                 *self.create_page_account_results["die"].values(),
             ]
-        return {record["raw_line"] for record in records if record.get("raw_line")}
+        return {record[field] for record in records for field in ("raw_line", "cookie")
+                if record.get(field)}
 
     def get_targets_for_mode(self, targets, mode, known_modes=None):
         """Lọc target theo prefix mode, vẫn hỗ trợ danh sách cũ không có prefix."""
@@ -4209,7 +4185,7 @@ class MainToolApp:
             if record is None:
                 record = import_account_record(account.get("raw", ""), len(source_lines) + 1)
             if record is not None:
-                source_lines.append(record.canonical_line)
+                source_lines.append(record.cookie)
                 self._account_import_records[len(source_lines)] = record
         self.txt_accounts.delete("1.0", "end")
         if source_lines:
@@ -4426,7 +4402,7 @@ class MainToolApp:
                                          state["status"], redact_history_text(state["current_action"], state), now_str])
             messagebox.showinfo("Thành công", f"Đã xuất báo cáo tại:\n{file_path}")
     def _normalize_account_input(self):
-        """Import boundary: canonical UI rows retain cached original records."""
+        """Show cookies only, retaining normalized models and original input internally."""
         text = self.txt_accounts.get("1.0", "end")
         lines = [line for line in text.splitlines()
                  if line.strip() and not line.lstrip().startswith("#")]
@@ -4437,10 +4413,10 @@ class MainToolApp:
         for index, line in enumerate(lines, 1):
             normalized = normalize_account_source_line(line)
             match = next(((key, record) for key, record in remaining
-                          if key == index and record.canonical_line == normalized), None)
+                          if key == index and normalized in (record.cookie, record.canonical_line)), None)
             if match is None:
                 match = next(((key, record) for key, record in remaining
-                              if record.canonical_line == normalized), None)
+                              if normalized in (record.cookie, record.canonical_line)), None)
             if match:
                 remaining.remove(match)
                 record = match[1]
@@ -4448,15 +4424,15 @@ class MainToolApp:
                 record = import_account_record(line, index)
             if record is not None:
                 records[index] = record
-                display_lines.append(record.canonical_line)
+                display_lines.append(record.cookie)
             else:
                 display_lines.append(line)
         self._account_import_records = records
-        canonical_text = "\n".join(display_lines)
-        if text.rstrip("\r\n") != canonical_text:
+        cookie_text = "\n".join(display_lines)
+        if text.rstrip("\r\n") != cookie_text:
             self.txt_accounts.delete("1.0", "end")
             if display_lines:
-                self.txt_accounts.insert("1.0", canonical_text + "\n")
+                self.txt_accounts.insert("1.0", cookie_text + "\n")
         return display_lines
 
     def reload_table_from_text(self, checked_indexes=None, normalize_before_run=False):
@@ -5634,8 +5610,7 @@ class MainToolApp:
         """
         Khởi tạo Browser + Context + Page.
         Tính năng: Tự động chia khung Grid, Retry khởi tạo, Health check.
-        """
-        import math  # Gọi luôn ở đây để không sợ thiếu thư viện ở đầu file
+        """ # Gọi luôn ở đây để không sợ thiếu thư viện ở đầu file
    
         # ==================================================
         # TÍNH TOÁN LƯỚI THÔNG MINH THEO SỐ LƯỢNG LUỒNG & ĐỘ PHÂN GIẢI
@@ -7246,7 +7221,7 @@ class MainToolApp:
             self.log(f"[-] [{acc_name}] Lỗi seeding livestream: {e}")
     
     async def authenticate_facebook_account(self, index, page, context, cookie_str, username, password):
-        """Cookie first; fall back only on affirmative invalid-session evidence."""
+        """Restore and verify cookies only; never submit password, 2FA or token."""
         self.account_states.set_login_mode(index, "COOKIE")
         state = self.account_states.get(index) or {}
         expected_uid = state.get("uid") or username
@@ -7262,18 +7237,9 @@ class MainToolApp:
                 return LOGIN_TECHNICAL_ERROR, f"Cookie navigation HTTP {status}"
             await asyncio.sleep(4)
             result, detail = await self.verify_facebook_session(page, context, expected_uid)
-            if result != LOGIN_INVALID:
-                return result, detail
-            path = urlparse(str(page.url or "")).path.casefold()
-            if re.match(r'^/(?:disabled|suspended)(?:/|$|\.)', path):
-                return result, detail
-            if not username or not password:
-                return LOGIN_INVALID, f"{detail}; không có UID/password để fallback"
-            self.account_states.set_login_mode(index, "FALLBACK_LOGIN")
-            self.log(f"[LOGIN][FALLBACK_LOGIN] Cookie được xác nhận không hợp lệ: {detail}")
-            return await self.login_facebook_user_pass(
-                page, context, username, password, expected_uid=expected_uid, twofa=state.get("2fa", "")
-            )
+            if result == LOGIN_INVALID:
+                return result, f"{detail}; Cookie không hợp lệ/hết hạn, cần thay Cookie mới"
+            return result, detail
         except FacebookCheckpointStopped:
             return LOGIN_CHECKPOINT, "Facebook yêu cầu xác minh tài khoản"
         except Exception as exc:
@@ -7610,7 +7576,7 @@ class MainToolApp:
                 continue
             parsed = parsed_accounts.get(idx) or parsed_accounts.get(str(idx))
             record = runtime_account_record(parsed)
-            if record is None or record.canonical_line != normalize_account_source_line(line):
+            if record is None or normalize_account_source_line(line) not in (record.cookie, record.canonical_line):
                 record = parse_canonical_account_line(line)
             if record is None:
                 continue
@@ -7638,9 +7604,7 @@ class MainToolApp:
                 "assigned_proxy_str": assigned_proxy_str,
                 "account_type": "COOKIE",
                 "login_user": parsed.get("uid", ""),
-                "login_password": parsed.get("password") or parsed.get("pwd", ""),
-                "two_factor": parsed.get("2fa", ""),
-                "token": parsed.get("token", ""),
+                "login_password": "",
                 "raw_line": parsed.get("raw_line", line),
                 "country": parsed.get("country", ""),
                 "locale": parsed.get("locale", "AUTO"),
