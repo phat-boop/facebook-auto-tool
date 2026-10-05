@@ -1,4 +1,5 @@
 import asyncio
+import random
 from datetime import datetime
 
 
@@ -61,3 +62,64 @@ async def retry_create_page_operation(operation, max_attempts=3, base_delay=1.0)
                 raise
             await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
     raise last_error
+
+HO_VIET = ["Nguyễn", "Trần", "Lê", "Phạm", "Hoàng", "Huỳnh", "Phan", "Vũ", "Võ", "Đặng", "Bùi", "Đỗ", "Hồ", "Ngô", "Dương", "Lý"]
+DEM_VIET = ["Văn", "Thị", "Đức", "Ngọc", "Thanh", "Minh", "Hữu", "Gia", "Bảo", "Anh", "Quang", "Phương", "Khánh", "Hải", "Tuấn", "Hoài"]
+TEN_VIET = [
+    "Anh", "Bảo", "Bình", "Châu", "Cường", "Dũng", "Dương", "Duy", "Đạt", "Đức", "Giang", "Hà", "Hải", "Hiếu", "Hoa",
+    "Hoàng", "Hùng", "Huy", "Huyền", "Hương", "Khánh", "Khoa", "Kiên", "Kiệt", "Lam", "Lan", "Linh", "Long", "Mai",
+    "Minh", "Nam", "Nga", "Ngân", "Ngọc", "Nhung", "Phong", "Phúc", "Phương", "Quân", "Quang", "Quyên", "Quỳnh", "Sơn",
+    "Tâm", "Thái", "Thắng", "Thanh", "Thảo", "Thịnh", "Thu", "Thuận", "Thư", "Thương", "Tiến", "Toàn", "Trang", "Trí",
+    "Trinh", "Trúc", "Trung", "Tú", "Tuấn", "Tùng", "Uyên", "Vân", "Việt", "Vinh", "Vũ", "Vy", "Yến"
+]
+HAU_TO_PAGE = ["", " - Blog Cá Nhân", " Cuộc Sống", " Chia Sẻ", " Daily", " Góc Nhỏ", " Kỷ Niệm"]
+
+
+def generate_random_person_name():
+    """Tự động kết hợp ngẫu nhiên tạo ra hơn 500+ tên người Việt Nam thực tế"""
+    ho = random.choice(HO_VIET)
+    dem = random.choice(DEM_VIET)
+    ten = random.choice(TEN_VIET)
+    hau_to = random.choice(HAU_TO_PAGE)
+    return f"{ho} {dem} {ten}{hau_to}".strip()
+
+def parse_page_plan(value: str):
+    """Parse `page name|category`; old one-column page names remain valid."""
+    parts = [part.strip() for part in str(value or "").split("|", 1)]
+    return {
+        "name": parts[0] if parts and parts[0] else generate_random_person_name(),
+        "category": parts[1] if len(parts) > 1 and parts[1] else "Blog cá nhân",
+    }
+
+def build_create_page_plans(targets, max_pages, name_generator=None):
+    """Build the requested Page plans while preserving legacy auto-name behavior."""
+    if name_generator is None:
+        name_generator = generate_random_person_name
+
+    requested = max(1, int(max_pages))
+    plans = [
+        str(target).strip()
+        for target in (targets or [])
+        if str(target or "").strip()
+    ][:requested]
+
+    while len(plans) < requested:
+        plans.append(f"{name_generator()}|Blog cá nhân")
+
+    return plans
+
+def validate_create_page_targets(targets, max_pages):
+    """Validate explicit Page plans before any browser is launched."""
+    requested = max(1, int(max_pages))
+    clean_targets = [str(target or "") for target in (targets or []) if str(target or "").strip()]
+    if not clean_targets:
+        return False, "Chưa có cấu hình Page hợp lệ."
+    for position, target in enumerate(clean_targets[:requested], 1):
+        parts = target.split("|", 1)
+        page_name = parts[0].strip() if parts else ""
+        category = parse_page_plan(target)["category"]
+        if not page_name:
+            return False, f"Page #{position} thiếu page_name."
+        if not category:
+            return False, f"Page #{position} thiếu category."
+    return True, ""

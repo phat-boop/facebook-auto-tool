@@ -3,6 +3,10 @@ from facebook.page_creator import (
     build_create_page_result,
     is_transient_create_page_error,
     retry_create_page_operation,
+    generate_random_person_name,
+    parse_page_plan,
+    build_create_page_plans as _build_create_page_plans,
+    validate_create_page_targets,
 )
 import base64
 import contextvars
@@ -73,6 +77,13 @@ SETTINGS_FILE = os.path.join(APP_DATA_DIR, "settings.json")
 def output_path(filename: str) -> str:
     return os.path.join(APP_DATA_DIR, filename)
 
+def build_create_page_plans(targets, max_pages):
+    return _build_create_page_plans(
+        targets,
+        max_pages,
+        name_generator=generate_random_person_name,
+    )
+
 def resource_path(relative_path: str) -> str:
     base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_path, relative_path)
@@ -97,13 +108,7 @@ TEN_VIET = [
 ]
 HAU_TO_PAGE = ["", " - Blog Cá Nhân", " Cuộc Sống", " Chia Sẻ", " Daily", " Góc Nhỏ", " Kỷ Niệm"]
 
-def generate_random_person_name():
-    """Tự động kết hợp ngẫu nhiên tạo ra hơn 500+ tên người Việt Nam thực tế"""
-    ho = random.choice(HO_VIET)
-    dem = random.choice(DEM_VIET)
-    ten = random.choice(TEN_VIET)
-    hau_to = random.choice(HAU_TO_PAGE)
-    return f"{ho} {dem} {ten}{hau_to}".strip()
+
 
 ADD_FRIEND_SELECTORS = (
     '[role="main"] [role="button"][data-testid*="add_friend" i], '
@@ -965,43 +970,13 @@ def version_tuple(version):
     return tuple(int(part) for part in parts) if parts else (0,)
 
 
-def parse_page_plan(value: str):
-    """Parse `page name|category`; old one-column page names remain valid."""
-    parts = [part.strip() for part in str(value or "").split("|", 1)]
-    return {
-        "name": parts[0] if parts and parts[0] else generate_random_person_name(),
-        "category": parts[1] if len(parts) > 1 and parts[1] else "Blog cá nhân",
-    }
 
 
-def build_create_page_plans(targets, max_pages):
-    """Build the requested Page plans while preserving legacy auto-name behavior."""
-    requested = max(1, int(max_pages))
-    plans = [
-        str(target).strip()
-        for target in (targets or [])
-        if str(target or "").strip()
-    ][:requested]
-    while len(plans) < requested:
-        plans.append(f"{generate_random_person_name()}|Blog cá nhân")
-    return plans
 
 
-def validate_create_page_targets(targets, max_pages):
-    """Validate explicit Page plans before any browser is launched."""
-    requested = max(1, int(max_pages))
-    clean_targets = [str(target or "") for target in (targets or []) if str(target or "").strip()]
-    if not clean_targets:
-        return False, "Chưa có cấu hình Page hợp lệ."
-    for position, target in enumerate(clean_targets[:requested], 1):
-        parts = target.split("|", 1)
-        page_name = parts[0].strip() if parts else ""
-        category = parse_page_plan(target)["category"]
-        if not page_name:
-            return False, f"Page #{position} thiếu page_name."
-        if not category:
-            return False, f"Page #{position} thiếu category."
-    return True, ""
+
+
+
 
 
 def filter_targets_for_mode(targets, mode, known_modes):
