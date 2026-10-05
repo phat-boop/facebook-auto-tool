@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 
 
@@ -43,3 +44,20 @@ def is_transient_create_page_error(exc):
             "net::err_", "temporarily unavailable",
         )
     )
+
+async def retry_create_page_operation(operation, max_attempts=3, base_delay=1.0):
+    """Retry transient pre-submit operations with bounded exponential backoff."""
+    last_error = None
+    for attempt in range(1, max(1, int(max_attempts)) + 1):
+        try:
+            return await operation(), attempt - 1
+        except Exception as exc:
+            last_error = exc
+            try:
+                setattr(exc, "create_page_retry_count", attempt - 1)
+            except Exception:
+                pass
+            if attempt >= max_attempts or not is_transient_create_page_error(exc):
+                raise
+            await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
+    raise last_error
