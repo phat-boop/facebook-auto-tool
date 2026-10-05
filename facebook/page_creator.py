@@ -7,6 +7,9 @@ import re
 import unicodedata
 from urllib.parse import urlparse
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+import time
+import uuid
+from long_run import DuplicatePageResult
 def build_create_page_result(
     status,
     account_id,
@@ -465,3 +468,666 @@ async def select_page_category(self, page, category_input, requested_category):
                 }""", opt_text)
                 return bool(selected), "" if selected else "CATEGORY_SELECTION_NOT_VERIFIED"
     return False, "CATEGORY_NOT_FOUND"
+
+
+CREATE_PAGE_BUTTON_PATTERN = re.compile(
+    r"^(Tạo Trang|Create Page|Créer une Page|Crear página|Criar Página|"
+    r"Seite erstellen|Buat Halaman|สร้างเพจ|Gumawa ng Page|ページを作成|페이지 만들기)$",
+    re.IGNORECASE,
+)
+
+
+async def wait_for_locator_ready(locator, timeout=15000):
+    """Chờ phần tử hiển thị và sẵn sàng tương tác, kết hợp kiểm tra is_enabled() chuẩn xác."""
+    await locator.wait_for(state="visible", timeout=timeout)
+    deadline = time.monotonic() + (timeout / 1000.0)
+    while time.monotonic() < deadline:
+        try:
+            aria_disabled = (await locator.get_attribute("aria-disabled") or "").casefold()
+            disabled = await locator.get_attribute("disabled")
+            enabled = await locator.is_enabled()
+            if aria_disabled != "true" and disabled is None and enabled:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+    return False
+
+
+def is_invalid_facebook_account_url(url):
+    normalized = str(url or "").casefold()
+    return any(
+        marker in normalized
+        for marker in ("/login", "checkpoint", "challenge", "disabled", "suspended")
+    )
+
+
+async def run_create_page(
+    self,
+    page,
+    context,
+    acc_name,
+    idx,
+    targets=None,
+    max_pages=5,
+    min_page_del=60,
+    max_page_del=120,
+    resolved_proxy="",
+):
+    """
+    Tạo Fanpage: Tích hợp check Checkpoint, đa tầng Selector, xử lý Stale Element (DOM refresh), 
+    kiểm tra iframe, focus trước khi gõ và chụp ảnh debug.
+    """
+    if self.skip_paused_module(idx, "CREATE_PAGE"):
+        return []
+    await self.guard_facebook_checkpoint(page, idx)
+    created_count = 0
+    results = []
+    current_page_job = None
+
+    def record_result(result):
+        owner = (self.account_states.get(idx) or {}).get("account_id", acc_name)
+        job = current_page_job["page_job_id"] if current_page_job else ""
+        if result.get("status") == "SUCCESS":
+            if result.get("owner_account_id") != owner or result.get("page_job_id") != job:
+                raise ValueError("Verified Page owner/job does not match current job.")
+        else:
+            result.update(owner_account_id=owner, page_job_id=job)
+        if not self.publish_create_page_result(idx, result):
+            return None
+        results.append(result)
+        return result
+
+    planned_targets = build_create_page_plans(targets, max_pages)
+    valid_targets, validation_error = validate_create_page_targets(
+        planned_targets, max_pages
+    )
+    if not valid_targets:
+        record_result(build_create_page_result(
+            "FAILED", acc_name, "", "", reason=validation_error,
+            account_index=idx, proxy=resolved_proxy,
+        ))
+        self.log(f"[FAILED] [{acc_name}] {validation_error}")
+        return results
+
+    effective_max_pages = len(planned_targets)
+
+    self.log(
+        f"[*] [{acc_name}] Bắt đầu tiến trình tạo {effective_max_pages} Fanpage "
+        f"theo {len(planned_targets)} cấu hình hợp lệ..."
+    )
+
+    for p_idx in range(effective_max_pages):
+        if not self.is_running or created_count >= effective_max_pages:
+            break
+        if self.skip_paused_module(idx, "CREATE_PAGE"):
+            break
+
+        page_plan = parse_page_plan(planned_targets[p_idx])
+        page_name = page_plan["name"]
+        category_name = page_plan["category"]
+        retry_count = 0
+        page_context = build_page_context(
+            acc_name, page_name, category_name,
+            proxy=resolved_proxy,
+            locale=self.account_states.get(idx).get("locale", "AUTO")
+            if self.account_states.get(idx) else "AUTO",
+        )
+        owner_state = self.account_states.get(idx) or {}
+        current_page_job = {
+            "owner_account_id": owner_state.get("account_id", acc_name),
+            "owner_uid": owner_state.get("uid") or owner_state.get("account_id"),
+            "page_job_id": uuid.uuid4().hex, "page_name": page_name,
+            "prior_page_ids": {result["page_id"] for result in results if result.get("page_id")},
+            "submitted": False,
+        }
+
+        def set_page_flow_state(state, detail=""):
+            transition_page_context(page_context, state)
+            action = f"Create Page [{state}]"
+            if detail:
+                action += f": {detail}"
+            self.set_account_state(idx, current_action=action)
+            self.log(f"[PAGE][{state}] [{acc_name}] {detail}".rstrip())
+
+        set_page_flow_state("PENDING", f"{page_name} ({p_idx + 1}/{effective_max_pages})")
+        set_page_flow_state("VALIDATING", f"category={category_name}")
+
+        try:
+            # ======================================================
+            # BƯỚC 1: TRUY CẬP VÀ ĐỢI REACT LOAD XONG
+            # ======================================================
+            try:
+                set_page_flow_state("SESSION_CHECK")
+                await self.guard_facebook_checkpoint(page, idx)
+                if is_invalid_facebook_account_url(page.url):
+                    reason = f"Session không hợp lệ trước Create Page: {page.url}"
+                    set_page_flow_state("FAILED", reason)
+                    self.set_account_failure(idx, "invalid_login", reason)
+                    return results
+                set_page_flow_state("OPEN_CREATE_PAGE", page_name)
+                async def navigate_to_creation():
+                    response = await page.goto(
+                        "https://www.facebook.com/pages/creation/",
+                        wait_until="domcontentloaded",
+                        timeout=45000,
+                    )
+                    await self.guard_facebook_checkpoint(page, idx)
+                    return response
+
+                _response, retry_count = await retry_create_page_operation(
+                    navigate_to_creation, max_attempts=3, base_delay=1.0
+                )
+            except Exception as e:
+                retry_count = getattr(e, "create_page_retry_count", retry_count)
+                record_result(build_create_page_result(
+                    "ERROR", acc_name, page_name, category_name,
+                    technical_error=f"{type(e).__name__}: {e}",
+                    retry_count=retry_count,
+                    account_index=idx,
+                    proxy=resolved_proxy,
+                ))
+                self.log(f"[ERROR] [{acc_name}] Lỗi tải trang tạo Page: {e}")
+                continue
+            await asyncio.sleep(3)
+
+            cur_url = page.url.lower()
+            self.log(
+                f"[DEBUG] URL={page.url}"
+            )
+
+            self.log(
+                f"[DEBUG] Title={await page.title()}"
+            )
+
+            self.log(
+                f"[DEBUG] Inputs={await page.locator('input').count()}"
+            )
+
+            self.log(
+                f"[DEBUG] Textareas={await page.locator('textarea').count()}"
+            )
+            self.log(
+                f"[DEBUG] Frames={len(page.frames)}"
+            )
+            if is_invalid_facebook_account_url(cur_url):
+                reason = "Session invalid/checkpoint khi mở trang tạo Page."
+                self.log(f"[!] [{acc_name}] Tài khoản không còn phiên đăng nhập hợp lệ!")
+                record_result(build_create_page_result(
+                    "FAILED", acc_name, page_name, category_name,
+                    reason=reason,
+                    retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                ))
+                self.set_account_failure(idx, "invalid_login", reason)
+                return results
+            if not re.search(r'/pages/creat', cur_url):
+                self.log(
+                    f"[-] [{acc_name}] Facebook đã chuyển khỏi trang tạo Page ({page.url}). "
+                    "Tài khoản có thể chưa được cấp quyền tạo Trang hoặc giao diện đã thay đổi."
+                )
+                await self.take_error_snapshot(page, acc_name, "create_page_redirect")
+                record_result(build_create_page_result(
+                    "FAILED", acc_name, page_name, category_name,
+                    reason=f"Facebook chuyển khỏi trang tạo Page: {page.url}",
+                    retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                ))
+                break
+
+            # ======================================================
+            # BƯỚC 2: TÌM FORM TÊN TRANG (XỬ LÝ LỖI STALE ELEMENT VÀ IFRAME)
+            # ======================================================
+            # Đã gỡ bỏ form input[type="text"] chung chung để tránh bắt nhầm ô Search
+            name_selectors = (
+                'div[role="main"] input[type="text"]:not([role="combobox"]):not([type="search"]), '
+                'label:has-text("Tên trang") input, '
+                'label:has-text("Page name") input, '
+                'label:has-text("Nom de la Page") input, '
+                'label:has-text("Nombre de la página") input, '
+                'label:has-text("Nome da Página") input, '
+                'input[aria-label*="tên trang" i], '
+                'input[aria-label*="page name" i], '
+                'input[aria-label*="nom de la page" i], '
+                'input[aria-label*="nombre de la página" i], '
+                'input[aria-label*="nome da página" i]'
+            )
+
+            # Check số lượng match để debug
+            name_count = await page.locator(name_selectors).count()
+            self.log(f"[DEBUG] [{acc_name}] Tìm thấy {name_count} phần tử khớp selector tên trang.")
+
+            name_input = page.locator(name_selectors).first
+
+            try:
+                await name_input.wait_for(state="visible", timeout=15000)
+            except Exception:
+                self.log(f"[!] [{acc_name}] Form tải chậm hoặc lỗi DOM. Chụp ảnh debug và F5...")
+
+                # Chụp ảnh thực trạng giao diện trước khi reload
+                if hasattr(self, 'take_error_snapshot'):
+                    await self.take_error_snapshot(page, acc_name, "create_page_timeout_1")
+
+                # Kiểm tra iframes đề phòng form bị nhúng ngầm
+                for i, frame in enumerate(page.frames):
+                    self.log(f"[DEBUG] [{acc_name}] Frame {i}: {frame.url}")
+
+                await page.reload(wait_until="domcontentloaded", timeout=45000)
+                await asyncio.sleep(3)
+
+                # [QUAN TRỌNG NHẤT]: Re-assign (khai báo lại) locator sau khi reload (Khắc phục lỗi Copilot chỉ ra)
+                name_input = page.locator(name_selectors).first
+                name_count_retry = await page.locator(name_selectors).count()
+                self.log(f"[DEBUG] [{acc_name}] Sau F5, tìm thấy {name_count_retry} phần tử khớp.")
+
+                try:
+                    await name_input.wait_for(state="visible", timeout=15000)
+                except Exception:
+                    self.log(f"[-] [{acc_name}] Vẫn không load được form. Bỏ qua lượt này.")
+                    if hasattr(self, 'take_error_snapshot'):
+                        await self.take_error_snapshot(page, acc_name, "create_page_fail_2")
+                    record_result(build_create_page_result(
+                        "ERROR", acc_name, page_name, category_name,
+                        technical_error="Form tạo Page không xuất hiện sau retry.",
+                        retry_count=retry_count + 1,
+                        account_index=idx, proxy=resolved_proxy,
+                        structural_failure="PAGE_NAME_INPUT_MISSING" if name_count_retry == 0 and await page.locator('div[role="main"]').count() > 0 else "",
+                    ))
+                    continue
+
+            # ======================================================
+            # BƯỚC 3: GÕ TÊN TRANG (THÊM LỆNH FOCUS TRƯỚC KHI GÕ)
+            # ======================================================
+            set_page_flow_state("FILL_PAGE_NAME", page_name)
+            await name_input.scroll_into_view_if_needed()
+            await name_input.click(timeout=3000)
+
+            # Ép trỏ chuột phải nháy đúng vào ô này trước khi gõ
+            try:
+                await name_input.focus()
+            except Exception:
+                self.log(f"[!] [{acc_name}] Lỗi focus ô tên trang. Chụp ảnh debug...")
+                if hasattr(self, 'take_error_snapshot'):
+                    await self.take_error_snapshot(page, acc_name, "create_page_focus_fail")
+                record_result(build_create_page_result(
+                    "ERROR", acc_name, page_name, category_name,
+                    technical_error="Không focus được ô page_name.",
+                    retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                ))
+                continue
+
+            await self.human_type(page, name_input, page_name)
+            await asyncio.sleep(1)
+            # Tự động bắt lỗi tên không hợp lệ từ Facebook và tự sửa
+            await asyncio.sleep(1.0)
+            err_notice = page.locator('div[role="alert"], div:has-text("không hợp lệ"), div:has-text("đề xuất")')
+            if await err_notice.count() > 0 and await err_notice.first.is_visible():
+                self.log(f"[!] [{acc_name}] Tên '{page_name}' bị Facebook từ chối. Đang tự động đổi sang tên thuần...")
+
+                # Lọc lấy tên thuần (bỏ các từ nối, hậu tố)
+                clean_name = page_name.split(" -")[0].split(" Official")[0].split(" Review")[0].strip()
+
+                await name_input.fill(clean_name)
+                await asyncio.sleep(1)
+
+            # ======================================================
+            # ======================================================
+            # BƯỚC 4: ĐIỀN HẠNG MỤC (CHỐNG NHẦM THANH TÌM KIẾM FACEBOOK)
+            # ======================================================
+            cat_selectors = (
+                'div[role="main"] input[role="combobox"], '
+                'label:has-text("Hạng mục") input, '
+                'label:has-text("Category") input, '
+                'label:has-text("Catégorie") input, '
+                'label:has-text("Categoría") input, '
+                'label:has-text("Categoria") input, '
+                'input[aria-label*="hạng mục" i], '
+                'input[aria-label*="category" i], '
+                'input[aria-label*="catégorie" i], '
+                'input[aria-label*="categoría" i], '
+                'input[aria-label*="categoria" i], '
+                'div[role="main"] input[role="combobox"], '
+                'input[role="combobox"]:not([aria-label*="kiếm" i]):not([aria-label*="search" i])'
+            )
+
+            cat_input = None
+            cat_elements = page.locator(cat_selectors)
+
+            # Quét từng phần tử tìm được để loại trừ dứt điểm thanh Search ở Header
+            for i in range(await cat_elements.count()):
+                el = cat_elements.nth(i)
+                aria_label = (await el.get_attribute("aria-label") or "").lower()
+                if "tìm kiếm" in aria_label or "search" in aria_label:
+                    continue  # Bỏ qua nếu là thanh tìm kiếm của Facebook
+                if await el.is_visible():
+                    cat_input = el
+                    break
+
+            if cat_input:
+                set_page_flow_state("SELECT_CATEGORY", category_name)
+                await cat_input.scroll_into_view_if_needed()
+                await cat_input.click()
+                await cat_input.focus()
+
+                # Gõ mô phỏng người dùng để kích hoạt dropdown gợi ý
+                await self.human_type(page, cat_input, category_name)
+                await asyncio.sleep(2.0)
+
+                # Sử dụng phím mũi tên xuống + Enter để chọn gợi ý chắc chắn
+                await page.keyboard.press("ArrowDown")
+                await asyncio.sleep(0.5)
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(1.5)
+
+                # Kiểm tra xem hạng mục đã được chọn thành công hay chưa
+                has_selected_tag = await page.locator(
+                    'div[role="main"] [aria-label*="xóa" i], '
+                    'div[role="main"] [aria-label*="remove" i], '
+                    'div[role="main"] span:has-text("' + category_name + '")'
+                ).count() > 0
+
+                if not has_selected_tag:
+                    # Thử phương án dự phòng gọi select_page_category nếu phím Enter chưa bắt được
+                    category_selected, category_reason = await self.select_page_category(page, cat_input, category_name)
+                    if not category_selected:
+                        record_result(build_create_page_result(
+                            "FAILED", acc_name, page_name, category_name,
+                            reason=category_reason, account_index=idx, proxy=resolved_proxy,
+                        ))
+                        continue
+            else:
+                self.log(f"[!] [{acc_name}] Không tìm thấy ô nhập Hạng mục.")
+                record_result(build_create_page_result(
+                    "FAILED", acc_name, page_name, category_name,
+                    reason="CATEGORY_INPUT_NOT_FOUND", account_index=idx, proxy=resolved_proxy,
+                    structural_failure="CATEGORY_INPUT_MISSING" if await cat_elements.count() == 0 else "",
+                ))
+                continue
+
+            # ======================================================
+            # BƯỚC 5: BẤM TẠO VÀ CHỜ KẾT QUẢ TỪ SERVER
+            # ======================================================
+            create_btn = page.locator(
+                'div[role="main"] form button[type="submit"]:visible, '
+                'div[role="main"] button[type="submit"]:visible'
+            ).first
+            if await create_btn.count() == 0:
+                create_btn = page.get_by_role(
+                    "button", name=CREATE_PAGE_BUTTON_PATTERN
+                ).first
+
+            if await create_btn.count() == 0 or not await create_btn.is_visible():
+                self.log(f"[-] [{acc_name}] Không tìm thấy nút Tạo Trang.")
+                if hasattr(self, 'take_error_snapshot'):
+                    await self.take_error_snapshot(page, acc_name, "no_create_btn")
+                record_result(build_create_page_result(
+                    "ERROR", acc_name, page_name, category_name,
+                    technical_error="Không tìm thấy nút Submit tạo Page.",
+                    retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    structural_failure="CREATE_SUBMIT_MISSING" if await create_btn.count() == 0 else "",
+                ))
+                continue
+
+            try:
+                # Chờ tối đa 15 giây cho Facebook đồng bộ dữ liệu Tên và Hạng mục
+                if not await wait_for_locator_ready(create_btn, timeout=15000):
+                    # Quét thông báo lỗi chi tiết trên form để chỉ rõ nguyên nhân
+                    form_alerts = await page.locator(
+                        'div[role="main"] div[role="alert"], '
+                        'div[role="main"] [aria-invalid="true"], '
+                        'div[role="main"] span:has-text("hợp lệ"), '
+                        'div[role="main"] span:has-text("valid")'
+                    ).all_inner_texts()
+
+                    detail_msg = "Nút Tạo Trang bị khóa: "
+                    if form_alerts:
+                        detail_msg += "; ".join(txt.strip() for txt in form_alerts if txt.strip())
+                    else:
+                        detail_msg += f"Tên '{page_name}' hoặc Hạng mục '{category_name}' chưa được Facebook chấp thuận."
+
+                    self.log(f"[-] [{acc_name}] {detail_msg}")
+                    record_result(build_create_page_result(
+                        "FAILED", acc_name, page_name, category_name,
+                        reason=detail_msg,
+                        retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                    ))
+                    if hasattr(self, 'take_error_snapshot'):
+                        await self.take_error_snapshot(page, acc_name, "submit_disabled")
+                    continue
+            except Exception as e:
+                record_result(build_create_page_result(
+                    "ERROR", acc_name, page_name, category_name,
+                    technical_error=f"Không chờ được nút Submit: {type(e).__name__}: {e}",
+                    retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                ))
+                continue
+
+            try:
+                if not self.is_running or getattr(self, "stop_requested", False):
+                    set_page_flow_state("CANCELLED", "Dừng trước khi Submit")
+                    return results
+                set_page_flow_state("SUBMITTING", page_name)
+                before_identity = await self.get_current_page_identity(page)
+                if before_identity.get("id"):
+                    current_page_job["prior_page_ids"].add(before_identity["id"])
+                await create_btn.scroll_into_view_if_needed()
+                if self.skip_paused_module(idx, "CREATE_PAGE"):
+                    return results
+                await self.human_click(page, create_btn)
+                current_page_job["submitted"] = True
+                await self.guard_facebook_checkpoint(page, idx)
+            except Exception as e:
+                self.log(f"[!] [{acc_name}] Lỗi click nút Tạo Trang. Chụp ảnh debug...")
+                if hasattr(self, 'take_error_snapshot'):
+                    await self.take_error_snapshot(page, acc_name, "create_page_create_btn_click_fail")
+                record_result(build_create_page_result(
+                    "ERROR", acc_name, page_name, category_name,
+                    technical_error=f"Submit failed: {type(e).__name__}: {e}",
+                    retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                ))
+                continue
+
+            set_page_flow_state("VERIFYING", page_name)
+
+            invalid_session_reason = ""
+            policy_rejected = False
+            rate_limited = False
+            submission_accepted = False
+
+            for _ in range(8):
+                if not self.is_running or getattr(self, "stop_requested", False):
+                    set_page_flow_state("CANCELLED", "Dừng trong khi gửi tạo Page")
+                    return results
+                await asyncio.sleep(2)
+                await self.guard_facebook_checkpoint(page, idx)
+
+                cur_url = page.url.lower()
+                if is_invalid_facebook_account_url(cur_url):
+                    invalid_session_reason = f"Tài khoản mất phiên đăng nhập sau khi gửi tạo Page: {page.url}"
+                    break
+
+                # 1. Tự động đọc mọi thông báo hệ thống xuất hiện trên màn hình qua ARIA
+                system_alerts = await self.get_system_notifications(page)
+                combined_alerts = " ".join(system_alerts).lower()
+                body_text = (await page.inner_text("body")).lower()
+
+                if is_page_policy_rejected(body_text) or "page policies" in combined_alerts or "chính sách" in combined_alerts:
+                    policy_rejected = True
+                    break
+
+                if any(err in f"{combined_alerts} {body_text}" for err in ["quá nhiều trang", "too many pages", "limit", "giới hạn"]):
+                    rate_limited = True
+                    break
+
+                # 2. Nhận diện cấu trúc Onboarding xuất hiện (form chi tiết hoặc URL đã điều hướng)
+                has_onboarding_form = await self.page_setup_transition_detected(
+                    page, page_name, body_text, system_alerts
+                )
+
+                if has_onboarding_form or "profile.php?id=" in cur_url or "facebook.com/pages/creation" not in cur_url:
+                    submission_accepted = True
+                    # Do not dismiss the setup dialog itself with Escape.
+                    break
+
+            if invalid_session_reason:
+                record_result(build_create_page_result(
+                    "FAILED", acc_name, page_name, category_name,
+                    reason=invalid_session_reason,
+                    retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                ))
+                self.set_account_failure(idx, "invalid_login", invalid_session_reason)
+                return results
+
+            if policy_rejected:
+                record_result(build_create_page_result(
+                    "FAILED", acc_name, page_name, category_name,
+                    reason="PAGE_POLICY_REJECTED",
+                    retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                ))
+                self.log(f"[-] [{acc_name}] Facebook từ chối tạo Page theo chính sách.")
+                continue
+
+            if rate_limited:
+                record_result(build_create_page_result(
+                    "FAILED", acc_name, page_name, category_name,
+                    reason="Bị giới hạn tạo Trang gần đây (Rate limited)",
+                    retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                ))
+                self.log(f"[-] [{acc_name}] Bị giới hạn tạo Trang gần đây.")
+                break
+
+            if not submission_accepted:
+                self.log(f"[-] [{acc_name}] Không phát hiện bước tiếp theo hoặc thông báo xác nhận.")
+                record_result(build_create_page_result(
+                    "FAILED", acc_name, page_name, category_name,
+                    reason="Không xuất hiện giao diện thiết lập sau khi bấm Tạo.",
+                    retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                ))
+                continue
+
+            await self.click_page_blank_margin(page, acc_name, idx)
+
+            # ======================================================
+            # BƯỚC 6: XỬ LÝ WIZARD THIẾT LẬP (MÔ PHỎNG NGƯỜI THẬT TỪNG BƯỚC)
+            # ======================================================
+            self.log(f"[*] [{acc_name}] Bắt đầu hoàn thiện các bước thiết lập Page (Bio, Tiếp, Xong)...")
+
+            # 6.1. Điền Tiểu sử (Bio) ngẫu nhiên nếu có form
+            bio_samples = [
+                "Chào mừng mọi người đến với kênh của mình! ✨",
+                "Nơi chia sẻ những khoảnh khắc và trải nghiệm thú vị mỗi ngày.",
+                "Trang cá nhân cập nhật tin tức và kiến thức hữu ích 🌿",
+                "Góc nhỏ lưu giữ kỷ niệm và kết nối những người bạn mới.",
+                "Học hỏi, chia sẻ và lan tỏa năng lượng tích cực 🌟"
+            ]
+            bio_input = page.locator('div[role="dialog"] textarea, textarea[aria-label*="tiểu sử" i], textarea[aria-label*="bio" i]').first
+            if await bio_input.count() > 0 and await bio_input.is_visible():
+                try:
+                    chosen_bio = random.choice(bio_samples)
+                    await self.human_type(page, bio_input, chosen_bio)
+                    await asyncio.sleep(random.uniform(1.2, 2.0))
+                except Exception:
+                    pass
+
+            # 6.2. Vòng lặp duyệt qua các bước Next / Done có nhịp dừng và cuộn trang
+            wizard_step = 1
+            for _ in range(15):
+                if not self.is_running or getattr(self, "stop_requested", False):
+                    break
+                await self.guard_facebook_checkpoint(page, idx)
+
+                # Nếu đã điều hướng khỏi màn hình tạo trang và tới Page chính
+                cur_url = page.url.lower()
+                if "facebook.com/pages/creation" not in cur_url:
+                    break
+
+                # Mô phỏng người đọc: thi thoảng cuộn nhẹ chuột trong dialog
+                if random.random() < 0.4:
+                    await page.mouse.wheel(0, random.randint(120, 250))
+                    await asyncio.sleep(random.uniform(0.6, 1.2))
+
+                # Ưu tiên tìm nút Xong/Done trước, sau đó tới Tiếp/Next/Bỏ qua
+                wiz_btn = await self.get_page_setup_button(page)
+                if wiz_btn is not None:
+                    await wiz_btn.scroll_into_view_if_needed(timeout=5000)
+                    if not await wait_for_locator_ready(wiz_btn, timeout=5000):
+                        await asyncio.sleep(1)
+                        continue
+                    btn_name = (await wiz_btn.inner_text()).strip()
+                    self.log(f"[*] [{acc_name}] [Bước {wizard_step}] Bấm '{btn_name}'...")
+                    await self.human_click(page, wiz_btn)
+                    wizard_step += 1
+                    # Giữ nhịp dừng tự nhiên từ 3.5s đến 6s cho mỗi bước chuyển
+                    await asyncio.sleep(random.uniform(3.5, 6.0))
+                else:
+                    await asyncio.sleep(2.0)
+
+            await self.click_page_blank_margin(page, acc_name, idx)
+
+            # Đóng các popup chào mừng/giới thiệu nếu còn sót lại
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(1.5)
+
+            page_identity = await self.verify_created_page(page, idx, current_page_job)
+            if not is_verified_page_identity(page_identity):
+                self.log(
+                    f"[-] [{acc_name}] Không xác minh được Page URL/ID sau khi tạo; "
+                    "không ghi nhận thành công."
+                )
+                record_result(build_create_page_result(
+                    "FAILED", acc_name, page_name, category_name,
+                    reason="Facebook đã chuyển sang thiết lập Page nhưng chưa xác minh được Page URL/ID; dừng tạo tiếp để tránh trùng Page.",
+                    retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                ))
+                break
+
+            if not self.is_running or getattr(self, "stop_requested", False):
+                set_page_flow_state("CANCELLED", "Không ghi success sau lệnh Stop")
+                return results
+            transition_page_context(page_context, "SUCCESS", page_identity)
+            page_record = build_create_page_result(
+                "SUCCESS", acc_name, page_name, category_name,
+                page_url=page_identity["url"], page_id=page_identity["id"],
+                retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                flow_state=page_context["creation_status"],
+            )
+            page_record.update(owner_account_id=page_identity["owner_account_id"],
+                               page_job_id=page_identity["page_job_id"])
+            await self.guard_facebook_checkpoint(page, idx)
+            try:
+                if record_result(page_record) is None:
+                    return results
+            except DuplicatePageResult:
+                record_result(build_create_page_result(
+                    "FAILED", acc_name, page_name, category_name,
+                    page_url=page_identity["url"], page_id=page_identity["id"],
+                    reason="Page URL/ID đã tồn tại trong kết quả SQLite.",
+                    retry_count=retry_count, account_index=idx, proxy=resolved_proxy,
+                ))
+                self.log(f"[FAILED] [{acc_name}] Bỏ qua Page trùng URL/ID.")
+                continue
+
+            created_count += 1
+            self.set_account_state(
+                idx,
+                current_action=f"Create Page [SUCCESS]: {created_count}/{effective_max_pages}",
+            )
+            self.log(f"[PAGE][SUCCESS] [{acc_name}] page_id={page_identity['id'] or 'N/A'} page_url={page_identity['url']}")
+
+            if created_count < effective_max_pages:
+                if not await self.wait_between_page_jobs(
+                    page, context, acc_name, idx, min_page_del, max_page_del
+                ):
+                    break
+
+        except Exception as e:
+            self.log(f"[-] [{acc_name}] Lỗi vòng lặp tạo Page: {e}")
+            record_result(build_create_page_result(
+                "ERROR", acc_name, page_name, category_name,
+                technical_error=f"{type(e).__name__}: {e}",
+                retry_count=retry_count,
+                account_index=idx,
+                proxy=resolved_proxy,
+            ))
+            if hasattr(self, 'take_error_snapshot'):
+                await self.take_error_snapshot(page, acc_name, "create_page_fatal")
+
+    return results
