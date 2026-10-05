@@ -7,6 +7,8 @@ from facebook.page_creator import (
     parse_page_plan,
     build_create_page_plans as _build_create_page_plans,
     validate_create_page_targets,
+    build_page_context as _build_page_context,
+    transition_page_context as _transition_page_context,
 )
 import base64
 import contextvars
@@ -58,7 +60,25 @@ if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 
+def build_page_context(account_id, page_name, category, proxy="", locale="AUTO"):
+    return _build_page_context(
+        account_id,
+        page_name,
+        category,
+        proxy=proxy,
+        locale=locale,
+        locale_normalizer=normalize_account_locale,
+    )
 
+
+def transition_page_context(page_context, state, page_identity=None):
+    return _transition_page_context(
+        page_context,
+        state,
+        page_identity,
+        page_flow_states=PAGE_FLOW_STATES,
+        identity_validator=is_verified_page_identity,
+    )
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
 CURRENT_VERSION = "2.3.3"
@@ -1007,39 +1027,7 @@ def filter_targets_for_mode(targets, mode, known_modes):
 
 
 
-def build_page_context(account_id, page_name, category, proxy="", locale="AUTO"):
-    return {
-        "owner_account_id": str(account_id or ""),
-        "requested_page_name": str(page_name or ""),
-        "requested_category": str(category or ""),
-        "proxy": str(proxy or ""),
-        "locale": normalize_account_locale(locale),
-        "page_id": "",
-        "page_url": "",
-        "creation_status": "PENDING",
-        "verification_status": "PENDING",
-        "created_at": "",
-    }
 
-
-def transition_page_context(page_context, state, page_identity=None):
-    normalized_state = str(state or "").upper()
-    if normalized_state not in PAGE_FLOW_STATES:
-        raise ValueError(f"Create Page state không hợp lệ: {state}")
-    if normalized_state == "SUCCESS" and not is_verified_page_identity(page_identity or {}):
-        raise ValueError("Không thể chuyển SUCCESS khi chưa có Page URL/ID hợp lệ.")
-    page_context["creation_status"] = normalized_state
-    if normalized_state == "VERIFYING":
-        page_context["verification_status"] = "VERIFYING"
-    elif normalized_state == "SUCCESS":
-        identity = page_identity or {}
-        page_context["page_url"] = str(identity.get("url") or "")
-        page_context["page_id"] = str(identity.get("id") or "")
-        page_context["verification_status"] = "VERIFIED"
-        page_context["created_at"] = datetime.now().isoformat(timespec="seconds")
-    elif normalized_state in {"FAILED", "ERROR", "CANCELLED"}:
-        page_context["verification_status"] = "NOT_VERIFIED"
-    return page_context
 
 
 def classify_page_access_feedback(text):
