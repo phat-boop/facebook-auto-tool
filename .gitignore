@@ -5,6 +5,7 @@ build/
 license.lic 
 settings.json 
 admin_key_gen.py 
+!/source/admin_key_gen.py
 license_private_key.pem
 __pycache__/
 build_rebuild/

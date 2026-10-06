@@ -106,7 +106,7 @@ def transition_page_context(page_context, state, page_identity=None):
     )
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.3.3"
+CURRENT_VERSION = "2.3.4"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -2006,6 +2006,23 @@ def parse_any_account_line(raw_line: str, idx: int = 1):
     return record.to_account_dict() if record else None
 
 
+def facebook_cookie_uid(cookie_input):
+    """Validate the cookie's account identity without changing imported fields."""
+    cookie = normalize_cookie_input(cookie_input)
+    if not cookie or any(separator in cookie for separator in ("|", "\r", "\n")):
+        return None
+
+    user_ids = []
+    for pair in cookie.split(";"):
+        name, separator, value = pair.partition("=")
+        if separator and name.strip() == "c_user":
+            user_ids.append(value.strip())
+    if len(user_ids) != 1 or not re.fullmatch(r"[1-9][0-9]*", user_ids[0]):
+        return None
+
+    return user_ids[0]
+
+
 def runtime_account_record(account):
     """Accept only a normalized model or its canonical serialization at runtime."""
     if isinstance(account, AccountRecord):
@@ -2130,7 +2147,7 @@ THEMES = {
     }
 }
 class ImportAccountDialog(tk.Toplevel):
-    """Cookie import dialog with internal provenance for full account inputs."""
+    """Multi-format account import; only the run input displays cookies."""
     def __init__(self, parent, on_import_callback):
         super().__init__(parent)
         self.title("Thêm tài khoản vào hệ thống")
@@ -2142,17 +2159,17 @@ class ImportAccountDialog(tk.Toplevel):
 
         self.configure(bg="#0B0F19")
 
-        # Tiêu đề & Chọn định dạng
+        # Tiêu đề
         frame_top = tk.Frame(self, bg="#131C2E", padx=15, pady=10, highlightbackground="#1E293B", highlightthickness=1)
         frame_top.pack(fill="x", padx=10, pady=10)
 
-        tk.Label(frame_top, text="COOKIE FACEBOOK", font=("Segoe UI", 13, "bold"), bg="#131C2E", fg="#38BDF8").pack(anchor="w")
+        tk.Label(frame_top, text="NHẬP TÀI KHOẢN FACEBOOK", font=("Segoe UI", 13, "bold"), bg="#131C2E", fg="#38BDF8").pack(anchor="w")
 
         # Khung nhập dữ liệu
         frame_txt = tk.Frame(self, bg="#131C2E", padx=10, pady=10, highlightbackground="#1E293B", highlightthickness=1)
         frame_txt.pack(fill="both", expand=True, padx=10, pady=5)
 
-        tk.Label(frame_txt, text="Cookie (mỗi dòng một tài khoản):", font=("Segoe UI", 12), bg="#131C2E", fg="#94A3B8").pack(anchor="w", pady=(0, 5))
+        tk.Label(frame_txt, text="Tài khoản nhiều định dạng / Cookie Facebook:", font=("Segoe UI", 12), bg="#131C2E", fg="#94A3B8").pack(anchor="w", pady=(0, 5))
         self.txt_input = scrolledtext.ScrolledText(frame_txt, bg="#070B14", fg="#E2E8F0", font=("Consolas", 10), insertbackground="#38BDF8", relief="solid", bd=1)
         self.txt_input.pack(fill="both", expand=True)
 
@@ -2172,16 +2189,33 @@ class ImportAccountDialog(tk.Toplevel):
             messagebox.showwarning("Thông báo", "Vui lòng nhập ít nhất 1 dòng dữ liệu!", parent=self)
             return
 
-        lines = [line for line in raw_data.splitlines() if line.strip()]
         parsed_accounts = []
+        invalid_lines = []
 
-        for idx, line in enumerate(lines, 1):
-            parsed = parse_any_account_line(line, idx)
-            if parsed:
-                parsed_accounts.append(parsed)
+        for idx, line in enumerate(raw_data.splitlines(), 1):
+            if not line.strip():
+                continue
+            record = import_account_record(line, idx)
+            if record and facebook_cookie_uid(record.cookie):
+                parsed_accounts.append(record.to_account_dict())
+            else:
+                invalid_lines.append(str(idx))
+
+        invalid_message = ""
+        if invalid_lines:
+            invalid_message = (
+                f"Bỏ qua dòng {', '.join(invalid_lines)}: cần Cookie Facebook có c_user hợp lệ."
+            )
+        if not parsed_accounts:
+            messagebox.showwarning("Cookie không hợp lệ", invalid_message, parent=self)
+            return
 
         self.on_import_callback(parsed_accounts)
-        messagebox.showinfo("Thành công", f"Đã nạp thành công {len(parsed_accounts)} tài khoản vào bảng!", parent=self)
+        message = f"Đã nạp thành công {len(parsed_accounts)} tài khoản vào bảng!"
+        if invalid_message:
+            messagebox.showwarning("Nhập tài khoản", f"{message}\n{invalid_message}", parent=self)
+        else:
+            messagebox.showinfo("Thành công", message, parent=self)
         self.destroy()
 # [ĐOẠN TRƯỚC:]
 class MainToolApp:

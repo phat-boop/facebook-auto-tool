@@ -157,7 +157,8 @@ function Invoke-PytestGate {
 }
 
 $projectRoot = $PSScriptRoot
-$clientPath = Join-Path $projectRoot 'client_app.py'
+$sourceRoot = Join-Path $projectRoot 'source'
+$clientPath = Join-Path $sourceRoot 'client_app.py'
 $versionJsonPath = Join-Path $projectRoot 'version.json'
 $specPath = Join-Path $projectRoot 'client_app.spec'
 $exePath = Join-Path $projectRoot 'dist\client_app.exe'

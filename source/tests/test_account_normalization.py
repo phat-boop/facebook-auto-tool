@@ -200,15 +200,20 @@ def test_multiple_accounts_keep_separate_raw_proxy_and_fields():
     assert len(app.txt_accounts.text.strip().splitlines()) == 2
 
 
-def test_import_dialog_keeps_raw_and_token_in_callback():
-    raw = f" 12345|Pass|2FA|||{COOKIE}|TOKEN "
+def test_import_dialog_keeps_full_raw_record_in_callback():
+    raw = f" 123456789|Pass|2FA|||{COOKIE}|TOKEN "
     dialog = mock.Mock()
     dialog.txt_input = TextBuffer(raw)
     with mock.patch.object(app_module.messagebox, "showinfo"):
         app_module.ImportAccountDialog.process_import(dialog)
     account = dialog.on_import_callback.call_args.args[0][0]
     assert account["raw_line"] == raw
+    assert account["uid"] == "123456789"
+    assert account["cookie"] == COOKIE
+    assert account["password"] == "Pass"
+    assert account["2fa"] == "2FA"
     assert account["token"] == "TOKEN"
+    assert account["import_fields"][3:5] == ["", ""]
     assert len(account["canonical_line"].split("|")) == 5
 
 

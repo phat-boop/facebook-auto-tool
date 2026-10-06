@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
 
-project_root = Path(SPECPATH).resolve()
+project_root = Path(SPECPATH).resolve() / 'source'
 
 a = Analysis(
     [str(project_root / 'client_app.py')],
