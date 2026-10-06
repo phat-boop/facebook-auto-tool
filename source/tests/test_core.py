@@ -899,12 +899,21 @@ class CoreHelpersTest(unittest.TestCase):
                 self.inline_setup = inline_setup
                 self.wizard_steps = 0
                 self.margin_click_steps = []
+                self.verification_evidence = None
+                self.verification_calls = 0
 
             async def evaluate(self, script):
                 if script == client_app.PAGE_BLANK_MARGIN_POINT:
                     return {"x": 480, "y": 240}
                 if script != client_app.PAGE_CREATION_EVIDENCE:
                     return False
+                self.verification_calls += 1
+                if self.verification_evidence is not None:
+                    evidence = self.verification_evidence[
+                        min(self.verification_calls - 1, len(self.verification_evidence) - 1)
+                    ]
+                    if evidence is not None:
+                        return evidence
                 identity = client_app.extract_facebook_page_identity([self.url])
                 return {"page_id": identity.get("id", ""), "page_type": "PAGE",
                         "name": self.requested_name, "canonical": self.url}
@@ -985,6 +994,8 @@ class CoreHelpersTest(unittest.TestCase):
             running=True,
             wait_result=None,
             inline_setup=False,
+            verification_evidence=None,
+            expected_verification_calls=None,
         ):
             app = client_app.MainToolApp.__new__(client_app.MainToolApp)
             app.is_running = running
@@ -1022,6 +1033,7 @@ class CoreHelpersTest(unittest.TestCase):
 
             app.ensure_personal_profile = ensure_personal_profile
             fake_page = FakePage(result_url, body_text, click_error, inline_setup)
+            fake_page.verification_evidence = verification_evidence
             page_targets = targets or ["Trang kiểm thử"]
             with (
                 mock.patch.object(client_app.asyncio, "sleep", new=mock.AsyncMock()),
@@ -1040,6 +1052,8 @@ class CoreHelpersTest(unittest.TestCase):
                     )
                 except client_app.FacebookCheckpointStopped:
                     records = []
+            if expected_verification_calls is not None:
+                self.assertEqual(fake_page.verification_calls, expected_verification_calls)
             if inline_setup:
                 self.assertEqual(fake_page.create_index, 1)
                 self.assertEqual(fake_page.wizard_steps, 5)
@@ -1094,6 +1108,16 @@ class CoreHelpersTest(unittest.TestCase):
                 if case_name.startswith("policy"):
                     self.assertEqual(records[0]["reason"], "PAGE_POLICY_REJECTED")
                     self.assertEqual(records[0]["retry_count"], 0)
+
+        for evidence_sequence, expected_calls in (([None, {}, {}], 1), ([{}, None, {}], 2)):
+            with self.subTest(verification_calls=expected_calls):
+                records, saves, _categories, _state = asyncio.run(run_create_case(
+                    "https://www.facebook.com/profile.php?id=123456789",
+                    verification_evidence=evidence_sequence,
+                    expected_verification_calls=expected_calls,
+                ))
+                self.assertEqual(records[0]["status"], "SUCCESS")
+                self.assertEqual(saves, 1)
 
         records, saves, _categories, state = asyncio.run(run_create_case(
             "https://www.facebook.com/checkpoint/",

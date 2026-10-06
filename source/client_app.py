@@ -106,7 +106,7 @@ def transition_page_context(page_context, state, page_identity=None):
     )
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.3.4"
+CURRENT_VERSION = "2.3.5"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -5786,7 +5786,7 @@ class MainToolApp:
                     return FriendRequestOutcome("FAILED", expected, "Đã thao tác người nhận này trong đợt; không gửi lại khi chưa xác minh.")
                 self.account_states.mark_friend_attempt(index, expected)
             await button.click(timeout=5000)
-            for _ in range(8):
+            for _ in range(15):
                 await self.guard_facebook_checkpoint(page)
                 after = await scope.evaluate(FRIEND_SCOPE_SNAPSHOT)
                 after_references = {ref for link in after["links"] if (ref := friend_profile_reference(link))}

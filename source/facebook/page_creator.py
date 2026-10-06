@@ -224,24 +224,62 @@ PAGE_CREATION_EVIDENCE = r"""() => {
 
 def verify_page_job_evidence(url, evidence, job, owner_account_id):
     empty = {"url": "", "id": ""}
-    if not evidence or not job.get("submitted") or job.get("owner_account_id") != owner_account_id:
-        return empty
-    identity = extract_facebook_page_identity([url])
-    page_id = str(evidence.get("page_id") or "")
-    if evidence.get("page_type") != "PAGE" or not page_id.isdigit() or len(page_id) < 5:
-        return empty
-    if not identity["url"] or (identity["id"] and identity["id"] != page_id):
-        return empty
-    if normalize_ui_text(evidence.get("name")) != normalize_ui_text(job["page_name"]):
-        return empty
-    canonical = evidence.get("canonical")
-    if canonical and facebook_page_reference(canonical) != facebook_page_reference(url):
-        return empty
-    if page_id == str(job.get("owner_uid") or "") or page_id in job.get("prior_page_ids", set()):
-        return empty
-    return {**identity, "id": page_id, "owner_account_id": owner_account_id,
-            "page_job_id": job["page_job_id"], "verified": True}
 
+    if (
+        not evidence
+        or not job.get("submitted")
+        or job.get("owner_account_id") != owner_account_id
+    ):
+        return empty
+
+    canonical = evidence.get("canonical")
+
+    identity = extract_facebook_page_identity([canonical, url])
+
+    page_id = str(evidence.get("page_id") or "")
+
+    page_type = str(evidence.get("page_type") or "").upper()
+
+    if page_type != "PAGE":
+        return empty
+
+    if not page_id.isdigit() or len(page_id) < 5:
+        return empty
+
+    if not identity["url"]:
+        return empty
+
+    if identity["id"] and identity["id"] != page_id:
+        return empty
+
+    observed_name = normalize_ui_text(evidence.get("name"))
+    expected_name = normalize_ui_text(job["page_name"])
+
+    if not observed_name or observed_name != expected_name:
+        return empty
+
+    canonical = evidence.get("canonical")
+
+    if (
+        canonical
+        and facebook_page_reference(canonical)
+        != facebook_page_reference(url)
+    ):
+        return empty
+
+    if (
+        page_id == str(job.get("owner_uid") or "")
+        or page_id in job.get("prior_page_ids", set())
+    ):
+        return empty
+
+    return {
+        **identity,
+        "id": page_id,
+        "owner_account_id": owner_account_id,
+        "page_job_id": job["page_job_id"],
+        "verified": True,
+    }
 
 def is_page_policy_rejected(text):
     normalized = " ".join(str(text or "").casefold().split())
@@ -812,27 +850,25 @@ async def run_create_page(
                 await asyncio.sleep(2.0)
 
                 # Sử dụng phím mũi tên xuống + Enter để chọn gợi ý chắc chắn
-                await page.keyboard.press("ArrowDown")
-                await asyncio.sleep(0.5)
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(1.5)
+                category_selected, category_reason = await self.select_page_category(
+                    page,
+                    cat_input,
+                    category_name,)
 
-                # Kiểm tra xem hạng mục đã được chọn thành công hay chưa
-                has_selected_tag = await page.locator(
-                    'div[role="main"] [aria-label*="xóa" i], '
-                    'div[role="main"] [aria-label*="remove" i], '
-                    'div[role="main"] span:has-text("' + category_name + '")'
-                ).count() > 0
+                if not category_selected:
+                    record_result(
+                        build_create_page_result(
+                            "FAILED",
+                            acc_name,
+                            page_name,
+                            category_name,
+                            reason=category_reason,
+                            account_index=idx,
+                            proxy=resolved_proxy,
+                        )
+                    )
+                    continue
 
-                if not has_selected_tag:
-                    # Thử phương án dự phòng gọi select_page_category nếu phím Enter chưa bắt được
-                    category_selected, category_reason = await self.select_page_category(page, cat_input, category_name)
-                    if not category_selected:
-                        record_result(build_create_page_result(
-                            "FAILED", acc_name, page_name, category_name,
-                            reason=category_reason, account_index=idx, proxy=resolved_proxy,
-                        ))
-                        continue
             else:
                 self.log(f"[!] [{acc_name}] Không tìm thấy ô nhập Hạng mục.")
                 record_result(build_create_page_result(
@@ -912,6 +948,7 @@ async def run_create_page(
                 if self.skip_paused_module(idx, "CREATE_PAGE"):
                     return results
                 await self.human_click(page, create_btn)
+                self.log(f"[PAGE][SUBMIT] [{acc_name}] name={page_name} category={category_name}")
                 current_page_job["submitted"] = True
                 await self.guard_facebook_checkpoint(page, idx)
             except Exception as e:
@@ -932,7 +969,7 @@ async def run_create_page(
             rate_limited = False
             submission_accepted = False
 
-            for _ in range(8):
+            for _ in range(15):
                 if not self.is_running or getattr(self, "stop_requested", False):
                     set_page_flow_state("CANCELLED", "Dừng trong khi gửi tạo Page")
                     return results
@@ -1066,7 +1103,13 @@ async def run_create_page(
             await page.keyboard.press("Escape")
             await asyncio.sleep(1.5)
 
-            page_identity = await self.verify_created_page(page, idx, current_page_job)
+            page_identity = {}
+            for _ in range(3):
+                page_identity = await self.verify_created_page(page, idx, current_page_job)
+                self.log(f"[PAGE][VERIFY] [{acc_name}] {page_identity}")
+                if is_verified_page_identity(page_identity):
+                    break
+                await asyncio.sleep(3.0)
             if not is_verified_page_identity(page_identity):
                 self.log(
                     f"[-] [{acc_name}] Không xác minh được Page URL/ID sau khi tạo; "

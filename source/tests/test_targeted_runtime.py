@@ -3,6 +3,7 @@ import asyncio
 import contextvars
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from itertools import chain, repeat
 from unittest import mock
 
 import pytest
@@ -35,7 +36,7 @@ def snapshot(controls, target="333333", connected=True):
 
 def friend_resources(before, after, exception=None):
     scope = mock.Mock()
-    scope.evaluate = mock.AsyncMock(side_effect=[before] + [after] * 8)
+    scope.evaluate = mock.AsyncMock(side_effect=chain([before], repeat(after)))
     handle = mock.Mock()
     handle.as_element.return_value = scope
     handle.dispose = mock.AsyncMock()
@@ -64,6 +65,20 @@ def test_matching_recipient_pending_is_sent():
     result = asyncio.run(app.click_and_confirm_friend_request(page, button, "333333"))
     assert result.status == "SENT"
     assert result.target == "333333"
+
+
+def test_matching_recipient_pending_after_extended_wait_is_sent():
+    app = make_app()
+    before = snapshot(["Add Friend"])
+    page, button = friend_resources(before, snapshot(["outgoing_pending"]))
+    scope = button.evaluate_handle.return_value.as_element.return_value
+    scope.evaluate.side_effect = chain([before] * 10, repeat(snapshot(["outgoing_pending"])))
+    with mock.patch.object(app_module.asyncio, "sleep", new=mock.AsyncMock()):
+        result = asyncio.run(app.click_and_confirm_friend_request(page, button, "333333"))
+    assert result.status == "SENT"
+    assert result.target == "333333"
+    assert scope.evaluate.await_count == 11
+    button.click.assert_awaited_once()
 
 
 @pytest.mark.parametrize("control,status", [("friends", "ALREADY_FRIEND"), ("pending", "ALREADY_PENDING")])
@@ -199,6 +214,17 @@ def test_page_success_binds_owner_and_job():
     assert identity["verified"]
     assert identity["owner_account_id"] == "111111"
     assert identity["page_job_id"] == "job-A"
+
+
+@pytest.mark.parametrize("field,value", [("page_type", ""), ("page_type", None),
+                                        ("name", ""), ("name", None)])
+def test_page_missing_positive_evidence_is_not_success(field, value):
+    evidence = page_evidence()
+    evidence[field] = value
+    identity = app_module.verify_page_job_evidence(
+        "https://www.facebook.com/profile.php?id=999999", evidence, page_job(), "111111"
+    )
+    assert not app_module.is_verified_page_identity(identity)
 
 
 @pytest.mark.parametrize("requested,options,selected,expected", [
