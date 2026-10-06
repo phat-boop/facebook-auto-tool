@@ -1,7 +1,7 @@
 {
-    "version":  "2.3.3",
-    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.3.3/client_app.exe",
-    "sha256":  "B037F03AF519FAA5B6DA371B42BBC059EB2C84EB702DCD0A437C5FCCA49E3B83",
-    "changelog":  "Cập nhật Tool",
-    "mandatory":  false
+  "version": "2.3.4",
+  "download_url": "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.3.4/client_app.exe",
+  "sha256": "E7728E7A1A3DE3BE44B733382BFF40E1078F4CD06EE93A39CA2D2779595D091A",
+  "changelog": "Cải thiện nhập tài khoản nhiều định dạng, giữ đầy đủ dữ liệu và ổn định chạy bằng Cookie.",
+  "mandatory": false
 }
