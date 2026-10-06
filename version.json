@@ -1,7 +1,7 @@
 {
-  "version": "2.3.4",
-  "download_url": "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.3.4/client_app.exe",
-  "sha256": "E7728E7A1A3DE3BE44B733382BFF40E1078F4CD06EE93A39CA2D2779595D091A",
-  "changelog": "Cải thiện nhập tài khoản nhiều định dạng, giữ đầy đủ dữ liệu và ổn định chạy bằng Cookie.",
+  "version": "2.3.5",
+  "download_url": "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.3.5/client_app.exe",
+  "sha256": "F362C78D25A73268AF4476AB1BC411A1A9A77827B2CB61EE77A70ECC37F5E9A1",
+  "changelog": "Ổn định chọn danh mục, xác minh Page và chờ xác nhận kết bạn.",
   "mandatory": false
 }
