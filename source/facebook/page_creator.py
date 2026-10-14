@@ -230,9 +230,9 @@ PAGE_CREATION_EVIDENCE = r"""() => {
 
     const visible = el => Boolean(el && el.getClientRects && el.getClientRects().length > 0);
     const ignoredHeadings = new Set([
-        'manage page', 'qu?n l? trang', 'notifications', 'th?ng b?o',
-        'finish setting up your page', 'ho?n t?t thi?t l?p trang c?a b?n',
-        'create a page', 't?o trang', 'pages', 'trang', 'chats', '?o?n chat'
+        'manage page', 'quản lý trang', 'notifications', 'thông báo',
+        'finish setting up your page', 'hoàn tất thiết lập trang của bạn',
+        'create a page', 'tạo trang', 'pages', 'trang', 'chats', 'đoạn chat'
     ]);
 
     const headingTexts = Array.from(document.querySelectorAll('h1, h2, [role="heading"], [role="main"] h1, [role="main"] span, [role="navigation"] span'))
@@ -321,20 +321,20 @@ def verify_page_job_evidence(url, evidence, job, owner_account_id):
 
 
 RATE_LIMIT_PATTERNS = (
-    "qu? nhi?u trang", "too many pages",
-    "b?n ?? t?o qu? nhi?u", "you have created too many",
-    "reached the limit", "??t ??n gi?i h?n",
-    "gi?i h?n t?o trang", "page creation limit",
-    "t?m th?i b? ch?n", "temporarily blocked",
-    "th? l?i sau", "try again later",
+    "quá nhiều trang", "too many pages",
+    "bạn đã tạo quá nhiều", "you have created too many",
+    "reached the limit", "đạt đến giới hạn",
+    "giới hạn tạo trang", "page creation limit",
+    "tạm thời bị chặn", "temporarily blocked",
+    "thử lại sau", "try again later",
     "??? ??", "????????", "????", "????",
     "?????????????????", "terlalu banyak halaman",
 )
 
 POLICY_REJECT_PATTERNS = (
-    "page policies", "ch?nh s?ch trang", "tu?n th? ch?nh s?ch",
-    "following page policies", "violates our", "vi ph?m",
-    "kh?ng th? t?o trang", "can't create page", "cannot create page",
+    "page policies", "chính sách trang", "tuân thủ chính sách",
+    "following page policies", "violates our", "vi phạm",
+    "không thể tạo trang", "can't create page", "cannot create page",
 )
 
 
@@ -345,13 +345,13 @@ def classify_facebook_page_feedback(alerts, body_text, page_name=""):
     combined = f"{alert_norm} {body_norm}".strip()
 
     if page_name and any(page_creation_notice_matches(txt, page_name) for txt in [*(alerts or []), body_text or ""]):
-        return "CREATED_NOTICE", "Facebook x?c nh?n Page ?? ???c kh?i t?o."
+        return "CREATED_NOTICE", "Facebook xác nhận Page đã được khởi tạo."
 
     if is_page_policy_rejected(body_norm) or any(p in alert_norm for p in POLICY_REJECT_PATTERNS):
-        return "POLICY_REJECTED", "Facebook t? ch?i t?o Page theo ch?nh s?ch."
+        return "POLICY_REJECTED", "Facebook từ chối tạo Page theo chính sách."
 
     if any(p in alert_norm for p in RATE_LIMIT_PATTERNS) or any(p in body_norm for p in RATE_LIMIT_PATTERNS[:6]):
-        return "RATE_LIMITED", "B? gi?i h?n t?n su?t t?o Trang g?n ??y (Rate limited)."
+        return "RATE_LIMITED", "Bị giới hạn tần suất tạo Trang gần đây (Rate limited)."
 
     return "PENDING", ""
 
@@ -551,10 +551,10 @@ async def select_page_category(self, page, category_input, requested_category):
     req_norm = normalize_ui_text(requested_category)
     aliases = {req_norm}
     blog_aliases = [
-        "Blog c? nh?n", "Personal blog", "Blog personnel", "Blog personal",
-        "Blog pessoal", "Pers?nlicher Blog", "????????????", "Blog Pribadi",
+        "Blog cá nhân", "Personal blog", "Blog personnel", "Blog personal",
+        "Blog pessoal", "Persönlicher Blog", "????????????", "Blog Pribadi",
         "???(??)", "?? ???", "????", "?????",
-        "?????? ????", "????? ?????", "Ki?isel blog", "Blog",
+        "?????? ????", "????? ?????", "Kişisel blog", "Blog",
     ]
     if req_norm in {normalize_ui_text(x) for x in blog_aliases}:
         aliases.update(normalize_ui_text(x) for x in blog_aliases)
@@ -587,7 +587,7 @@ async def select_page_category(self, page, category_input, requested_category):
                     return bool(selected), "" if selected else "CATEGORY_SELECTION_NOT_VERIFIED"
         return None
 
-    # L?n 1: Ch? listbox t? t? kh?a ?? g? ban ??u (VD: "Blog c? nh?n")
+    # L?n 1: Ch? listbox t? t? kh?a ?? g? ban ??u (VD: "Blog cá nhân")
     has_any_option = False
     try:
         await options.first.wait_for(state="visible", timeout=5000)
@@ -600,10 +600,10 @@ async def select_page_category(self, page, category_input, requested_category):
         if pick_res is not None:
             return pick_res
 
-    # L?n 2: N?u giao di?n l? Ti?ng Anh / Ngo?i ng? khi?n "Blog c? nh?n" ch? hi?n 4 m?c m?c ??nh
+    # L?n 2: N?u giao di?n l? Ti?ng Anh / Ngo?i ng? khi?n "Blog cá nhân" ch? hi?n 4 m?c m?c ??nh
     # (Local service, Shopping & retail...), t? ??ng x?a v? g? l?i b?ng t? kh?a Ti?ng Anh ("Personal blog" / "Blog")
     if hasattr(page, "keyboard"):
-        fallback_queries = ["Personal blog", "Blog"] if req_norm == normalize_ui_text("Blog c? nh?n") else ["Personal blog"]
+        fallback_queries = ["Personal blog", "Blog"] if req_norm == normalize_ui_text("Blog cá nhân") else ["Personal blog"]
         for alt_query in fallback_queries:
             if normalize_ui_text(alt_query) == req_norm:
                 continue
@@ -625,9 +625,9 @@ async def select_page_category(self, page, category_input, requested_category):
     if not has_any_option:
         return False, "CATEGORY_SUGGESTIONS_NOT_AVAILABLE"
 
-    # L?n 3: N?u ch? c? duy nh?t 1 g?i ? ho?c khi ng??i d?ng d?ng m?c ??nh "Blog c? nh?n"
+    # L?n 3: N?u ch? c? duy nh?t 1 g?i ? ho?c khi ng??i d?ng d?ng m?c ??nh "Blog cá nhân"
     # m? Facebook ch? cho ch?n t? danh s?ch m?c ??nh (Local service...), ch?n m?c h?p l? ??u ti?n
-    if req_norm == normalize_ui_text("Blog c? nh?n"):
+    if req_norm == normalize_ui_text("Blog cá nhân"):
         for index in range(await options.count()):
             option = options.nth(index)
             if await option.is_visible():
@@ -740,8 +740,8 @@ async def run_create_page(
             break
         if consecutive_failures >= 2:
             self.log(
-                f"[ANTI-SPAM] [{acc_name}] D?ng t?o Page s?m sau {consecutive_failures} l??t "
-                "th?t b?i li?n ti?p ?? b?o v? t?i kho?n kh?i Checkpoint/H?n ch?."
+                f"[ANTI-SPAM] [{acc_name}] Dừng tạo Page sớm sau {consecutive_failures} lượt "
+                "thất bại liên tiếp để bảo vệ tài khoản khỏi Checkpoint/Hạn chế."
             )
             break
 

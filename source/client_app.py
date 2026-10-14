@@ -106,7 +106,7 @@ def transition_page_context(page_context, state, page_identity=None):
     )
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.4.1"
+CURRENT_VERSION = "2.4.2"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -4379,6 +4379,8 @@ class MainToolApp:
         self._run_generation = getattr(self, "_run_generation", 0) + 1
         self._finished_run_generation = None
         self._cancel_requested_generation = None
+        self.stopped_account_indexes = set()
+        self.worker_account_tasks = {}
         self.worker_root_task = None
         self.worker_tasks = []
         self.worker_loop = None
