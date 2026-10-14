@@ -1,7 +1,7 @@
 {
-    "version":  "2.3.9",
-    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.3.9/client_app.exe",
-    "sha256":  "9745925E9CAB5428EC85D17BF405762A2E918E33EB97638303EB83B9E84D5933",
-    "changelog":  "Cập nhật tool chạy acc bao die 100%",
+    "version":  "2.4.0",
+    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.4.0/client_app.exe",
+    "sha256":  "AE37CD4F0A7A1688ED36365F5A058011FF8D789F6E58195D3040A75216DF6076",
+    "changelog":  "nâng cấp tỉ lệ acc live",
     "mandatory":  false
 }
