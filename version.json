@@ -1,7 +1,7 @@
 {
-    "version":  "2.4.3",
-    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.4.3/client_app.exe",
-    "sha256":  "33A7E6657B123E82D0DFA354BF9792751B127DBFAF7D9C51886F39B828C1630A",
-    "changelog":  "Cập nhật lại tool chạy ổn định và reg page tăng tỉ lệ live",
+    "version":  "2.4.4",
+    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.4.4/client_app.exe",
+    "sha256":  "96D3448AA30532DC17AB54AA907C90B02FC2FE5A7EACB12F6F557600B8E2C990",
+    "changelog":  "Nâng cấp các chức năng của tool, chạy ổn định và mượt mà hơn, vip pro hơn",
     "mandatory":  false
 }
