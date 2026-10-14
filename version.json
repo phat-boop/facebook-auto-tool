@@ -1,7 +1,7 @@
 {
-  "version": "2.3.5",
-  "download_url": "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.3.5/client_app.exe",
-  "sha256": "F362C78D25A73268AF4476AB1BC411A1A9A77827B2CB61EE77A70ECC37F5E9A1",
-  "changelog": "Ổn định chọn danh mục, xác minh Page và chờ xác nhận kết bạn.",
+  "version": "2.3.6",
+  "download_url": "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.3.6/client_app.exe",
+  "sha256": "BC33BAFA4C9A6D4AE80651A138EC2DB73E097257551FF597228543E307E8B4DE",
+  "changelog": "Tinh gọn công cụ, cải thiện lịch sử và bảo mật dữ liệu xuất báo cáo.",
   "mandatory": false
 }
