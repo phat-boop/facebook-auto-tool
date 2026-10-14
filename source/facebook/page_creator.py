@@ -627,17 +627,21 @@ async def run_create_page(
         return []
     await self.guard_facebook_checkpoint(page, idx)
     created_count = 0
+    consecutive_failures = 0
     results = []
     current_page_job = None
 
     def record_result(result):
+        nonlocal consecutive_failures
         owner = (self.account_states.get(idx) or {}).get("account_id", acc_name)
         job = current_page_job["page_job_id"] if current_page_job else ""
         if result.get("status") == "SUCCESS":
             if result.get("owner_account_id") != owner or result.get("page_job_id") != job:
                 raise ValueError("Verified Page owner/job does not match current job.")
+            consecutive_failures = 0
         else:
             result.update(owner_account_id=owner, page_job_id=job)
+            consecutive_failures += 1
         if not self.publish_create_page_result(idx, result):
             return None
         results.append(result)
@@ -666,6 +670,12 @@ async def run_create_page(
         if not self.is_running or created_count >= effective_max_pages:
             break
         if self.skip_paused_module(idx, "CREATE_PAGE"):
+            break
+        if consecutive_failures >= 2:
+            self.log(
+                f"[ANTI-SPAM] [{acc_name}] D?ng t?o Page s?m sau {consecutive_failures} l??t "
+                "th?t b?i li?n ti?p ?? b?o v? t?i kho?n kh?i Checkpoint/H?n ch?."
+            )
             break
 
         page_plan = parse_page_plan(planned_targets[p_idx])
@@ -712,6 +722,11 @@ async def run_create_page(
                     return results
                 set_page_flow_state("OPEN_CREATE_PAGE", page_name)
                 async def navigate_to_creation():
+                    try:
+                        if hasattr(page, "mouse") and callable(getattr(page.mouse, "move", None)):
+                            await page.mouse.move(random.randint(80, 260), random.randint(60, 180), steps=5)
+                    except Exception:
+                        pass
                     response = await page.goto(
                         "https://www.facebook.com/pages/creation/",
                         wait_until="domcontentloaded",

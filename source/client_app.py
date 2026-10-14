@@ -106,7 +106,7 @@ def transition_page_context(page_context, state, page_identity=None):
     )
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.3.8"
+CURRENT_VERSION = "2.3.9"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -806,6 +806,26 @@ ACCOUNT_METADATA_PATTERN = re.compile(
 )
 
 
+
+COUNTRY_DEFAULTS = {
+    "VN": ("vi-VN", "Asia/Ho_Chi_Minh"),
+    "TH": ("th-TH", "Asia/Bangkok"),
+    "ID": ("id-ID", "Asia/Jakarta"),
+    "PH": ("en-PH", "Asia/Manila"),
+    "US": ("en-US", "America/New_York"),
+    "GB": ("en-GB", "Europe/London"),
+    "FR": ("fr-FR", "Europe/Paris"),
+    "DE": ("de-DE", "Europe/Berlin"),
+    "ES": ("es-ES", "Europe/Madrid"),
+    "BR": ("pt-BR", "America/Sao_Paulo"),
+    "JP": ("ja-JP", "Asia/Tokyo"),
+    "KR": ("ko-KR", "Asia/Seoul"),
+    "TW": ("zh-TW", "Asia/Taipei"),
+    "RU": ("ru-RU", "Europe/Moscow"),
+    "TR": ("tr-TR", "Europe/Istanbul"),
+    "IN": ("en-IN", "Asia/Kolkata"),
+}
+
 def normalize_account_locale(value):
     locale = str(value or "AUTO").strip()
     if not locale or locale.casefold() == "auto":
@@ -840,6 +860,59 @@ def split_account_metadata(raw_line):
         elif key == "timezone":
             metadata["timezone"] = normalize_account_timezone(value)
     return "|".join(account_parts), metadata
+
+
+
+def build_uid_fingerprint_script(seed_value):
+    """T?o script ch?ng ph?t hi?n v?n tay tr?nh duy?t (CPU, RAM, WebGL, Canvas, Audio) c? ??nh theo t?ng t?i kho?n."""
+    seed_num = sum((i + 1) * ord(ch) for i, ch in enumerate(str(seed_value or "1")))
+    cores = (4, 6, 8, 12, 16)[seed_num % 5]
+    memory = (4, 8, 8, 16)[seed_num % 4]
+    gpus = [
+        ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+        ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+        ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon(TM) Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+        ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ]
+    vendor, renderer = gpus[seed_num % len(gpus)]
+    canvas_shift = (seed_num % 7) - 3 or 1
+    return f"""
+        Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
+        try {{ delete navigator.__proto__.webdriver; }} catch (e) {{}}
+        Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {cores} }});
+        Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {memory} }});
+        window.chrome = {{
+            app: {{ isInstalled: false }},
+            runtime: {{}},
+            loadTimes: function() {{}},
+            csi: function() {{}}
+        }};
+        Object.defineProperty(navigator, 'plugins', {{
+            get: () => [1, 2, 3, 4, 5]
+        }});
+        try {{
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(param) {{
+                if (param === 37445) return '{vendor}';
+                if (param === 37446) return '{renderer}';
+                return getParameter.apply(this, arguments);
+            }};
+        }} catch (e) {{}}
+        try {{
+            const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+            HTMLCanvasElement.prototype.toDataURL = function() {{
+                const ctx = this.getContext('2d');
+                if (ctx && this.width > 0 && this.height > 0) {{
+                    try {{
+                        const img = ctx.getImageData(0, 0, 1, 1);
+                        img.data[0] = (img.data[0] + ({canvas_shift})) & 255;
+                        ctx.putImageData(img, 0, 0);
+                    }} catch (e) {{}}
+                }}
+                return origToDataURL.apply(this, arguments);
+            }};
+        }} catch (e) {{}}
+    """
 
 
 def browser_locale_options(locale):
@@ -4837,19 +4910,9 @@ class MainToolApp:
                 context_options["timezone_id"] = normalized_timezone
             context = await browser.new_context(**context_options)
             page = await context.new_page()
-            await context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                delete navigator.__proto__.webdriver;
-                window.chrome = {
-                    app: { isInstalled: false },
-                    runtime: {},
-                    loadTimes: function() {},
-                    csi: function() {}
-                };
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5]
-                });
-            """)
+            state_for_fp = self.account_states.get(idx) if hasattr(self, "account_states") else None
+            fp_seed = (state_for_fp or {}).get("uid") or (state_for_fp or {}).get("account_id") or idx
+            await context.add_init_script(build_uid_fingerprint_script(fp_seed))
 
             # Test a real HTTPS route so a dead/auth-failed proxy cannot pass on about:blank.
             health_response = await page.goto(
@@ -5468,6 +5531,49 @@ class MainToolApp:
 
 
     
+    async def sync_live_account_cookies(self, index, context, acc_name):
+        """??ng b? l?i b? Cookie m?i nh?t t? tr?nh duy?t sau phi?n ch?y ?? gi? phi?n s?ng l?u d?i."""
+        try:
+            state = self.account_states.get(index)
+            if not state or state.get("status") != "LIVE" or context is None:
+                return
+            cookies_fn = getattr(context, "cookies", None)
+            if not callable(cookies_fn):
+                return
+            live_cookies = await cookies_fn("https://www.facebook.com/")
+            if not isinstance(live_cookies, list) or not live_cookies:
+                return
+            has_c_user = any(c.get("name") == "c_user" and str(c.get("value") or "").isdigit() for c in live_cookies if isinstance(c, dict))
+            if not has_c_user:
+                return
+            important_order = ("c_user", "xs", "fr", "datr", "sb", "wd", "dpr", "locale", "presence")
+            cookie_map = {
+                str(c.get("name")).strip(): str(c.get("value")).strip()
+                for c in live_cookies
+                if isinstance(c, dict) and c.get("name") and c.get("value") is not None and c.get("name") != "i_user"
+            }
+            ordered_pairs = [f"{k}={cookie_map.pop(k)}" for k in important_order if k in cookie_map]
+            ordered_pairs.extend(f"{k}={v}" for k, v in cookie_map.items())
+            fresh_cookie_str = "; ".join(ordered_pairs) + ";"
+            if normalize_cookie_input(fresh_cookie_str):
+                profiles_dir = output_path("profiles")
+                os.makedirs(profiles_dir, exist_ok=True)
+                uid_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(state.get("uid") or acc_name))
+                profile_file = os.path.join(profiles_dir, f"session_{uid_label}.json")
+                with open(profile_file, "w", encoding="utf-8") as fh:
+                    json.dump(
+                        {
+                            "uid": state.get("uid") or acc_name,
+                            "updated_at": datetime.now().isoformat(timespec="seconds"),
+                            "cookie": protect_setting(fresh_cookie_str),
+                        },
+                        fh,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+        except Exception:
+            pass
+
     async def authenticate_facebook_account(self, index, page, context, cookie_str, username, password):
         """Restore and verify cookies only; never submit password, 2FA or token."""
         self.account_states.set_login_mode(index, "COOKIE")
@@ -5527,6 +5633,12 @@ class MainToolApp:
             self.set_account_state(idx, status="CHECKING", current_action="Khởi tạo tài khoản")
             self.update_tree_row(str(idx), status="ĐANG KIỂM TRA")
             self.log(f"\n[🚀 LUỒNG BẮT ĐẦU] Nick {idx}: {acc_name}")
+            if account_country and str(account_country).strip().upper() in COUNTRY_DEFAULTS:
+                c_loc, c_tz = COUNTRY_DEFAULTS[str(account_country).strip().upper()]
+                if normalize_account_locale(account_locale) == "AUTO":
+                    account_locale = c_loc
+                if not account_timezone:
+                    account_timezone = c_tz
             self.log(
                 f"[*] [{acc_name}] Context: locale={normalize_account_locale(account_locale)}; "
                 f"country={account_country or 'N/A'}; timezone={account_timezone or 'AUTO'}"
