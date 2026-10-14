@@ -1,7 +1,7 @@
 {
-  "version": "2.3.6",
-  "download_url": "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.3.6/client_app.exe",
-  "sha256": "BC33BAFA4C9A6D4AE80651A138EC2DB73E097257551FF597228543E307E8B4DE",
-  "changelog": "Tinh gọn công cụ, cải thiện lịch sử và bảo mật dữ liệu xuất báo cáo.",
-  "mandatory": false
+    "version":  "2.3.7",
+    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.3.7/client_app.exe",
+    "sha256":  "1CD35A9B6DAE745639283A3AB6A8AB64C2349D12F4B833ED253687BCD9C407B6",
+    "changelog":  "cập nhật tool",
+    "mandatory":  false
 }
