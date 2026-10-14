@@ -223,11 +223,34 @@ PAGE_CREATION_EVIDENCE = r"""() => {
     const data = document.querySelector('[data-page-id]');
     const deepLink = document.querySelector('meta[property="al:android:url"]');
     const match = (deepLink?.content || '').match(/^fb:\/\/page\/(\d+)/);
-    const pageId = data?.getAttribute('data-page-id') || match?.[1] || '';
-    const heading = Array.from(document.querySelectorAll('h1'))
-        .find(el => el.getClientRects().length > 0);
-    return {page_id: pageId, page_type: pageId ? 'PAGE' : '', name: heading?.innerText || '',
-            canonical: document.querySelector('link[rel="canonical"]')?.href || ''};
+    const urlIdMatch = (location.search || '').match(/(?:^|[?&])id=(\d{5,})(?:&|$)/)
+        || (location.pathname || '').match(/\/(?:profile\.php\/)?(\d{5,})(?:\/|$)/);
+    const cookieIdMatch = (document.cookie || '').match(/(?:^|;\s*)i_user=(\d{5,})/);
+    const pageId = data?.getAttribute('data-page-id') || match?.[1] || urlIdMatch?.[1] || cookieIdMatch?.[1] || '';
+
+    const visible = el => Boolean(el && el.getClientRects && el.getClientRects().length > 0);
+    const ignoredHeadings = new Set([
+        'manage page', 'qu?n l? trang', 'notifications', 'th?ng b?o',
+        'finish setting up your page', 'ho?n t?t thi?t l?p trang c?a b?n',
+        'create a page', 't?o trang', 'pages', 'trang', 'chats', '?o?n chat'
+    ]);
+
+    const headingTexts = Array.from(document.querySelectorAll('h1, h2, [role="heading"], [role="main"] h1, [role="main"] span, [role="navigation"] span'))
+        .filter(visible)
+        .map(el => (el.innerText || '').trim().replace(/\s+/g, ' '))
+        .filter(t => t.length >= 2 && t.length <= 120 && !ignoredHeadings.has(t.toLowerCase()));
+
+    const canonicalEl = document.querySelector('link[rel="canonical"]');
+    const canonicalHref = canonicalEl?.href || '';
+    const validCanonical = (canonicalHref && !canonicalHref.includes('/pages/creation')) ? canonicalHref : '';
+
+    return {
+        page_id: pageId,
+        page_type: pageId ? 'PAGE' : '',
+        name: headingTexts[0] || '',
+        names: Array.from(new Set(headingTexts)),
+        canonical: validCanonical
+    };
 }"""
 
 
@@ -242,11 +265,8 @@ def verify_page_job_evidence(url, evidence, job, owner_account_id):
         return empty
 
     canonical = evidence.get("canonical")
-
     identity = extract_facebook_page_identity([canonical, url])
-
     page_id = str(evidence.get("page_id") or "")
-
     page_type = str(evidence.get("page_type") or "").upper()
 
     if page_type != "PAGE":
@@ -261,10 +281,19 @@ def verify_page_job_evidence(url, evidence, job, owner_account_id):
     if identity["id"] and identity["id"] != page_id:
         return empty
 
-    observed_name = normalize_ui_text(evidence.get("name"))
     expected_name = normalize_ui_text(job["page_name"])
+    raw_candidates = []
+    if evidence.get("name"):
+        raw_candidates.append(evidence.get("name"))
+    if isinstance(evidence.get("names"), (list, tuple)):
+        raw_candidates.extend(evidence.get("names"))
+    observed_candidates = [normalize_ui_text( item ) for item in raw_candidates if normalize_ui_text(item)]
 
-    if not observed_name or observed_name != expected_name:
+    name_matched = any(
+        obs == expected_name or expected_name in obs
+        for obs in observed_candidates
+    )
+    if not expected_name or not name_matched:
         return empty
 
     if (
@@ -287,6 +316,44 @@ def verify_page_job_evidence(url, evidence, job, owner_account_id):
         "page_job_id": job["page_job_id"],
         "verified": True,
     }
+
+
+
+
+RATE_LIMIT_PATTERNS = (
+    "qu? nhi?u trang", "too many pages",
+    "b?n ?? t?o qu? nhi?u", "you have created too many",
+    "reached the limit", "??t ??n gi?i h?n",
+    "gi?i h?n t?o trang", "page creation limit",
+    "t?m th?i b? ch?n", "temporarily blocked",
+    "th? l?i sau", "try again later",
+    "??? ??", "????????", "????", "????",
+    "?????????????????", "terlalu banyak halaman",
+)
+
+POLICY_REJECT_PATTERNS = (
+    "page policies", "ch?nh s?ch trang", "tu?n th? ch?nh s?ch",
+    "following page policies", "violates our", "vi ph?m",
+    "kh?ng th? t?o trang", "can't create page", "cannot create page",
+)
+
+
+def classify_facebook_page_feedback(alerts, body_text, page_name=""):
+    """Ph?n lo?i ch?nh x?c th?ng b?o ph?n h?i c?a Facebook khi t?o Page."""
+    alert_norm = normalize_ui_text(" ".join(alerts or []))
+    body_norm = normalize_ui_text(body_text or "")
+    combined = f"{alert_norm} {body_norm}".strip()
+
+    if page_name and any(page_creation_notice_matches(txt, page_name) for txt in [*(alerts or []), body_text or ""]):
+        return "CREATED_NOTICE", "Facebook x?c nh?n Page ?? ???c kh?i t?o."
+
+    if is_page_policy_rejected(body_norm) or any(p in alert_norm for p in POLICY_REJECT_PATTERNS):
+        return "POLICY_REJECTED", "Facebook t? ch?i t?o Page theo ch?nh s?ch."
+
+    if any(p in alert_norm for p in RATE_LIMIT_PATTERNS) or any(p in body_norm for p in RATE_LIMIT_PATTERNS[:6]):
+        return "RATE_LIMITED", "B? gi?i h?n t?n su?t t?o Trang g?n ??y (Rate limited)."
+
+    return "PENDING", ""
 
 
 def is_page_policy_rejected(text):
@@ -1190,7 +1257,28 @@ async def run_create_page(
             await asyncio.sleep(1.5)
 
             page_identity = {}
-            for _ in range(3):
+            for verify_attempt in range(3):
+                if "pages/creation" in page.url.lower() and hasattr(context, "cookies"):
+                    try:
+                        cur_cookies = await context.cookies("https://www.facebook.com/")
+                        i_user_val = next(
+                            (str(c.get("value")).strip() for c in cur_cookies
+                             if isinstance(c, dict) and c.get("name") == "i_user" and str(c.get("value") or "").isdigit()),
+                            "",
+                        )
+                        if (
+                            i_user_val
+                            and i_user_val != str(current_page_job.get("owner_uid") or "")
+                            and i_user_val not in current_page_job.get("prior_page_ids", set())
+                        ):
+                            await page.goto(
+                                f"https://www.facebook.com/profile.php?id={i_user_val}",
+                                wait_until="domcontentloaded",
+                                timeout=30000,
+                            )
+                            await asyncio.sleep(2.5)
+                    except Exception:
+                        pass
                 page_identity = await self.verify_created_page(page, idx, current_page_job)
                 self.log(f"[PAGE][VERIFY] [{acc_name}] {page_identity}")
                 if is_verified_page_identity(page_identity):
