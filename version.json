@@ -1,7 +1,7 @@
 {
-    "version":  "2.3.8",
-    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.3.8/client_app.exe",
-    "sha256":  "538E4B5DAFD43E93158F65A6CF598D8B724AB112CEE33F0A3F134346D71A82E9",
-    "changelog":  "bản update++, vá lỗi đăng nhập và tạo page",
+    "version":  "2.3.9",
+    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.3.9/client_app.exe",
+    "sha256":  "9745925E9CAB5428EC85D17BF405762A2E918E33EB97638303EB83B9E84D5933",
+    "changelog":  "Cập nhật tool chạy acc bao die 100%",
     "mandatory":  false
 }
