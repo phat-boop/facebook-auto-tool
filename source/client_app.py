@@ -66,6 +66,7 @@ import unicodedata
 import uuid
 from dataclasses import asdict, dataclass
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from types import MappingProxyType
 from account_history import AccountHistoryStore, COUNTER_FIELDS, history_account_id, redact_history_text, safe_proxy_label
 from result_center import (
@@ -123,7 +124,7 @@ def transition_page_context(page_context, state, page_identity=None):
     )
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.4.3"
+CURRENT_VERSION = "2.4.4"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -533,6 +534,7 @@ class AccountStateStore:
                         "locale": normalize_account_locale(account.get("locale")),
                         "timezone": normalize_account_timezone(account.get("timezone")),
                         "status": "UNKNOWN",
+                        "is_processing": False,
                         "checkpoint_stopped": False,
                         "current_action": "Chưa chạy",
                         "logs": [],
@@ -566,6 +568,7 @@ class AccountStateStore:
                     existing["country"] = str(account.get("country") or "")
                     existing["locale"] = normalize_account_locale(account.get("locale"))
                     existing["timezone"] = normalize_account_timezone(account.get("timezone"))
+                    existing["is_processing"] = False
                     existing.update(account_payload)
                 self._persist(self._states[index], event_type="SEEN")
             for index in list(self._states):
@@ -575,6 +578,17 @@ class AccountStateStore:
     def indexes(self):
         with self._lock:
             return sorted(self._states)
+
+    def set_processing(self, index, active):
+        """Transient worker occupancy, independent of persisted login/task status."""
+        with self._lock:
+            state = self._states.get(int(index))
+            if state is not None:
+                state["is_processing"] = bool(active)
+
+    def processing_count(self):
+        with self._lock:
+            return sum(bool(state.get("is_processing")) for state in self._states.values())
 
     def get(self, index, include_logs=True):
         with self._lock:
@@ -2357,6 +2371,7 @@ class MainToolApp:
         self.worker_loop = None
         self.worker_tasks = []
         self.worker_root_task = None
+        self.create_page_semaphore = None
         self._run_generation = 0
         self._finished_run_generation = None
         self._cancel_requested_generation = None
@@ -3853,7 +3868,7 @@ class MainToolApp:
                 )
             )
         if hasattr(self, "lbl_stat_running"):
-            self.lbl_stat_running.config(text=str(summary["CHECKING"]))
+            self.lbl_stat_running.config(text=str(self.account_states.processing_count()))
             self.lbl_stat_success.config(text=str(summary["LIVE"]))
             self.lbl_stat_failed.config(text=str(summary["DIE"] + summary["ERROR"]))
         if hasattr(self, "lbl_management_summary"):
@@ -4535,6 +4550,7 @@ class MainToolApp:
         self.worker_tasks = []
         self.worker_loop = None
         self.is_running = False
+        self.create_page_semaphore = None
         self.stop_requested = False
         self.run_error = None
         self.run_status = None
@@ -4674,6 +4690,7 @@ class MainToolApp:
         self.worker_tasks = []
         self.worker_root_task = None
         self._finished_run_generation = current
+        self.create_page_semaphore = None
 
         # Khôi phục trạng thái nút Bắt đầu để người dùng có thể chạy lại ngay
         self.btn_start.config(state="normal")
@@ -4731,6 +4748,7 @@ class MainToolApp:
             self.worker_loop = None
             self.worker_tasks = []
             self.worker_root_task = None
+            self.create_page_semaphore = None
             try:
                 self.post_ui(self.finish_run)
             finally:
@@ -5618,18 +5636,32 @@ class MainToolApp:
 
         return False
     async def run_create_page(self, page, context, acc_name, idx, targets=None, max_pages=5, min_page_del=60, max_page_del=120, resolved_proxy=''):
-        return await _pc_run_create_page(
-            self,
-            page,
-            context,
-            acc_name,
-            idx,
-            targets,
-            max_pages,
-            min_page_del,
-            max_page_del,
-            resolved_proxy
-        )
+        async with self.create_page_worker_slot(idx):
+            return await _pc_run_create_page(
+                self,
+                page,
+                context,
+                acc_name,
+                idx,
+                targets,
+                max_pages,
+                min_page_del,
+                max_page_del,
+                resolved_proxy
+            )
+
+    @asynccontextmanager
+    async def create_page_worker_slot(self, index):
+        limiter = getattr(self, "create_page_semaphore", None)
+        if limiter is None:
+            yield
+            return
+        if limiter.locked():
+            self.set_account_state(index, current_action="Chờ lượt tạo Page; các tài khoản khác đang tạo")
+        async with limiter:
+            if self.stop_requested or not self.is_running:
+                raise asyncio.CancelledError()
+            yield
 
     async def run_add_by_group(self, page, acc_name, idx, targets, target_total, min_del, max_del):
         """Kết bạn theo danh sách thành viên nhóm"""
@@ -5794,6 +5826,24 @@ class MainToolApp:
         finally:
             self.account_log_context.reset(context_token)
 
+    @asynccontextmanager
+    async def account_worker_slot(self, index, semaphore):
+        acquired = False
+        try:
+            async with semaphore:
+                acquired = True
+                self.account_states.set_processing(index, True)
+                try:
+                    self.request_ui_refresh(index)
+                    yield
+                finally:
+                    self.account_states.set_processing(index, False)
+                    self.request_ui_refresh(index)
+        except asyncio.CancelledError:
+            if not acquired and self.stop_requested:
+                self.set_account_state(index, current_action="Đã dừng khi chờ trình duyệt")
+            raise
+
     async def process_account(
         self,
         playwright_instance,
@@ -5809,7 +5859,7 @@ class MainToolApp:
         account_locale="AUTO",
         account_timezone="",
     ):
-        async with semaphore:
+        async with self.account_worker_slot(idx, semaphore):
             if not self.is_running or self.stop_requested: return
 
             config = self.run_config
@@ -6086,13 +6136,16 @@ class MainToolApp:
         if not target_indexes:
             target_indexes = set(config.get("checked_indexes", set()))
 
-        threads_count = config.get("threads", 3)
+        threads_count = max(1, min(20, int(config.get("threads", 3))))
         modes = {mode: bool(config.get("modes", {}).get(mode)) for mode in CORE_AUTOMATION_MODES}
+        self.create_page_semaphore = None
         if modes.get("create_page", False):
             max_create_workers = max(1, int(config.get("max_create_page_workers", 3)))
-            threads_count = effective_account_worker_count(
+            page_workers = effective_account_worker_count(
                 threads_count, modes, max_create_workers
             )
+            # Page limits must not serialize browser login, Feed or friend workers.
+            self.create_page_semaphore = asyncio.Semaphore(page_workers)
         if modes.get("create_page", False):
             raw_targets = [
                 line.strip() for line in config.get("targets", "").splitlines()
@@ -6159,10 +6212,24 @@ class MainToolApp:
             })
 
         batches = split_account_batches(account_jobs, batch_size)
+        if target_indexes:
+            for index in self.account_states.indexes():
+                if index not in target_indexes:
+                    self.set_account_state(index, current_action="Không được chọn trong lượt chạy này")
+        if len(account_jobs) < len(raw_acc_lines):
+            self.log(
+                f"[!] Hàng đợi chạy {len(account_jobs)}/{len(raw_acc_lines)} tài khoản đầu vào. "
+                "Kiểm tra Chọn STT chạy và dấu chọn trong bảng quản lý nếu muốn chạy tất cả."
+            )
         self.log(
             f"[BẮT ĐẦU ĐỢT CHẠY] {len(account_jobs)} tài khoản • "
             f"{len(batches)} đợt • {threads_count} luồng đồng thời"
         )
+        if modes.get("create_page", False):
+            self.log(
+                f"[ĐIỀU TIẾT] Tối đa {threads_count} trình duyệt; "
+                f"{page_workers} luồng tạo Page; {batch_size} tài khoản/đợt."
+            )
         unexpected_errors = []
 
         async with async_playwright() as p:
@@ -6177,6 +6244,9 @@ class MainToolApp:
                 for job in batch_jobs:
                     if self.stop_requested:
                         break
+                    self.set_account_state(
+                        job["idx"], current_action=f"Chờ trình duyệt; tối đa {threads_count} luồng"
+                    )
                     tasks.append(asyncio.create_task(self.process_account_scoped(
                         p,
                         job["idx"],

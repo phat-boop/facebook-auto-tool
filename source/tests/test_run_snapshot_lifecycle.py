@@ -1,6 +1,7 @@
 """Phase 3: fresh immutable snapshots and isolated browser ownership."""
 import asyncio
 import ast
+import gc
 import inspect
 import threading
 from unittest import mock
@@ -112,6 +113,8 @@ def test_invalid_input_never_starts_thread_and_restores_buttons(raw):
 
 
 def test_worker_uses_snapshot_without_tk_or_proxy_reselection():
+    # Destroyed GUI fixtures must finalize on the UI thread, not in this worker.
+    gc.collect()
     app = make_start_app()
     config = start_without_real_worker(app)
     app.process_account_scoped = mock.AsyncMock()
