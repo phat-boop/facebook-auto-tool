@@ -12,47 +12,55 @@ class SingleInstanceLock:
     def __init__(self, path):
         self.path = path
         self.handle = None
+        self.lock = threading.RLock()
 
     def acquire(self):
-        if self.handle is not None:
+        with self.lock:
+            if self.handle is not None:
+                return True
+            flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
+            fd = os.open(os.fspath(self.path), flags, 0o666)
+            handle = os.fdopen(fd, "r+b")
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if os.fstat(handle.fileno()).st_size == 0:
+                    handle.write(b"0")
+                    handle.flush()
+                    handle.seek(0)
+            except OSError as exc:
+                handle.close()
+                if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                    return False
+                raise
+            except BaseException:
+                handle.close()
+                raise
+            self.handle = handle
             return True
-        handle = open(self.path, "a+b")
-        try:
-            if os.fstat(handle.fileno()).st_size == 0:
-                handle.write(b"0")
-                handle.flush()
-            handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            handle.close()
-            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
-                return False
-            raise
-        except BaseException:
-            handle.close()
-            raise
-        self.handle = handle
-        return True
 
     def release(self):
-        handle, self.handle = self.handle, None
-        if handle is None:
-            return
-        try:
-            handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            handle.close()
+        with self.lock:
+            handle, self.handle = self.handle, None
+            if handle is None:
+                return
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            finally:
+                handle.close()
 
 
 STRUCTURAL_FAILURES = frozenset({

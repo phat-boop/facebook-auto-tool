@@ -46,9 +46,10 @@ async function validateLicense(request, env) {
     return json({ valid: false, message: "Key hoặc HWID không hợp lệ." }, 400);
   }
 
+  const keyHash = await sha256(key);
   const row = await env.DB.prepare(
     "SELECT expires_at, status, hwid FROM licenses WHERE key_hash = ?1",
-  ).bind(await sha256(key)).first();
+  ).bind(keyHash).first();
   if (!row || row.status !== "active") {
     return json({ valid: false, message: "Key không tồn tại hoặc đã bị khóa." });
   }
@@ -60,9 +61,12 @@ async function validateLicense(request, env) {
   }
 
   if (!row.hwid) {
-    await env.DB.prepare(
-      "UPDATE licenses SET hwid = ?1, activated_at = ?2 WHERE key_hash = ?3",
-    ).bind(hwid, new Date().toISOString(), await sha256(key)).run();
+    const updateResult = await env.DB.prepare(
+      "UPDATE licenses SET hwid = ?1, activated_at = ?2 WHERE key_hash = ?3 AND status = 'active' AND (hwid IS NULL OR hwid = '' OR hwid = ?1)",
+    ).bind(hwid, new Date().toISOString(), keyHash).run();
+    if (!updateResult.meta?.changes) {
+      return json({ valid: false, message: "Key đã được kích hoạt trên máy khác." });
+    }
   }
   return json({ valid: true, expires: row.expires_at.slice(0, 10) });
 }
@@ -108,35 +112,61 @@ async function handleTelegram(request, env) {
     const [command, ...args] = message.text.trim().split(/\s+/);
     const chatId = message.chat.id;
     if (command === "/create") {
-    const days = parseDuration(args[0]);
-    if (!days) return telegramSend(env, chatId, "Dùng: /create <số_ngày>, ví dụ /create 30").then(() => json({ ok: true }));
-    let key;
-    let hash;
-    do {
-      key = randomKey();
-      hash = await sha256(key);
-    } while (await env.DB.prepare("SELECT key_hash FROM licenses WHERE key_hash = ?1").bind(hash).first());
-    const expires = new Date(Date.now() + days * 86400000).toISOString();
-    await env.DB.prepare(
-      "INSERT INTO licenses (key_hash, key_hint, expires_at, status, created_at) VALUES (?1, ?2, ?3, 'active', ?4)",
-    ).bind(hash, key.slice(-4), expires, new Date().toISOString()).run();
-    await telegramSend(env, chatId, `Key mới (${days} ngày):\n${key}\nHạn: ${expires.slice(0, 10)}`);
+      const days = parseDuration(args[0]);
+      if (!days) {
+        await telegramSend(env, chatId, "Dùng: /create <số_ngày>, ví dụ /create 30");
+        return json({ ok: true });
+      }
+      let key;
+      let hash;
+      do {
+        key = randomKey();
+        hash = await sha256(key);
+      } while (await env.DB.prepare("SELECT key_hash FROM licenses WHERE key_hash = ?1").bind(hash).first());
+      const expires = new Date(Date.now() + days * 86400000).toISOString();
+      await env.DB.prepare(
+        "INSERT INTO licenses (key_hash, key_hint, expires_at, status, created_at) VALUES (?1, ?2, ?3, 'active', ?4)",
+      ).bind(hash, key.slice(-4), expires, new Date().toISOString()).run();
+      await telegramSend(env, chatId, `Key mới (${days} ngày):\n${key}\nHạn: ${expires.slice(0, 10)}`);
     } else if (command === "/activate") {
-    const key = normalizeKey(args[0]);
-    const hwid = String(args[1] || "").trim().toUpperCase();
-    if (!isLicenseKey(key) || !hwid) await telegramSend(env, chatId, "Dùng: /activate KEY HWID");
-    else {
-      const result = await env.DB.prepare("UPDATE licenses SET hwid = ?, activated_at = ? WHERE key_hash = ? AND status = 'active'").bind(hwid, new Date().toISOString(), await sha256(key)).run();
-      await telegramSend(env, chatId, result.meta.changes ? "Đã gắn HWID." : "Không tìm thấy key active.");
-    }
+      const key = normalizeKey(args[0]);
+      const hwid = String(args[1] || "").trim().toUpperCase();
+      if (!isLicenseKey(key) || !hwid || hwid.length > 128) {
+        await telegramSend(env, chatId, "Dùng: /activate KEY HWID");
+      } else {
+        const keyHash = await sha256(key);
+        const existing = await env.DB.prepare(
+          "SELECT hwid, expires_at, status FROM licenses WHERE key_hash = ?1",
+        ).bind(keyHash).first();
+        if (!existing || existing.status !== "active") {
+          await telegramSend(env, chatId, "Không tìm thấy key active.");
+        } else if (Date.parse(existing.expires_at) <= Date.now()) {
+          await telegramSend(env, chatId, "Key đã hết hạn, không thể gắn HWID.");
+        } else {
+          const previousHwid = existing.hwid;
+          const result = await env.DB.prepare(
+            "UPDATE licenses SET hwid = ?1, activated_at = ?2 WHERE key_hash = ?3 AND status = 'active'",
+          ).bind(hwid, new Date().toISOString(), keyHash).run();
+          const note = previousHwid && previousHwid !== hwid ? ` (đổi từ ${previousHwid})` : "";
+          await telegramSend(env, chatId, result.meta?.changes ? `Đã gắn HWID${note}.` : "Không tìm thấy key active.");
+        }
+      }
     } else if (command === "/revoke") {
-    const key = normalizeKey(args[0]);
-    const result = await env.DB.prepare("UPDATE licenses SET status = 'revoked' WHERE key_hash = ?").bind(await sha256(key)).run();
-    await telegramSend(env, chatId, result.meta.changes ? "Đã khóa key." : "Không tìm thấy key.");
+      const key = normalizeKey(args[0]);
+      if (!isLicenseKey(key)) {
+        await telegramSend(env, chatId, "Dùng: /revoke KEY");
+      } else {
+        const result = await env.DB.prepare("UPDATE licenses SET status = 'revoked' WHERE key_hash = ?").bind(await sha256(key)).run();
+        await telegramSend(env, chatId, result.meta?.changes ? "Đã khóa key." : "Không tìm thấy key.");
+      }
     } else if (command === "/check") {
-    const key = normalizeKey(args[0]);
-    const row = await env.DB.prepare("SELECT key_hint, hwid, expires_at, status FROM licenses WHERE key_hash = ?").bind(await sha256(key)).first();
-    await telegramSend(env, chatId, row ? `Key ...${row.key_hint}\nHWID: ${row.hwid || 'chưa kích hoạt'}\nHạn: ${row.expires_at.slice(0, 10)}\nTrạng thái: ${row.status}` : "Không tìm thấy key.");
+      const key = normalizeKey(args[0]);
+      if (!isLicenseKey(key)) {
+        await telegramSend(env, chatId, "Dùng: /check KEY");
+      } else {
+        const row = await env.DB.prepare("SELECT key_hint, hwid, expires_at, status FROM licenses WHERE key_hash = ?").bind(await sha256(key)).first();
+        await telegramSend(env, chatId, row ? `Key ...${row.key_hint}\nHWID: ${row.hwid || 'chưa kích hoạt'}\nHạn: ${row.expires_at.slice(0, 10)}\nTrạng thái: ${row.status}` : "Không tìm thấy key.");
+      }
     } else {
       await telegramSend(env, chatId, "/create <ngày>\n/activate <key> <hwid>\n/revoke <key>\n/check <key>");
     }

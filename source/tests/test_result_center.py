@@ -203,10 +203,12 @@ def test_result_export_schema_status_is_d_not_password_column(tmp_path):
         sheet = workbook["CHECKPOINT"]
         assert tuple(cell.value for cell in sheet[1]) == results.REPORT_HEADERS
         assert sheet["A2"].value == 1 and sheet["B2"].value == "11111"
-        assert sheet["C2"].value == "=secret" and sheet["C2"].data_type == "s"
+        assert sheet["C2"].value == "********" and sheet["C2"].data_type == "s"
         assert sheet["D2"].value == "CHECKPOINT"
         assert sheet["F2"].value == 3 and sheet["G2"].value == "checkpoint"
-        assert sheet["I2"].value == "=raw" and sheet["I2"].data_type == "s"
+        assert sheet["I2"].value == "11111|[REDACTED]" and sheet["I2"].data_type == "s"
+        for secret in ("=secret", "=raw", "password-A", "twofa-A", "session-A==", "token-A"):
+            assert secret not in str(tuple(cell.value for cell in sheet[2]))
         detail = workbook["RESULTS"]
         assert tuple(cell.value for cell in detail[1]) == results.RESULT_HEADERS
         assert tuple(cell.value if cell.value is not None else "" for cell in detail[2]) == rows[0]

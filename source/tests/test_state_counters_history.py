@@ -300,3 +300,14 @@ def test_finalizing_cancelled_task_does_not_count_a_failed_attempt():
     states.finalize_active_tasks(1, "SKIPPED", "stop requested")
     assert states.get(1)["page_failed_count"] == 0
     assert states.get(1)["tasks"]["CREATE_PAGE"]["status"] == "SKIPPED"
+def test_short_non_secret_cookie_attributes_do_not_corrupt_action_numbers():
+    state = {
+        "uid": "11111",
+        "password": "MySecretPassword",
+        "cookie": "c_user=11111; dpr=1; wd=1; xs=secret_session_token;",
+    }
+    text = "Create Page [SUCCESS]: 1/5 ( MySecretPassword / xs=secret_session_token )"
+    redacted = module.redact_history_text(text, state)
+    assert "1/5" in redacted
+    assert "MySecretPassword" not in redacted
+    assert "secret_session_token" not in redacted

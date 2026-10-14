@@ -10,6 +10,8 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 import time
 import uuid
 from long_run import DuplicatePageResult
+
+
 def build_create_page_result(
     status,
     account_id,
@@ -44,6 +46,7 @@ def build_create_page_result(
         "structural_failure": structural_failure,
     }
 
+
 def is_transient_create_page_error(exc):
     text = f"{type(exc).__name__}: {exc}".casefold()
     return isinstance(exc, (TimeoutError, OSError, ConnectionError)) or any(
@@ -52,6 +55,7 @@ def is_transient_create_page_error(exc):
             "net::err_", "temporarily unavailable",
         )
     )
+
 
 async def retry_create_page_operation(operation, max_attempts=3, base_delay=1.0):
     """Retry transient pre-submit operations with bounded exponential backoff."""
@@ -69,6 +73,7 @@ async def retry_create_page_operation(operation, max_attempts=3, base_delay=1.0)
                 raise
             await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
     raise last_error
+
 
 HO_VIET = ["Nguyễn", "Trần", "Lê", "Phạm", "Hoàng", "Huỳnh", "Phan", "Vũ", "Võ", "Đặng", "Bùi", "Đỗ", "Hồ", "Ngô", "Dương", "Lý"]
 DEM_VIET = ["Văn", "Thị", "Đức", "Ngọc", "Thanh", "Minh", "Hữu", "Gia", "Bảo", "Anh", "Quang", "Phương", "Khánh", "Hải", "Tuấn", "Hoài"]
@@ -90,6 +95,7 @@ def generate_random_person_name():
     hau_to = random.choice(HAU_TO_PAGE)
     return f"{ho} {dem} {ten}{hau_to}".strip()
 
+
 def parse_page_plan(value: str):
     """Parse `page name|category`; old one-column page names remain valid."""
     parts = [part.strip() for part in str(value or "").split("|", 1)]
@@ -97,6 +103,7 @@ def parse_page_plan(value: str):
         "name": parts[0] if parts and parts[0] else generate_random_person_name(),
         "category": parts[1] if len(parts) > 1 and parts[1] else "Blog cá nhân",
     }
+
 
 def build_create_page_plans(targets, max_pages, name_generator=None):
     """Build the requested Page plans while preserving legacy auto-name behavior."""
@@ -115,6 +122,7 @@ def build_create_page_plans(targets, max_pages, name_generator=None):
 
     return plans
 
+
 def validate_create_page_targets(targets, max_pages):
     """Validate explicit Page plans before any browser is launched."""
     requested = max(1, int(max_pages))
@@ -130,6 +138,7 @@ def validate_create_page_targets(targets, max_pages):
         if not category:
             return False, f"Page #{position} thiếu category."
     return True, ""
+
 
 def build_page_context(
     account_id,
@@ -218,7 +227,7 @@ PAGE_CREATION_EVIDENCE = r"""() => {
     const heading = Array.from(document.querySelectorAll('h1'))
         .find(el => el.getClientRects().length > 0);
     return {page_id: pageId, page_type: pageId ? 'PAGE' : '', name: heading?.innerText || '',
-        canonical: document.querySelector('link[rel="canonical"]')?.href || ''};
+            canonical: document.querySelector('link[rel="canonical"]')?.href || ''};
 }"""
 
 
@@ -258,8 +267,6 @@ def verify_page_job_evidence(url, evidence, job, owner_account_id):
     if not observed_name or observed_name != expected_name:
         return empty
 
-    canonical = evidence.get("canonical")
-
     if (
         canonical
         and facebook_page_reference(canonical)
@@ -280,6 +287,7 @@ def verify_page_job_evidence(url, evidence, job, owner_account_id):
         "page_job_id": job["page_job_id"],
         "verified": True,
     }
+
 
 def is_page_policy_rejected(text):
     normalized = " ".join(str(text or "").casefold().split())
@@ -400,7 +408,7 @@ PAGE_BLANK_MARGIN_POINT = r"""() => {
         '[role="banner"],[role="navigation"],[role="dialog"],[role="menu"],' +
         '[role="listbox"],[role="alert"],[role="status"]';
     const points = [[width - 20, height / 2], [width - 20, height * 0.75],
-        [width * 0.75, height - 20], [width / 2, height - 20], [20, height * 0.75]];
+                    [width * 0.75, height - 20], [width / 2, height - 20], [20, height * 0.75]];
     for (const [x, y] of points) {
         const target = document.elementFromPoint(x, y);
         if (!target || target.closest(excluded) || getComputedStyle(target).cursor === 'pointer') continue;
@@ -495,10 +503,10 @@ async def select_page_category(self, page, category_input, requested_category):
                     while (Date.now() < deadline && input.isConnected) {
                         const root = input.parentElement.parentElement;
                         const selected = Array.from(root.querySelectorAll('[aria-selected="true"], [data-selected-category], span'))
-                        .some(el => !el.closest('[role="listbox"]') && el.getClientRects().length > 0
-                            && normalize(el.textContent) === normalize(matched_text)
-                            && (el.matches('[aria-selected="true"],[data-selected-category]')
-                                || el.parentElement.querySelector('button,[role="button"]')));
+                            .some(el => !el.closest('[role="listbox"]') && el.getClientRects().length > 0
+                                && normalize(el.textContent) === normalize(matched_text)
+                                && (el.matches('[aria-selected="true"],[data-selected-category]')
+                                    || el.parentElement.querySelector('button,[role="button"]')));
                         if (selected) return true;
                         await new Promise(resolve => setTimeout(resolve, 100));
                     }
@@ -795,7 +803,6 @@ async def run_create_page(
             await self.human_type(page, name_input, page_name)
             await asyncio.sleep(1)
             # Tự động bắt lỗi tên không hợp lệ từ Facebook và tự sửa
-            await asyncio.sleep(1.0)
             err_notice = page.locator('div[role="alert"], div:has-text("không hợp lệ"), div:has-text("đề xuất")')
             if await err_notice.count() > 0 and await err_notice.first.is_visible():
                 self.log(f"[!] [{acc_name}] Tên '{page_name}' bị Facebook từ chối. Đang tự động đổi sang tên thuần...")
@@ -806,7 +813,6 @@ async def run_create_page(
                 await name_input.fill(clean_name)
                 await asyncio.sleep(1)
 
-            # ======================================================
             # ======================================================
             # BƯỚC 4: ĐIỀN HẠNG MỤC (CHỐNG NHẦM THANH TÌM KIẾM FACEBOOK)
             # ======================================================
@@ -822,7 +828,6 @@ async def run_create_page(
                 'input[aria-label*="catégorie" i], '
                 'input[aria-label*="categoría" i], '
                 'input[aria-label*="categoria" i], '
-                'div[role="main"] input[role="combobox"], '
                 'input[role="combobox"]:not([aria-label*="kiếm" i]):not([aria-label*="search" i])'
             )
 
@@ -853,7 +858,8 @@ async def run_create_page(
                 category_selected, category_reason = await self.select_page_category(
                     page,
                     cat_input,
-                    category_name,)
+                    category_name,
+                )
 
                 if not category_selected:
                     record_result(
@@ -990,7 +996,13 @@ async def run_create_page(
                     policy_rejected = True
                     break
 
-                if any(err in f"{combined_alerts} {body_text}" for err in ["quá nhiều trang", "too many pages", "limit", "giới hạn"]):
+                rate_limit_markers = (
+                    "quá nhiều trang", "too many pages",
+                    "bạn đã tạo quá nhiều", "you have created too many",
+                    "reached the limit", "đạt đến giới hạn",
+                    "giới hạn tạo trang", "page creation limit",
+                )
+                if any(err in f"{combined_alerts} {body_text}" for err in rate_limit_markers):
                     rate_limited = True
                     break
 

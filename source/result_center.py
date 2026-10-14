@@ -26,6 +26,25 @@ REPORT_HEADERS = (
 SUMMARY_KEYS = ("TOTAL ACCOUNTS", "RUNNING", "LIVE", "DIE", "CHECKPOINT", "ERROR", "PAGE SUCCESS", "PAGE FAILED")
 
 
+def _mask_secret(value):
+    return "********" if str(value or "").strip() else ""
+
+
+def _safe_report_raw_line(record_or_state):
+    raw_value = str(record_or_state.get("raw_line") or "")
+    if not raw_value:
+        return ""
+    uid = str(record_or_state.get("uid") or record_or_state.get("account_id") or "")
+    has_secret = any(
+        str(record_or_state.get(key) or "").strip()
+        for key in ("password", "pwd", "2fa", "twofa", "cookie", "token")
+    )
+    redacted = redact_history_text(raw_value, record_or_state)
+    if redacted != raw_value or has_secret or "|" in raw_value:
+        return f"{uid}|[REDACTED]" if uid else "[REDACTED]"
+    return redacted
+
+
 def result_values(state):
     tasks = state.get("tasks", {})
     page_task = tasks.get("CREATE_PAGE", {})
@@ -82,12 +101,16 @@ def result_summary(accounts):
     return summary
 
 
-def report_record(state, target_count=0):
+def report_record(state, target_count=0, include_sensitive=False):
     values = result_values(state)
+    raw_password = state.get("password") or state.get("pwd", "")
+    raw_line = state.get("raw_line", "")
     return {
-        "stt": values[0], "uid": values[1], "password": state.get("password", ""),
+        "stt": values[0], "uid": values[1],
+        "password": raw_password if include_sensitive else _mask_secret(raw_password),
         "status": values[2], "created_count": values[4], "target_count": target_count,
-        "reason": values[12] or values[8], "time": values[13], "raw_line": state.get("raw_line", ""),
+        "reason": values[12] or values[8], "time": values[13],
+        "raw_line": raw_line if include_sensitive else _safe_report_raw_line(state),
     }
 
 
@@ -98,7 +121,7 @@ def write_result_csv(file_path, rows):
         writer.writerows(rows)
 
 
-def write_result_workbook(file_path, categorized_records, result_rows=None):
+def write_result_workbook(file_path, categorized_records, result_rows=None, include_sensitive=False):
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font, PatternFill
@@ -114,12 +137,20 @@ def write_result_workbook(file_path, categorized_records, result_rows=None):
             sheet = workbook.create_sheet(names[key])
             sheet.append(REPORT_HEADERS)
             for record in records:
+                raw_password = record.get("password") or record.get("pwd", "")
+                password_cell = raw_password if include_sensitive else _mask_secret(raw_password)
+                raw_line_cell = record.get("raw_line", "") if include_sensitive else _safe_report_raw_line(record)
+                reason_text = record.get("reason") or (
+                    "Đã tạo đủ Page" if key == "completed" else "Tài khoản không còn đăng nhập hợp lệ"
+                )
+                if not include_sensitive:
+                    reason_text = redact_history_text(reason_text, record)
                 sheet.append((
                     record.get("stt", ""), record.get("uid") or record.get("account_id", ""),
-                    record.get("password") or record.get("pwd", ""), record.get("status") or names[key],
+                    password_cell, record.get("status") or names[key],
                     int(record.get("created_count") or 0), int(record.get("target_count") or 0),
-                    record.get("reason") or ("Đã tạo đủ Page" if key == "completed" else "Tài khoản không còn đăng nhập hợp lệ"),
-                    record.get("time", ""), record.get("raw_line", ""),
+                    reason_text,
+                    record.get("time", ""), raw_line_cell,
                 ))
         if result_rows is not None:
             sheet = workbook.create_sheet("RESULTS")

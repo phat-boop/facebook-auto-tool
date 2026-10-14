@@ -17,6 +17,7 @@ SECRET_FIELDS = {
     "canonical_line", "fields", "import_fields", "unknown_fields", "account_record",
 }
 
+
 def history_account_id(state):
     value = str(state.get("uid") or state.get("account_id") or "")
     if any(char in value for char in "|=;") or value.startswith("EAA"):
@@ -46,8 +47,10 @@ def redact_history_text(text, state):
     secrets = [str(state.get(key) or "") for key in ("raw_line", "source_line", "canonical_line", "password", "pwd", "twofa", "2fa", "cookie", "token")]
     for cookie in str(state.get("cookie") or "").split(";"):
         name, separator, cookie_value = cookie.strip().partition("=")
-        if separator and name != "c_user":
-            secrets.append(cookie_value)
+        clean_name = name.strip().casefold()
+        clean_val = cookie_value.strip()
+        if separator and clean_name != "c_user" and (len(clean_val) >= 4 or clean_name in {"xs", "sb", "datr", "fr", "sessionid", "access_token", "token"}):
+            secrets.append(clean_val)
     proxy = str(state.get("proxy") or "")
     if proxy:
         value = value.replace(proxy, safe_proxy_label(proxy))
@@ -74,7 +77,9 @@ class AccountHistoryStore:
         self.path = str(path)
         self.lock = threading.RLock()
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        with self.lock, sqlite3.connect(self.path) as db:
+        with self.lock, self._connect() as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=NORMAL")
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS accounts (
                     account_id TEXT PRIMARY KEY, last_status TEXT, last_task_result TEXT,
@@ -102,6 +107,11 @@ class AccountHistoryStore:
             if "payload" not in {row[1] for row in db.execute("PRAGMA table_info(events)")}:
                 db.execute("ALTER TABLE events ADD COLUMN payload TEXT")
 
+    def _connect(self):
+        db = sqlite3.connect(self.path, timeout=30.0)
+        db.execute("PRAGMA busy_timeout=30000")
+        return db
+
     def save(self, state, module="ACCOUNT", event_type="STATE", message="", task_event=None):
         key = history_account_id(state)
         if not key:
@@ -109,6 +119,7 @@ class AccountHistoryStore:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         status = state.get("status", "UNKNOWN")
         action = redact_history_text(state.get("current_action"), state)
+
         def sanitize(value):
             if isinstance(value, dict):
                 return {key: sanitize(item) for key, item in value.items()
@@ -132,7 +143,7 @@ class AccountHistoryStore:
         identity_event = task_event if task_event is not None else state.get("tasks", {}).get(module, {})
         # Events keep one outcome each; avoid copying all earlier outcomes into every event.
         payload = json.dumps({**event_task, "outcomes": event_task.get("outcomes", [])[-1:]}) if event_type == "TASK" else None
-        with self.lock, sqlite3.connect(self.path) as db:
+        with self.lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if module == "CREATE_PAGE" and event_type == "TASK" and identity_event.get("status") == "SUCCESS":
                 # Identity checks use verified business fields, not redacted display text.
@@ -152,21 +163,21 @@ class AccountHistoryStore:
                     db.executemany("INSERT OR IGNORE INTO page_identities VALUES (?, ?, ?)",
                                    ((identity, key, page["page_job_id"]) for identity in keys))
             db.execute("""INSERT INTO accounts (
-                    account_id,last_status,last_task_result,last_action,first_seen_at,last_seen_at,
-                    last_run_at,last_error,last_checkpoint_at,page_summary,friend_summary,proxy_label,tasks,
-                    login_mode,last_update,page_success_count,page_failed_count,friend_success_count,friend_failed_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(account_id) DO UPDATE SET
-                    last_status=excluded.last_status, last_task_result=excluded.last_task_result,
-                    last_action=excluded.last_action, last_seen_at=excluded.last_seen_at,
-                    last_run_at=COALESCE(excluded.last_run_at, accounts.last_run_at),
-                    last_error=COALESCE(excluded.last_error, accounts.last_error),
-                    last_checkpoint_at=COALESCE(excluded.last_checkpoint_at, accounts.last_checkpoint_at),
-                    page_summary=excluded.page_summary, friend_summary=excluded.friend_summary,
-                    proxy_label=excluded.proxy_label, tasks=excluded.tasks,
-                    login_mode=COALESCE(excluded.login_mode, accounts.login_mode), last_update=excluded.last_update,
-                    page_success_count=excluded.page_success_count, page_failed_count=excluded.page_failed_count,
-                    friend_success_count=excluded.friend_success_count, friend_failed_count=excluded.friend_failed_count""", (
+                account_id,last_status,last_task_result,last_action,first_seen_at,last_seen_at,
+                last_run_at,last_error,last_checkpoint_at,page_summary,friend_summary,proxy_label,tasks,
+                login_mode,last_update,page_success_count,page_failed_count,friend_success_count,friend_failed_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_id) DO UPDATE SET
+                last_status=excluded.last_status, last_task_result=excluded.last_task_result,
+                last_action=excluded.last_action, last_seen_at=excluded.last_seen_at,
+                last_run_at=COALESCE(excluded.last_run_at, accounts.last_run_at),
+                last_error=COALESCE(excluded.last_error, accounts.last_error),
+                last_checkpoint_at=COALESCE(excluded.last_checkpoint_at, accounts.last_checkpoint_at),
+                page_summary=excluded.page_summary, friend_summary=excluded.friend_summary,
+                proxy_label=excluded.proxy_label, tasks=excluded.tasks,
+                login_mode=COALESCE(excluded.login_mode, accounts.login_mode), last_update=excluded.last_update,
+                page_success_count=excluded.page_success_count, page_failed_count=excluded.page_failed_count,
+                friend_success_count=excluded.friend_success_count, friend_failed_count=excluded.friend_failed_count""", (
                 key, status, task_result, action, now, now,
                 now if status == "CHECKING" else None,
                 last_error if state.get("last_error") or status in {"DIE", "ERROR", "CHECKPOINT"} or task_result in {"FAILED", "ERROR"} else None,
@@ -182,11 +193,11 @@ class AccountHistoryStore:
                 db.execute("INSERT INTO events(account_id,timestamp,module,event_type,result,message,payload) VALUES (?, ?, ?, ?, ?, ?, ?)", (key, now, *event))
 
     def page_identity_bootstrapped(self):
-        with self.lock, sqlite3.connect(self.path) as db:
+        with self.lock, self._connect() as db:
             return db.execute("SELECT 1 FROM history_metadata WHERE name='legacy_page_identities'").fetchone() is not None
 
     def bootstrap_page_identities(self, identities):
-        with self.lock, sqlite3.connect(self.path) as db:
+        with self.lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT 1 FROM history_metadata WHERE name='legacy_page_identities'").fetchone():
                 return
@@ -199,7 +210,7 @@ class AccountHistoryStore:
             db.execute("INSERT INTO history_metadata VALUES ('legacy_page_identities', '1')")
 
     def load(self, state, include_logs=True):
-        with self.lock, sqlite3.connect(self.path) as db:
+        with self.lock, self._connect() as db:
             db.row_factory = sqlite3.Row
             row = db.execute("SELECT * FROM accounts WHERE account_id=?", (history_account_id(state),)).fetchone()
             if row is None:
