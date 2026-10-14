@@ -480,40 +480,99 @@ async def click_page_blank_margin(self, page, acc_name, index):
 
 async def select_page_category(self, page, category_input, requested_category):
     options = page.locator('div[role="listbox"] [role="option"], ul[role="listbox"] li, [role="option"]')
-    try:
-        await options.first.wait_for(state="visible", timeout=5000)
-    except (TimeoutError, PlaywrightTimeoutError):
-        return False, "CATEGORY_SUGGESTIONS_NOT_AVAILABLE"
 
-    # Mở rộng danh sách từ khóa tương đương cho đa ngôn ngữ
     req_norm = normalize_ui_text(requested_category)
     aliases = {req_norm}
-    if req_norm == normalize_ui_text("Blog cá nhân"):
-        aliases.update(normalize_ui_text(x) for x in ["Personal blog", "Blog personnel", "Blog personal", "Blog pessoal", "Persönlicher Blog", "บล็อกส่วนตัว", "Blog Pribadi", "ブログ(個人)", "개인 블로그"])
+    blog_aliases = [
+        "Blog c? nh?n", "Personal blog", "Blog personnel", "Blog personal",
+        "Blog pessoal", "Pers?nlicher Blog", "????????????", "Blog Pribadi",
+        "???(??)", "?? ???", "????", "?????",
+        "?????? ????", "????? ?????", "Ki?isel blog", "Blog",
+    ]
+    if req_norm in {normalize_ui_text(x) for x in blog_aliases}:
+        aliases.update(normalize_ui_text(x) for x in blog_aliases)
 
-    for index in range(await options.count()):
-        option = options.nth(index)
-        if await option.is_visible():
-            opt_text = await option.inner_text()
-            if normalize_ui_text(opt_text) in aliases:
-                await option.click()
-                selected = await category_input.evaluate(r"""async (input, matched_text) => {
-                    const normalize = text => (text || '').normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase();
-                    const deadline = Date.now() + 3000;
-                    while (Date.now() < deadline && input.isConnected) {
-                        const root = input.parentElement.parentElement;
-                        const selected = Array.from(root.querySelectorAll('[aria-selected="true"], [data-selected-category], span'))
-                            .some(el => !el.closest('[role="listbox"]') && el.getClientRects().length > 0
-                                && normalize(el.textContent) === normalize(matched_text)
-                                && (el.matches('[aria-selected="true"],[data-selected-category]')
-                                    || el.parentElement.querySelector('button,[role="button"]')));
-                        if (selected) return true;
-                        await new Promise(resolve => setTimeout(resolve, 100));
-                    }
-                    return false;
-                }""", opt_text)
-                return bool(selected), "" if selected else "CATEGORY_SELECTION_NOT_VERIFIED"
+    async def verify_chip(opt_text):
+        return await category_input.evaluate(r"""async (input, matched_text) => {
+            const normalize = text => (text || '').normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+            const deadline = Date.now() + 3000;
+            while (Date.now() < deadline && input.isConnected) {
+                const root = input.parentElement.parentElement;
+                const selected = Array.from(root.querySelectorAll('[aria-selected="true"], [data-selected-category], span'))
+                    .some(el => !el.closest('[role="listbox"]') && el.getClientRects().length > 0
+                        && normalize(el.textContent) === normalize(matched_text)
+                        && (el.matches('[aria-selected="true"],[data-selected-category]')
+                            || el.parentElement.querySelector('button,[role="button"]')));
+                if (selected) return true;
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+            return false;
+        }""", opt_text)
+
+    async def try_pick_matching_option():
+        for index in range(await options.count()):
+            option = options.nth(index)
+            if await option.is_visible():
+                opt_text = (await option.inner_text()).strip()
+                if normalize_ui_text(opt_text) in aliases:
+                    await option.click()
+                    selected = await verify_chip(opt_text)
+                    return bool(selected), "" if selected else "CATEGORY_SELECTION_NOT_VERIFIED"
+        return None
+
+    # L?n 1: Ch? listbox t? t? kh?a ?? g? ban ??u (VD: "Blog c? nh?n")
+    has_any_option = False
+    try:
+        await options.first.wait_for(state="visible", timeout=5000)
+        has_any_option = True
+    except (TimeoutError, PlaywrightTimeoutError):
+        has_any_option = False
+
+    if has_any_option:
+        pick_res = await try_pick_matching_option()
+        if pick_res is not None:
+            return pick_res
+
+    # L?n 2: N?u giao di?n l? Ti?ng Anh / Ngo?i ng? khi?n "Blog c? nh?n" ch? hi?n 4 m?c m?c ??nh
+    # (Local service, Shopping & retail...), t? ??ng x?a v? g? l?i b?ng t? kh?a Ti?ng Anh ("Personal blog" / "Blog")
+    if hasattr(page, "keyboard"):
+        fallback_queries = ["Personal blog", "Blog"] if req_norm == normalize_ui_text("Blog c? nh?n") else ["Personal blog"]
+        for alt_query in fallback_queries:
+            if normalize_ui_text(alt_query) == req_norm:
+                continue
+            try:
+                await category_input.click()
+                await category_input.fill("")
+                await asyncio.sleep(0.3)
+                await page.keyboard.type(alt_query, delay=65)
+                await asyncio.sleep(1.8)
+                await options.first.wait_for(state="visible", timeout=4000)
+                has_any_option = True
+                aliases.add(normalize_ui_text(alt_query))
+                pick_res = await try_pick_matching_option()
+                if pick_res is not None:
+                    return pick_res
+            except Exception:
+                continue
+
+    if not has_any_option:
+        return False, "CATEGORY_SUGGESTIONS_NOT_AVAILABLE"
+
+    # L?n 3: N?u ch? c? duy nh?t 1 g?i ? ho?c khi ng??i d?ng d?ng m?c ??nh "Blog c? nh?n"
+    # m? Facebook ch? cho ch?n t? danh s?ch m?c ??nh (Local service...), ch?n m?c h?p l? ??u ti?n
+    if req_norm == normalize_ui_text("Blog c? nh?n"):
+        for index in range(await options.count()):
+            option = options.nth(index)
+            if await option.is_visible():
+                opt_text = (await option.inner_text()).strip()
+                if opt_text:
+                    await option.click()
+                    selected = await verify_chip(opt_text)
+                    return bool(selected), "" if selected else "CATEGORY_SELECTION_NOT_VERIFIED"
+
     return False, "CATEGORY_NOT_FOUND"
+
+
 
 
 CREATE_PAGE_BUTTON_PATTERN = re.compile(
