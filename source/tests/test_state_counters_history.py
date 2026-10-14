@@ -84,7 +84,7 @@ def test_restart_keeps_login_mode_error_counters_and_task_results(tmp_path):
     states.update(1, status="LIVE", current_action="verified")
     page_result(states, 1, "SUCCESS", "job-A")
     friend_result(states, 1, "FAILED", "target-A")
-    states.append_log(1, "persistent-account-A")
+    states.append_log(1, "[!] persistent-account-A")
     reopened = store(path)
     state = reopened.get(1)
     assert state["status"] == "LIVE"
@@ -120,7 +120,7 @@ def test_new_run_keeps_history_and_cumulative_counters(tmp_path):
     path = tmp_path / "history.db"
     states = store(path)
     page_result(states, 1, "SUCCESS", "old-job")
-    states.append_log(1, "previous-run")
+    states.append_log(1, "[!] previous-run")
     states.set_login_mode(1, "COOKIE")
     states.update(1, status="CHECKING")
     state = states.get(1)
@@ -267,12 +267,13 @@ def test_concurrent_results_are_atomic_and_account_isolated(tmp_path):
         index = 1 + number % 2
         page_result(states, index, "SUCCESS", f"job-{number}")
         friend_result(states, index, "FAILED", f"target-{number}")
-        states.append_log(index, f"account-{index}-event-{number}")
+        states.append_log(index, f"[!] account-{index}-event-{number}")
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(result, range(40)))
     reopened = store(path)
     for index in (1, 2):
         assert [reopened.get(index)[key] for key in COUNTER_FIELDS] == [20, 0, 0, 20]
+        assert any(f"account-{index}-event" in log for log in reopened.get(index)["history_logs"])
         assert not any(f"account-{3-index}-event" in log for log in reopened.get(index)["history_logs"])
     with sqlite3.connect(path) as db:
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

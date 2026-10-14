@@ -263,7 +263,7 @@ def test_history_survives_reopen_refresh_and_reordering(tmp_path):
     app = make_app(AccountHistoryStore(path))
     app.account_states.update(1, status="CHECKING")
     app.account_states.update(1, status="LIVE")
-    app.account_states.append_log(1, "only account A")
+    app.account_states.append_log(1, "[!] only account A")
     app.record_task_result(1, "CREATE_PAGE", "FAILED", "policy rejected")
     app.account_states.sync([])
     reopened = make_app(AccountHistoryStore(path))
@@ -334,8 +334,8 @@ def test_refresh_during_run_preserves_worker_account_and_proxy():
 
 def test_selected_account_renders_persistent_history_only(tmp_path):
     first = make_app(AccountHistoryStore(tmp_path / "history.db"))
-    first.account_states.append_log(1, "persistent-A")
-    first.account_states.append_log(2, "persistent-B")
+    first.account_states.append_log(1, "[!] persistent-A")
+    first.account_states.append_log(2, "[!] persistent-B")
     app = make_app(AccountHistoryStore(tmp_path / "history.db"))
     app.txt_log = mock.Mock()
     app.lbl_log_scope = mock.Mock()
@@ -351,7 +351,7 @@ def test_selected_account_renders_persistent_history_only(tmp_path):
 def test_new_run_keeps_history_and_clears_only_task_results(tmp_path):
     app = make_app(AccountHistoryStore(tmp_path / "history.db"))
     app.record_task_result(1, "FRIEND_REQUEST", "ERROR", "old timeout")
-    app.account_states.append_log(1, "previous-run")
+    app.account_states.append_log(1, "[!] previous-run")
     app.account_states.update(1, status="CHECKING")
     state = app.account_states.get(1)
     assert state["tasks"] == {}

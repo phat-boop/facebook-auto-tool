@@ -75,6 +75,23 @@ from result_center import (
 from long_run import DuplicatePageResult, ModuleCircuitBreaker, SingleInstanceLock, app_circuit_breaker
 from cryptography.fernet import Fernet, InvalidToken
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+
+ENABLE_DEBUG_LOG = False
+MAX_LOG_LINES = 1000
+MAX_HISTORY_LOG_LINES = 500
+UI_POLL_INTERVAL_MS = 150
+UI_BUSY_INTERVAL_MS = 20
+UI_DRAIN_BUDGET_SECONDS = 0.008
+UI_MAX_CALLBACKS = 50
+BROWSER_CLOSE_TIMEOUT = 2.0
+_UI_REFRESH_INIT_LOCK = threading.Lock()
+
+
+def persist_log_message(message):
+    return "[DEBUG]" not in message and any(
+        marker in message for marker in ("[✔]", "[-]", "[!]", "[ERROR]")
+    )
+
 # ==================== CẤU HÌNH EVENT LOOP AN TOÀN CHO WINDOWS ====================
 # ==================== CẤU HÌNH EVENT LOOP THEO CHUẨN HIỆN ĐẠI ====================
 if sys.platform == 'win32':
@@ -106,7 +123,7 @@ def transition_page_context(page_context, state, page_identity=None):
     )
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.4.2"
+CURRENT_VERSION = "2.4.3"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -535,7 +552,7 @@ class AccountStateStore:
                         self._states[index].update(
                             status=saved["last_status"], current_action=saved["last_action"],
                             tasks=saved["tasks"], last_task_result=saved["last_task_result"],
-                            history_logs=saved["logs"],
+                            history_logs=saved["logs"][-MAX_HISTORY_LOG_LINES:],
                             last_error=saved.get("last_error") or "",
                             last_update=saved.get("last_update") or saved.get("last_seen_at") or "",
                             **{field: int(saved.get(field) or 0) for field in COUNTER_FIELDS},
@@ -559,15 +576,15 @@ class AccountStateStore:
         with self._lock:
             return sorted(self._states)
 
-    def get(self, index):
+    def get(self, index, include_logs=True):
         with self._lock:
             state = self._states.get(int(index))
             if state is None:
                 return None
             snapshot = dict(state)
             snapshot.pop("_counter_events", None)
-            snapshot["logs"] = list(state["logs"])
-            snapshot["history_logs"] = list(state.get("history_logs", []))
+            snapshot["logs"] = list(state["logs"]) if include_logs else []
+            snapshot["history_logs"] = list(state.get("history_logs", [])) if include_logs else []
             snapshot["tasks"] = copy.deepcopy(state.get("tasks", {}))
             snapshot["friend_attempts"] = set(state.get("friend_attempts", set()))
             snapshot["fields"] = list(state.get("fields") or [])
@@ -581,12 +598,14 @@ class AccountStateStore:
             state = self._states.get(int(index))
             if state is None:
                 return None
+            if status is None and (current_action is None or str(current_action) == state["current_action"]):
+                return self.get(index, include_logs=False)
             if status == "CHECKING":
                 state["page_wait_remaining"] = None
                 state["next_page_at"] = ""
                 if self.history:
                     saved = self.history.load(state)
-                    state["history_logs"] = saved["logs"] if saved else []
+                    state["history_logs"] = saved["logs"][-MAX_HISTORY_LOG_LINES:] if saved else []
                     state["logs"] = []
                 state["checkpoint_stopped"] = False
                 state["tasks"] = {}
@@ -731,18 +750,23 @@ class AccountStateStore:
                         counts[task["status"]] += 1
             return counts
 
-    def append_log(self, index, message, current_action=None):
+    def append_log(self, index, message, current_action=None, include_logs=True):
+        message = str(message)
+        if "[DEBUG]" in message and not ENABLE_DEBUG_LOG:
+            return None
         with self._lock:
             state = self._states.get(int(index))
             if state is None:
                 return None
-            state["logs"].append(str(message))
-            if len(state["logs"]) > 5000:
-                del state["logs"][:-4500]
-            if current_action and not state.get("checkpoint_stopped"):
+            state["logs"].append(message)
+            if len(state["logs"]) > MAX_LOG_LINES:
+                del state["logs"][:-MAX_LOG_LINES]
+            if current_action and "[DEBUG]" not in message and not state.get("checkpoint_stopped"):
                 state["current_action"] = str(current_action)
-            self._persist(state, event_type="LOG", message=message)
-            return self.get(index)
+            state["last_update"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+            if persist_log_message(message):
+                self._persist(state, event_type="LOG", message=message)
+            return self.get(index, include_logs=include_logs)
 
     def set_failure(self, index, failure_kind, reason):
         state = self.get(index)
@@ -1171,21 +1195,32 @@ def consume_cleanup_result(task):
         task.exception()
 
 
-async def close_browser_resources(context=None, browser=None, page=None, close_timeout=5):
+async def close_browser_resources(context=None, browser=None, page=None, close_timeout=BROWSER_CLOSE_TIMEOUT):
     """Bound each close independently; cancellation cannot skip remaining resources."""
     async def close_all():
         errors = []
+        closing = []
         for resource in (page, context, browser):
             if resource is None:
                 continue
             try:
                 task = asyncio.ensure_future(resource.close())
-                done, _ = await asyncio.wait({task}, timeout=close_timeout)
-                if not done:
-                    task.cancel()
-                    task.add_done_callback(consume_cleanup_result)
-                    errors.append(TimeoutError("Browser resource close timed out"))
-                    continue
+                if isinstance(task, asyncio.Task):
+                    task.set_name("browser-cleanup-resource")
+                closing.append(task)
+            except asyncio.CancelledError:
+                errors.append(RuntimeError("Browser resource close was cancelled"))
+            except Exception as exc:
+                errors.append(exc)
+        if not closing:
+            return errors
+        done, pending = await asyncio.wait(closing, timeout=close_timeout)
+        for task in pending:
+            task.cancel()
+            task.add_done_callback(consume_cleanup_result)
+            errors.append(TimeoutError("Browser resource close timed out"))
+        for task in done:
+            try:
                 task.result()
             except asyncio.CancelledError:
                 errors.append(RuntimeError("Browser resource close was cancelled"))
@@ -1193,7 +1228,7 @@ async def close_browser_resources(context=None, browser=None, page=None, close_t
                 errors.append(exc)
         return errors
 
-    cleanup = asyncio.create_task(close_all())
+    cleanup = asyncio.create_task(close_all(), name="browser-cleanup")
     cancelled = False
     while True:
         try:
@@ -1846,6 +1881,24 @@ def send_telegram_alert(bot_token: str, chat_id: str, message: str):
     except Exception:
         pass
 
+
+async def send_telegram_alert_async(bot_token, chat_id, message):
+    """Keep notification HTTP I/O off the worker event loop's synchronous path."""
+    if not bot_token or not chat_id:
+        return
+    try:
+        async with async_playwright() as playwright:
+            request = await playwright.request.new_context(timeout=8000)
+            try:
+                await request.post(
+                    f"https://api.telegram.org/bot{bot_token.strip()}/sendMessage",
+                    data={"chat_id": chat_id.strip(), "text": message},
+                )
+            finally:
+                await request.dispose()
+    except Exception:
+        pass
+
 @dataclass(frozen=True, repr=False)
 class AccountRecord:
     uid: str
@@ -2312,6 +2365,12 @@ class MainToolApp:
         self.run_config = {}
         self._account_import_records = {}
         self.ui_queue = queue.Queue()
+        self._ui_thread_id = threading.get_ident()
+        self._ui_refresh_lock = threading.RLock()
+        self._ui_dirty_rows = set()
+        self._ui_dirty_logs = set()
+        self._ui_refresh_pending = False
+        self._ui_refresh_generation = 0
         self.close_requested = False
         history = AccountHistoryStore(output_path("account_history.db"))
         if not history.page_identity_bootstrapped():
@@ -2340,7 +2399,7 @@ class MainToolApp:
         self.style = ttk.Style()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.root.after(50, self._drain_ui_queue)
+        self.root.after(UI_POLL_INTERVAL_MS, self._drain_ui_queue)
 
         self._build_layout()
         self.apply_theme(self.theme_name)
@@ -2366,20 +2425,84 @@ class MainToolApp:
                 self.ui_queue.put(current_run_callback)
 
     def _drain_ui_queue(self):
+        deadline = time.perf_counter() + UI_DRAIN_BUDGET_SECONDS
         try:
-            while True:
+            for _ in range(UI_MAX_CALLBACKS):
+                if time.perf_counter() >= deadline:
+                    break
                 callback = self.ui_queue.get_nowait()
                 try:
                     callback()
                 except Exception as exc:
                     # A failed row refresh must not discard the later finish_run callback.
-                    with self.global_log_lock:
-                        self.global_logs.append(f"[UI ERROR] {type(exc).__name__}: {exc}")
+                    self._record_ui_error(exc)
         except queue.Empty:
             pass
         finally:
             if not self.close_requested:
-                self.root.after(50, self._drain_ui_queue)
+                delay = UI_BUSY_INTERVAL_MS if not self.ui_queue.empty() else UI_POLL_INTERVAL_MS
+                self.root.after(delay, self._drain_ui_queue)
+
+    def _record_ui_error(self, exc):
+        with self.global_log_lock:
+            self.global_logs.append(f"[UI ERROR] {type(exc).__name__}: {exc}")
+            del self.global_logs[:-MAX_LOG_LINES]
+
+    def request_ui_refresh(self, index=None, render_log=False):
+        if not hasattr(self, "_ui_refresh_lock"):
+            with _UI_REFRESH_INIT_LOCK:
+                if not hasattr(self, "_ui_refresh_lock"):
+                    self._ui_refresh_lock = threading.RLock()
+                    self._ui_dirty_rows = set()
+                    self._ui_dirty_logs = set()
+                    self._ui_refresh_pending = False
+                    self._ui_refresh_generation = getattr(self, "_run_generation", 0)
+        generation = getattr(self, "_run_generation", 0)
+        context = getattr(self, "_ui_run_context", None)
+        if context is not None and context.get() not in (None, generation):
+            return
+        with self._ui_refresh_lock:
+            if self._ui_refresh_generation != generation:
+                self._ui_dirty_rows.clear()
+                self._ui_dirty_logs.clear()
+                self._ui_refresh_pending = False
+                self._ui_refresh_generation = generation
+            if index is not None:
+                self._ui_dirty_rows.add(int(index))
+            if render_log:
+                self._ui_dirty_logs.add(int(index) if index is not None else None)
+            if self._ui_refresh_pending:
+                return
+            self._ui_refresh_pending = True
+        self.post_ui(lambda: self._flush_ui_refresh(generation))
+
+    def _flush_ui_refresh(self, generation):
+        with self._ui_refresh_lock:
+            if generation != getattr(self, "_run_generation", 0):
+                return
+            rows, logs = self._ui_dirty_rows, self._ui_dirty_logs
+            self._ui_dirty_rows, self._ui_dirty_logs = set(), set()
+            self._ui_refresh_pending = False
+        self._defer_ui_summaries = True
+        deadline = time.perf_counter() + UI_DRAIN_BUDGET_SECONDS
+        try:
+            ordered_rows = sorted(rows)
+            for position, index in enumerate(ordered_rows):
+                if position and (position >= UI_MAX_CALLBACKS or time.perf_counter() >= deadline):
+                    for remaining in ordered_rows[position:]:
+                        self.request_ui_refresh(remaining)
+                    break
+                try:
+                    self.refresh_account_state_row(index)
+                except Exception as exc:
+                    self._record_ui_error(exc)
+        finally:
+            self._defer_ui_summaries = False
+        if rows:
+            self.refresh_state_summary()
+            self.refresh_result_center_summary()
+        if getattr(self, "selected_log_account", None) in logs:
+            self.render_log_view()
 
     @staticmethod
     def _bounded_int(value, default, minimum=0, maximum=100000):
@@ -2407,7 +2530,7 @@ class MainToolApp:
             values = self.tree.item(item, "values")
             if values and str(values[1]).isdigit():
                 account_index = int(values[1])
-                state = self.account_states.get(account_index)
+                state = self.account_states.get(account_index, include_logs=False)
                 resolved_proxies[account_index] = (
                     state.get("proxy", "") if state else ""
                 )
@@ -2419,7 +2542,7 @@ class MainToolApp:
         min_page_delay = self._bounded_int(self.ent_min_page_delay.get(), 60, 0, 86400)
         max_page_delay = self._bounded_int(self.ent_max_page_delay.get(), 120, 0, 86400)
         parsed_accounts = {
-            index: self.account_states.get(index)
+            index: self.account_states.get(index, include_logs=False)
             for index in self.account_states.indexes()
         }
 
@@ -3257,14 +3380,16 @@ class MainToolApp:
     def refresh_management_account_row(self, index):
         if not hasattr(self, "tree") or not self.tree.exists(str(index)):
             return
-        state = self.account_states.get(index)
+        state = self.account_states.get(index, include_logs=False)
         if state is None:
             return
         previous = self.tree.item(str(index), "values")
         tag = state["status"]
         if tag == "LIVE" and task_result_status(state.get("tasks", {})) == "RUNNING":
             tag = "RUNNING"
-        self.tree.item(str(index), values=management_account_values(state, bool(previous and previous[0] == "[✔]")), tags=(tag,))
+        values = management_account_values(state, bool(previous and previous[0] == "[✔]"))
+        if tuple(map(str, previous)) != tuple(map(str, values)):
+            self.tree.item(str(index), values=values, tags=(tag,))
 
     def open_create_page_results_dialog(self):
         window = getattr(self, "create_page_results_window", None)
@@ -3444,7 +3569,7 @@ class MainToolApp:
 
     def result_center_accounts(self):
         # Project the existing live store and its SQLite history, including removed input rows.
-        states = [self.account_states.get(index) for index in self.account_states.indexes()]
+        states = [self.account_states.get(index, include_logs=False) for index in self.account_states.indexes()]
         accounts = {history_account_id(state): state for state in states if state is not None}
         config = getattr(self, "run_config", {})
         legacy = {}
@@ -3493,8 +3618,9 @@ class MainToolApp:
         window = getattr(self, "create_page_results_window", None)
         if window is None or not window.winfo_exists():
             return
-        accounts = self.result_center_accounts()
-        changed = self.account_states.get(index) if index is not None else None
+        deferred = getattr(self, "_defer_ui_summaries", False)
+        accounts = [] if deferred and index is not None else self.result_center_accounts()
+        changed = self.account_states.get(index, include_logs=False) if index is not None else None
         rows = [changed] if changed else accounts
         for key, tree in self.create_page_result_trees.items():
             if index is None or changed is None:
@@ -3516,9 +3642,19 @@ class MainToolApp:
                     elif values[8] == "RUNNING":
                         tag = "RUNNING"
                 if tree.exists(item):
-                    tree.item(item, values=values, tags=(tag,))
+                    if tuple(map(str, tree.item(item, "values"))) != tuple(map(str, values)):
+                        tree.item(item, values=values, tags=(tag,))
                 else:
                     tree.insert("", "end", iid=item, values=values, tags=(tag,))
+        if not deferred:
+            self.refresh_result_center_summary(accounts)
+
+    def refresh_result_center_summary(self, accounts=None):
+        window = getattr(self, "create_page_results_window", None)
+        if window is None or not window.winfo_exists():
+            return
+        if accounts is None:
+            accounts = self.result_center_accounts()
         for key, value in result_summary(accounts).items():
             self.result_center_summary_labels[key].config(text=str(value))
         self.update_result_center_footer()
@@ -3640,18 +3776,16 @@ class MainToolApp:
             visible_indexes = batches[self.current_batch - 1]
 
         selected_index = self.selected_log_account
+        visible_items = {f"account_state_{index}" for index in visible_indexes}
         for item in self.account_state_tree.get_children():
-            self.account_state_tree.delete(item)
+            if item not in visible_items:
+                self.account_state_tree.delete(item)
         for index in visible_indexes:
-            state = self.account_states.get(index)
+            state = self.account_states.get(index, include_logs=False)
             if state is None:
                 continue
             item_id = f"account_state_{index}"
-            self.account_state_tree.insert(
-                "",
-                "end",
-                iid=item_id,
-                values=(
+            values = (
                     state["stt"],
                     state["account_id"],
                     ACCOUNT_STATUS_LABELS[state["status"]],
@@ -3660,9 +3794,12 @@ class MainToolApp:
                     f"{state['page_success_count']} / {state['page_failed_count']}",
                     f"{state['friend_success_count']} / {state['friend_failed_count']}",
                     state["current_action"],
-                ),
-                tags=(state["status"],),
             )
+            if self.account_state_tree.exists(item_id):
+                if tuple(map(str, self.account_state_tree.item(item_id, "values"))) != tuple(map(str, values)):
+                    self.account_state_tree.item(item_id, values=values, tags=(state["status"],))
+            else:
+                self.account_state_tree.insert("", "end", iid=item_id, values=values, tags=(state["status"],))
             if selected_index == index:
                 self.account_state_tree.selection_set(item_id)
 
@@ -3680,7 +3817,7 @@ class MainToolApp:
         if not self.account_state_tree.exists(item_id):
             self.refresh_state_summary()
             return
-        state = self.account_states.get(index)
+        state = self.account_states.get(index, include_logs=False)
         if state is None:
             return
         self.account_state_tree.item(
@@ -3700,6 +3837,8 @@ class MainToolApp:
         self.refresh_state_summary()
 
     def refresh_state_summary(self):
+        if getattr(self, "_defer_ui_summaries", False):
+            return
         summary = self.account_states.summary()
         total = sum(summary.values())
         task_summary = self.account_states.task_summary()
@@ -3767,21 +3906,32 @@ class MainToolApp:
             account_label = state["account_id"] if state else str(self.selected_log_account)
             title = f"📜 NHẬT KÝ: {account_label}"
 
+        lines = tuple(lines[-(MAX_LOG_LINES + MAX_HISTORY_LOG_LINES + 1):])
+        scope = (self.selected_log_account, title)
+        previous = getattr(self, "_rendered_log_lines", ())
+        same_scope = getattr(self, "_rendered_log_scope", None) == scope
+        if same_scope and previous == lines:
+            return
         self.lbl_log_scope.config(text=title)
         self.txt_log.config(state="normal")
-        self.txt_log.delete("1.0", "end")
-        if lines:
-            self.txt_log.insert("1.0", "\n".join(lines) + "\n")
+        if same_scope and len(lines) >= len(previous) and lines[:len(previous)] == previous:
+            added = lines[len(previous):]
+        else:
+            self.txt_log.delete("1.0", "end")
+            added = lines
+        if added:
+            self.txt_log.insert("end", "\n".join(added) + "\n")
         self.txt_log.see("end")
         self.txt_log.config(state="disabled")
+        self._rendered_log_scope, self._rendered_log_lines = scope, lines
 
     def set_account_state(self, index, status=None, current_action=None):
         self.account_states.update(index, status=status, current_action=current_action)
-        self.post_ui(lambda idx=int(index): self.refresh_account_state_row(idx))
+        self.request_ui_refresh(index)
 
     def record_task_result(self, index, module, status, detail="", outcome=None, preserve_outcomes=False):
         committed = self.account_states.record_task(index, module, status, detail, outcome, preserve_outcomes)
-        self.post_ui(lambda idx=int(index): self.refresh_account_state_row(idx))
+        self.request_ui_refresh(index)
         return committed
 
     def skip_paused_module(self, index, module):
@@ -3822,7 +3972,7 @@ class MainToolApp:
 
     def finalize_active_account_tasks(self, index, status, reason):
         self.account_states.finalize_active_tasks(index, status, reason)
-        self.post_ui(lambda idx=int(index): self.refresh_account_state_row(idx))
+        self.request_ui_refresh(index)
 
     async def resolve_effective_proxy(self, index, assigned_proxy):
         config = self.run_config
@@ -3985,25 +4135,25 @@ class MainToolApp:
         if resolved_index is None:
             resolved_index = self.account_log_context.get()
         message = str(text)
+        if "[DEBUG]" in message and not ENABLE_DEBUG_LOG:
+            return
 
-        if resolved_index is not None and self.account_states.get(resolved_index) is not None:
+        if resolved_index is not None:
             current_action = None
             stripped = message.lstrip()
             if stripped.startswith(("[*]", "[🚀]", "[⏳]")):
                 current_action = re.sub(r"^\[[^\]]+\]\s*", "", stripped)
                 current_action = re.sub(r"^\[[^\]]+\]\s*", "", current_action)[:160]
-            self.account_states.append_log(resolved_index, message, current_action=current_action)
-            self.post_ui(lambda idx=int(resolved_index): [
-                self.refresh_account_state_row(idx),
-                self.render_log_view() if self.selected_log_account == idx else None,
-            ])
-            return
+            state = self.account_states.append_log(resolved_index, message, current_action=current_action, include_logs=False)
+            if state is not None:
+                self.request_ui_refresh(resolved_index, render_log=True)
+                return
 
         with self.global_log_lock:
             self.global_logs.append(message)
-            if len(self.global_logs) > 5000:
-                del self.global_logs[:-4500]
-        self.post_ui(lambda: self.render_log_view() if self.selected_log_account is None else None)
+            if len(self.global_logs) > MAX_LOG_LINES:
+                del self.global_logs[:-MAX_LOG_LINES]
+        self.request_ui_refresh(render_log=True)
 
 
     async def take_error_snapshot(self, page, acc_name, reason):
@@ -4449,14 +4599,20 @@ class MainToolApp:
             return
         self.stop_requested = True
         generation = getattr(self, "_run_generation", 0)
-        self.log("[!] Đang gửi lệnh dừng đến tất cả các luồng...")
         def mark_stopping():
             if generation != getattr(self, "_run_generation", 0):
                 return
-            self.btn_stop.config(state="disabled")
+            if not hasattr(self, "_stop_button_text"):
+                original = self.btn_stop.cget("text")
+                self._stop_button_text = original if isinstance(original, str) else None
+            self.btn_start.config(state="disabled")
+            self.btn_stop.config(state="disabled", text="ĐANG DỪNG...")
             if hasattr(self, 'lbl_status_indicator'):
                 self.lbl_status_indicator.config(text="● Đang dừng...", fg="#F59E0B")
-        self.post_ui(mark_stopping)
+        if threading.get_ident() == getattr(self, "_ui_thread_id", threading.main_thread().ident):
+            mark_stopping()
+        else:
+            self.post_ui(mark_stopping)
         loop = self.worker_loop
         if loop and loop.is_running():
             try:
@@ -4464,6 +4620,7 @@ class MainToolApp:
             except RuntimeError:
                 # The worker may finish and close its loop during this request.
                 pass
+        self.log("[!] Đang gửi lệnh dừng đến tất cả các luồng...")
 
     def _cancel_worker_tasks(self, generation=None):
         current = getattr(self, "_run_generation", 0)
@@ -4473,12 +4630,24 @@ class MainToolApp:
             return
         self._cancel_requested_generation = current
         root = getattr(self, "worker_root_task", None)
-        if root is not None and not root.done():
-            # Cancelling gather's owner propagates once to all account tasks.
-            root.cancel()
-            return
-        for task in list(self.worker_tasks):
-            if not task.done():
+        tasks = set(self.worker_tasks)
+        if root is not None:
+            tasks.add(root)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is getattr(self, "worker_loop", None) and loop is not None:
+            for task in asyncio.all_tasks(loop):
+                code = getattr(task.get_coro(), "cr_code", None)
+                filename = getattr(code, "co_filename", "").replace("\\", "/")
+                # Keep Playwright's transport alive until browser cleanup finishes.
+                source_root = os.path.dirname(__file__).replace("\\", "/") + "/"
+                if filename.startswith(source_root) and not task.get_name().startswith("browser-cleanup"):
+                    tasks.add(task)
+        ordered = ([root] if root in tasks else []) + [task for task in tasks if task is not root]
+        for task in ordered:
+            if not task.done() and not (isinstance(task, asyncio.Task) and task.cancelling()):
                 task.cancel()
 
     def finish_run(self, generation=None):
@@ -4508,6 +4677,8 @@ class MainToolApp:
 
         # Khôi phục trạng thái nút Bắt đầu để người dùng có thể chạy lại ngay
         self.btn_start.config(state="normal")
+        if getattr(self, "_stop_button_text", None) is not None:
+            self.btn_stop.config(text=self._stop_button_text)
         self.btn_stop.config(state="disabled")
         
         if hasattr(self, 'lbl_status_indicator'):
@@ -4534,7 +4705,15 @@ class MainToolApp:
             self.worker_root_task = asyncio.current_task()
             if self.stop_requested:
                 raise asyncio.CancelledError()
-            await self.main_worker()
+            try:
+                await self.main_worker()
+            finally:
+                pending = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+                for task in pending:
+                    if not task.cancelling():
+                        task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
 
         try:
             # Chạy trực tiếp worker chính, không gọi lại set_event_loop_policy để tránh xung đột luồng
@@ -4895,8 +5074,10 @@ class MainToolApp:
                 browser = await playwright_instance.chromium.launch(**launch_kwargs)
                 break
             except Exception as e:
-                self.log(f"[!] Lỗi khởi tạo Chrome lần {attempt}: {e}")
-                await asyncio.sleep(2)
+                if attempt == 3:
+                    self.log(f"[!] Lỗi khởi tạo Chrome sau {attempt} lần: {e}")
+                else:
+                    await asyncio.sleep(2)
 
         if not browser:
             raise RuntimeError("Thất bại hoàn toàn khi mở trình duyệt Chromium.")
@@ -5410,6 +5591,8 @@ class MainToolApp:
         Click an toàn khi DOM thay đổi, tự động retry khi bị Stale Element.
         """
         for attempt in range(1, retries + 1):
+            if getattr(self, "stop_requested", False):
+                raise asyncio.CancelledError()
             try:
                 locator = page.locator(selector)
                 count = await locator.count()
@@ -5428,13 +5611,10 @@ class MainToolApp:
                 return True
 
             except Exception as e:
-                err_msg = str(e).lower()
-                if "detached" in err_msg or "not attached" in err_msg or "timeout" in err_msg:
-                    self.log(f"[DEBUG] [{acc_name}] {action_name} retry {attempt}/{retries}: DOM thay đổi...")
+                if attempt == retries:
+                    self.log(f"[-] [{acc_name}] {action_name} thất bại sau {retries} lần: {e}")
                 else:
-                    self.log(f"[DEBUG] [{acc_name}] {action_name} retry {attempt}/{retries}: {type(e).__name__}")
-                
-                await asyncio.sleep(random.uniform(1.0, 1.5))
+                    await asyncio.sleep(random.uniform(1.0, 1.5))
 
         return False
     async def run_create_page(self, page, context, acc_name, idx, targets=None, max_pages=5, min_page_del=60, max_page_del=120, resolved_proxy=''):
@@ -5852,7 +6032,7 @@ class MainToolApp:
                 t_token = config.get("tele_token", "")
                 t_id = config.get("tele_chatid", "")
                 if t_token and t_id:
-                    send_telegram_alert(t_token, t_id, f"⚠️ CẢNH BÁO: Nick [{acc_name}] gặp sự cố/checkpoint!\nChi tiết: {e}")
+                    await send_telegram_alert_async(t_token, t_id, f"⚠️ CẢNH BÁO: Nick [{acc_name}] gặp sự cố/checkpoint!\nChi tiết: {e}")
             
             finally:
                 # --- SIÊU NĂNG LỰC: DÙ LỖI HAY KHÔNG CŨNG BẮT BUỘC ĐÓNG TRÌNH DUYỆT ĐỂ CHỐNG TREO RAM ---
@@ -6013,7 +6193,16 @@ class MainToolApp:
                     )))
 
                 self.worker_tasks = tasks
-                task_results = await asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    task_results = await asyncio.gather(*tasks, return_exceptions=True)
+                finally:
+                    pending = [task for task in tasks if not task.done()]
+                    for task in pending:
+                        if not task.cancelling():
+                            task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    self.worker_tasks = []
                 for job, result in zip(batch_jobs, task_results):
                     if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
                         unexpected_errors.append(result)
@@ -6050,7 +6239,7 @@ class MainToolApp:
         t_token = config.get("tele_token", "")
         t_id = config.get("tele_chatid", "")
         if t_token and t_id:
-            send_telegram_alert(t_token, t_id, "THÔNG BÁO: " + (
+            await send_telegram_alert_async(t_token, t_id, "THÔNG BÁO: " + (
                 "Đợt chạy kết thúc có lỗi; kiểm tra nhật ký tài khoản."
                 if self.run_status == "COMPLETED_WITH_ERRORS"
                 else "Toàn bộ dàn nick đã hoàn thành tất cả tiến trình!"

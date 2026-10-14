@@ -195,7 +195,7 @@ def test_popup_refresh_and_history_keep_account_binding_without_losing_metadata(
          mock.patch.object(module.messagebox, "showwarning", side_effect=AssertionError("valid account rejected")):
         module.ImportAccountDialog.process_import(dialog)
     record = app.account_states.get(1)["account_record"]
-    app.account_states.append_log(1, "account-A-imported")
+    app.account_states.append_log(1, "[!] account-A-imported")
     app.account_states.update(1, status="LIVE", current_action="verified cookie")
     app.txt_accounts.text = COOKIE_B + "\n" + COOKIE_A
     app.reload_table_from_text()

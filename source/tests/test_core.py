@@ -1571,7 +1571,7 @@ class RunLifecycleTests(unittest.TestCase):
         app.btn_stop.config.assert_called_once_with(state="disabled")
         subsequent.assert_called_once()
         self.assertIn("row refresh failed", app.global_logs[0])
-        app.root.after.assert_called_once_with(50, app._drain_ui_queue)
+        app.root.after.assert_called_once_with(client_app.UI_POLL_INTERVAL_MS, app._drain_ui_queue)
 
     def test_finish_waits_for_old_thread_before_enabling_start(self):
         app = self.make_app()

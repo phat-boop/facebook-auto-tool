@@ -259,8 +259,8 @@ def test_inspector_worker_captures_snapshot_and_posts_error_to_ui_thread():
 def test_log_view_uses_stable_account_identity_after_reorder(history, tmp_path):
     app = management_app()
     app.account_states.history = module.AccountHistoryStore(tmp_path / "history.db")
-    app.account_states.append_log(1, "A private password-A")
-    app.account_states.append_log(2, "B-only-log")
+    app.account_states.append_log(1, "[!] A private password-A")
+    app.account_states.append_log(2, "[!] B-only-log")
     selected = app.account_states.get(1)
     app.account_states.sync([dict(app.account_states.get(2), stt=1),
                              dict(app.account_states.get(1), stt=2)])
