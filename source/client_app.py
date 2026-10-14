@@ -106,7 +106,7 @@ def transition_page_context(page_context, state, page_identity=None):
     )
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.3.6"
+CURRENT_VERSION = "2.3.7"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -5484,6 +5484,7 @@ class MainToolApp:
             if isinstance(status, int) and status >= 400:
                 return LOGIN_TECHNICAL_ERROR, f"Cookie navigation HTTP {status}"
             await asyncio.sleep(4)
+            await self.dismiss_floating_overlays(page)
             result, detail = await self.verify_facebook_session(page, context, expected_uid)
             if result == LOGIN_INVALID:
                 return result, f"{detail}; Cookie không hợp lệ/hết hạn, cần thay Cookie mới"
