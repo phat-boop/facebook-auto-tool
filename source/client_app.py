@@ -71,7 +71,7 @@ from contextlib import asynccontextmanager
 from types import MappingProxyType
 from account_history import AccountHistoryStore, COUNTER_FIELDS, history_account_id, redact_history_text, safe_proxy_label
 from result_center import (
-    RESULT_COLUMNS, RESULT_HEADERS, RESULT_TABS, SUMMARY_KEYS, report_record,
+    RESULT_COLUMNS, RESULT_HEADERS, RESULT_TABS, SUMMARY_KEYS, account_action_label, report_record,
     result_matches, result_summary, result_values, write_result_csv, write_result_workbook,
 )
 from long_run import DuplicatePageResult, ModuleCircuitBreaker, SingleInstanceLock, app_circuit_breaker
@@ -125,7 +125,7 @@ def transition_page_context(page_context, state, page_identity=None):
     )
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.4.6"
+CURRENT_VERSION = "2.4.7"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -283,7 +283,7 @@ def management_account_values(state, checked=True):
         "********" if state.get("password") else "", "********" if state.get("2fa") else "",
         "YES" if state.get("cookie") else "NO", "YES" if state.get("token") else "NO",
         state.get("login_mode") or "-", state.get("status", "UNKNOWN"),
-        redact_history_text(state.get("current_action", ""), state),
+        account_action_label(state),
         f"{state.get('page_success_count', 0)} / {state.get('page_failed_count', 0)}",
         f"{state.get('friend_success_count', 0)} / {state.get('friend_failed_count', 0)}", timestamp,
     )
@@ -564,6 +564,8 @@ class AccountStateStore:
                         "last_task_result": "PENDING",
                         "page_wait_remaining": None,
                         "next_page_at": "",
+                        "activity_wait_remaining": None,
+                        "activity_wait_label": "",
                         "last_error": "",
                         "last_update": "",
                         "_counter_events": set(),
@@ -640,6 +642,8 @@ class AccountStateStore:
             if status == "CHECKING":
                 state["page_wait_remaining"] = None
                 state["next_page_at"] = ""
+                state["activity_wait_remaining"] = None
+                state["activity_wait_label"] = ""
                 if self.history:
                     saved = self.history.load(state)
                     state["history_logs"] = saved["logs"][-MAX_HISTORY_LOG_LINES:] if saved else []
@@ -661,6 +665,8 @@ class AccountStateStore:
             if current_action is not None:
                 state["current_action"] = str(current_action)
             if status in {"DIE", "ERROR", "CHECKPOINT"}:
+                state["activity_wait_remaining"] = None
+                state["activity_wait_label"] = ""
                 state["last_error"] = state["current_action"]
             self._persist(state)
             return self.get(index)
@@ -694,6 +700,17 @@ class AccountStateStore:
             state["page_wait_remaining"] = remaining
             state["next_page_at"] = next_page_at
 
+    def set_activity_wait(self, index, remaining=None, label=""):
+        """Transient UI countdown; do not persist a history event every second."""
+        with self._lock:
+            state = self._states.get(int(index))
+            if state is None:
+                return
+            if remaining is not None and state["status"] in {"CHECKPOINT", "DIE", "ERROR"}:
+                return
+            state["activity_wait_remaining"] = remaining
+            state["activity_wait_label"] = label if remaining is not None else ""
+
     def finalize_active_tasks(self, index, status, reason):
         if status not in {"SKIPPED", "ERROR"}:
             raise ValueError("Kết quả dừng tác vụ phải là SKIPPED hoặc ERROR")
@@ -703,6 +720,8 @@ class AccountStateStore:
                 return
             state["page_wait_remaining"] = None
             state["next_page_at"] = ""
+            state["activity_wait_remaining"] = None
+            state["activity_wait_label"] = ""
             for module, task in state.get("tasks", {}).items():
                 if task["status"] in {"PENDING", "RUNNING"}:
                     task.update(status=status, detail=reason)
@@ -3880,7 +3899,7 @@ class MainToolApp:
                     page_wait_label(state),
                     f"{state['page_success_count']} / {state['page_failed_count']}",
                     f"{state['friend_success_count']} / {state['friend_failed_count']}",
-                    state["current_action"],
+                    account_action_label(state),
             )
             if self.account_state_tree.exists(item_id):
                 if tuple(map(str, self.account_state_tree.item(item_id, "values"))) != tuple(map(str, values)):
@@ -3917,7 +3936,7 @@ class MainToolApp:
                 page_wait_label(state),
                 f"{state['page_success_count']} / {state['page_failed_count']}",
                 f"{state['friend_success_count']} / {state['friend_failed_count']}",
-                state["current_action"],
+                account_action_label(state),
             ),
             tags=(state["status"],),
         )
@@ -5202,31 +5221,63 @@ class MainToolApp:
     async def _wait_support_activity(self, page, duration_seconds, scroll=False):
         deadline = time.monotonic() + duration_seconds
         scroll_timeout_logged = False
-        while self.is_running and not getattr(self, "stop_requested", False):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return
-            await self.guard_facebook_checkpoint(page)
-            if page.is_closed():
-                raise RuntimeError("Profile đã đóng trong lúc chờ")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return
-            if scroll:
-                try:
-                    await self._smooth_human_scroll(page, deadline)
-                except (asyncio.TimeoutError, PlaywrightTimeoutError) as exc:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return
-                    await self.verify_support_session_after_timeout(page, exc, timeout=min(5.0, remaining))
-                    if not scroll_timeout_logged:
-                        self.log("[!] Cuộn Feed phản hồi chậm; phiên vẫn hợp lệ, tiếp tục thời gian đệm.")
-                        scroll_timeout_logged = True
-                pause_time = random.uniform(1.2, 2.6)
-            else:
-                pause_time = 1.0
-            await asyncio.sleep(min(pause_time, max(0, deadline - time.monotonic())))
+        log_context = getattr(self, "account_log_context", None)
+        index = log_context.get() if log_context is not None else None
+        timer = None
+
+        def update_countdown():
+            self.account_states.set_activity_wait(
+                index, max(0, math.ceil(deadline - time.monotonic())),
+                "Lướt Feed đệm" if scroll else "Xem thông báo",
+            )
+            self.request_ui_refresh(index)
+
+        async def countdown():
+            while self.is_running and not getattr(self, "stop_requested", False):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                await asyncio.sleep(min(1.0, remaining))
+                if not self.is_running or getattr(self, "stop_requested", False):
+                    return
+                update_countdown()
+
+        try:
+            if index is not None:
+                update_countdown()
+                timer = asyncio.create_task(countdown())
+            while self.is_running and not getattr(self, "stop_requested", False):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                await self.guard_facebook_checkpoint(page)
+                if page.is_closed():
+                    raise RuntimeError("Profile đã đóng trong lúc chờ")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                if scroll:
+                    try:
+                        await self._smooth_human_scroll(page, deadline)
+                    except (asyncio.TimeoutError, PlaywrightTimeoutError) as exc:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return
+                        await self.verify_support_session_after_timeout(page, exc, timeout=min(5.0, remaining))
+                        if not scroll_timeout_logged:
+                            self.log("[!] Cuộn Feed phản hồi chậm; phiên vẫn hợp lệ, tiếp tục thời gian đệm.")
+                            scroll_timeout_logged = True
+                    pause_time = random.uniform(1.2, 2.6)
+                else:
+                    pause_time = 1.0
+                await asyncio.sleep(min(pause_time, max(0, deadline - time.monotonic())))
+        finally:
+            if timer is not None:
+                timer.cancel()
+                await asyncio.gather(timer, return_exceptions=True)
+            if index is not None:
+                self.account_states.set_activity_wait(index)
+                self.request_ui_refresh(index)
 
 
     async def warm_up_feed(self, page, acc_name, duration_seconds=30):

@@ -45,6 +45,17 @@ def _safe_report_raw_line(record_or_state):
     return redacted
 
 
+def account_action_label(state):
+    action = state.get("current_action", "")
+    remaining = state.get("activity_wait_remaining")
+    label = state.get("activity_wait_label")
+    if remaining is not None and label and state.get("status") not in {"DIE", "ERROR", "CHECKPOINT"}:
+        seconds = max(0, int(remaining))
+        minutes, seconds_part = divmod(seconds, 60)
+        action = f"{label} - còn {seconds}s ({minutes:02d}:{seconds_part:02d})"
+    return redact_history_text(action, state)
+
+
 def result_values(state):
     tasks = state.get("tasks", {})
     page_task = tasks.get("CREATE_PAGE", {})
@@ -66,7 +77,7 @@ def result_values(state):
         state.get("stt", ""), state.get("uid") or state.get("account_id", ""),
         state.get("status", "UNKNOWN"), state.get("login_mode") or "-",
         *(int(state.get(field) or 0) for field in COUNTER_FIELDS), result,
-        redact_history_text(state.get("current_action"), state),
+        account_action_label(state),
         redact_history_text(last_page.get("page_name"), state), str(last_page.get("page_id") or ""),
         redact_history_text(reason, state), timestamp,
     )
