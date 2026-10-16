@@ -1,7 +1,7 @@
 {
-    "version":  "2.4.6",
-    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.4.6/client_app.exe",
-    "sha256":  "E995457F0951302401579C2AED48968926D4F7430B04AF4F2B56987DAD7FCFF2",
-    "changelog":  "Sửa xử lý tên Page, đồng bộ tài khoản/luồng và proxy; bổ sung đếm ngược Feed sau tạo Page.",
+    "version":  "2.4.7",
+    "download_url":  "https://github.com/phat-boop/facebook-auto-tool/releases/download/v2.4.7/client_app.exe",
+    "sha256":  "66A91E890786E3DD2ECA6A3AA295F834CAFCC6548218345687B47F2F4F79E131",
+    "changelog":  "Sửa đếm ngược Feed đệm và xem thông báo theo từng tài khoản trên Trang chủ, Thống kê và Result Center.",
     "mandatory":  false
 }
