@@ -235,6 +235,9 @@ def test_page_missing_positive_evidence_is_not_success(field, value):
 ])
 def test_category_matches_suggestion_and_verifies_selection(requested, options, selected, expected):
     app = make_app()
+    async def click_option(_page, locator):
+        await locator.click()
+    app.human_click = mock.AsyncMock(side_effect=click_option)
     page, category_input = mock.Mock(), mock.Mock()
     category_input.evaluate = mock.AsyncMock(return_value=selected)
     locators = []
@@ -254,8 +257,16 @@ def test_category_matches_suggestion_and_verifies_selection(requested, options, 
     assert success is expected
     for text, locator in zip(options, locators):
         assert locator.click.await_count == int(app_module.normalize_ui_text(text) == app_module.normalize_ui_text(requested))
+    matching = [(text.strip(), locator) for text, locator in zip(options, locators)
+                if app_module.normalize_ui_text(text) == app_module.normalize_ui_text(requested)]
+    assert app.human_click.await_args_list == [mock.call(page, locator) for _text, locator in matching]
+    assert category_input.evaluate.await_count == len(matching)
+    if matching:
+        assert category_input.evaluate.call_args.args[1] == matching[0][0]
     if not expected:
-        assert reason.startswith("CATEGORY_")
+        assert reason == ("CATEGORY_SELECTION_NOT_VERIFIED" if matching else "CATEGORY_NOT_FOUND")
+    else:
+        assert reason == ""
 
 
 def test_history_survives_reopen_refresh_and_reordering(tmp_path):

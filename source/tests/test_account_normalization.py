@@ -263,7 +263,7 @@ def test_import_provenance_survives_encrypted_settings_round_trip(tmp_path):
     app.mode_vars = {}
     names = ("ent_threads ent_batch_size ent_target ent_page_target ent_max_create_page_workers "
              "ent_min_page_delay ent_max_page_delay ent_min_delay ent_max_delay ent_warmup_seconds "
-             "ent_notification_seconds ent_tele_token ent_tele_chatid chk_headless chk_warmup "
+             "ent_notification_seconds ent_tele_token ent_tele_chatid ent_proxy_api chk_headless chk_warmup "
              "chk_check_notif").split()
     for name in names:
         setattr(app, name, mock.Mock())

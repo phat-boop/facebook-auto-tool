@@ -62,6 +62,7 @@ def test_edits_before_start_are_synced_before_running():
     app = make_start_app()
     app.txt_accounts.text = account("33333") + "\n" + account("44444")
     app.txt_proxies.text = "127.0.0.1:61001\n127.0.0.1:61002"
+    app.ent_selected_indexes.get.return_value = "1,2"
     original_reload = app.reload_table_from_text
     original_capture = app.capture_run_config
     events = []
@@ -146,35 +147,51 @@ def test_worker_uses_snapshot_without_tk_or_proxy_reselection():
         (1, config["resolved_proxies"][1]), (2, config["resolved_proxies"][2])]
 
 
-def test_rotating_api_is_resolved_before_running_not_again_in_worker():
+def test_rotating_api_is_prepared_off_ui_once_before_account_workers():
     app = make_start_app()
     app.proxy_mode.get.return_value = "rotating_api"
     app.ent_proxy_api.get.return_value = "https://proxy.example/api"
-    def fetch(_url):
-        assert not app.is_running
+    async def fetch(_url, _request):
+        assert app.is_running
         return next(proxies)
     proxies = iter(["127.0.0.1:62001", "127.0.0.1:62002"])
-    with mock.patch.object(module, "fetch_proxy_from_api", side_effect=fetch) as fetcher:
+    request = mock.Mock(dispose=mock.AsyncMock())
+    playwright = mock.Mock()
+    playwright.request.new_context = mock.AsyncMock(return_value=request)
+    with mock.patch.object(module, "fetch_proxy_from_api_async", side_effect=fetch) as fetcher, \
+         mock.patch.object(module, "fetch_proxy_from_api", side_effect=AssertionError("UI network call")):
         config = start_without_real_worker(app)
-        fetcher.assert_called()
-        assert fetcher.call_count == 2
-        fetcher.side_effect = AssertionError("proxy resolved twice")
+        fetcher.assert_not_called()
+        assert not config["proxy_snapshot_complete"]
         async def resolve():
+            jobs = [{"idx": 1}, {"idx": 2}]
+            await app.prepare_run_proxies(playwright, jobs)
+            assert fetcher.await_count == 2
+            assert [job["assigned_proxy_str"] for job in jobs] == ["127.0.0.1:62001", "127.0.0.1:62002"]
+            fetcher.side_effect = AssertionError("proxy resolved twice")
             return await asyncio.gather(app.resolve_effective_proxy(1, "old:8000"),
                                         app.resolve_effective_proxy(2, "old:8000"))
-        assert asyncio.run(resolve()) == [config["resolved_proxies"][1], config["resolved_proxies"][2]]
+        assert asyncio.run(resolve()) == ["127.0.0.1:62001", "127.0.0.1:62002"]
+        assert app.run_config["proxy_snapshot_complete"]
+        assert not config["proxy_snapshot_complete"]
+    request.dispose.assert_awaited_once()
 
 
 def test_failed_proxy_capture_cannot_fallback_to_machine_ip():
     app = make_start_app()
     app.proxy_mode.get.return_value = "rotating_api"
     app.ent_proxy_api.get.return_value = "API"
-    with mock.patch.object(module, "fetch_proxy_from_api", side_effect=TimeoutError("proxy timeout")):
-        start_without_real_worker(app)
+    start_without_real_worker(app)
+    request = mock.Mock(dispose=mock.AsyncMock())
+    playwright = mock.Mock()
+    playwright.request.new_context = mock.AsyncMock(return_value=request)
     async def resolve():
-        with pytest.raises(ConnectionError, match="proxy timeout"):
+        await app.prepare_run_proxies(playwright, [{"idx": 1}])
+        with pytest.raises(ConnectionError, match="TimeoutError"):
             await app.resolve_effective_proxy(1, None)
-    asyncio.run(resolve())
+    with mock.patch.object(module, "fetch_proxy_from_api_async", side_effect=TimeoutError("proxy timeout")):
+        asyncio.run(resolve())
+    request.dispose.assert_awaited_once()
 
 
 class Resource:

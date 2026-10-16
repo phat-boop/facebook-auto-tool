@@ -1870,7 +1870,8 @@ class PageWaitTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(state["page_wait_remaining"], 30)
             self.assertIn("→", client_app.page_wait_label(state))
             self.assertEqual(client_app.page_wait_label(self.app.account_states.get(2)), "-")
-            choose.assert_called_once_with(30, 60)
+            self.assertEqual(choose.call_args_list[0], mock.call(30, 60))
+            self.assertEqual(choose.call_args_list.count(mock.call(30, 60)), 1)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task

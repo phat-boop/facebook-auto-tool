@@ -27,7 +27,8 @@ def batch_app(page_workers=1, threads=5, batch_size=5, selected=None):
     app.guard_facebook_checkpoint = mock.AsyncMock()
     app.authenticate_facebook_account = mock.AsyncMock(return_value=(module.LOGIN_SUCCESS, "verified"))
     app.lbl_stat_running, app.lbl_stat_success, app.lbl_stat_failed = (mock.Mock() for _ in range(3))
-    app.reload_table_from_text()
+    # Explicitly select the replacement fixture accounts, not the old UIDs.
+    app.reload_table_from_text(checked_indexes=set(range(1, 6)))
     if selected is not None:
         for item in app.tree.get_children():
             values = list(app.tree.item(item, "values"))

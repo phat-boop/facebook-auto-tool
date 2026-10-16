@@ -30,6 +30,27 @@ For publishing, activate the same environment first. Git and an authenticated
 GitHub CLI must be on PATH, and the branch must be `main`. Then use the existing
 `release.ps1` flow. Build/test failure must never be skipped.
 
+For a local tested build without changing Git, GitHub, or `version.json`:
+
+```powershell
+.\release.ps1 -BuildOnly
+```
+
+The script prefers `.venv-build\Scripts\python.exe` and uses the same interpreter
+for syntax checks, pytest, and PyInstaller. Override it with `-PythonPath` when
+needed. Test counts are dynamic; a nonzero pytest exit code stops the build.
+Fresh build outputs are verified before replacing `dist/client_app.exe`, so
+failed tests, failed builds, or a locked destination leave the old EXE intact.
+
+For an actual GitHub publication, specify a new, unused version:
+
+```powershell
+.\release.ps1 2.4.5 "Fix account selection, Page verification and proxy preparation"
+```
+
+Publication still checks the downloaded asset's SHA256 before publishing the
+draft and updates `version.json` last. Existing tags/releases are never overwritten.
+
 Commit the spec, dependency manifests, assets, local helper modules and tests with
 the release source. Do not commit `.venv-build`, `build`, `dist` or credentials.
 The previous source-like backup is preserved in `archive/`, and the detailed

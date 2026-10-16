@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import random
 from datetime import datetime
 
@@ -84,16 +85,14 @@ TEN_VIET = [
     "Tâm", "Thái", "Thắng", "Thanh", "Thảo", "Thịnh", "Thu", "Thuận", "Thư", "Thương", "Tiến", "Toàn", "Trang", "Trí",
     "Trinh", "Trúc", "Trung", "Tú", "Tuấn", "Tùng", "Uyên", "Vân", "Việt", "Vinh", "Vũ", "Vy", "Yến"
 ]
-HAU_TO_PAGE = ["", " - Blog Cá Nhân", " Cuộc Sống", " Chia Sẻ", " Daily", " Góc Nhỏ", " Kỷ Niệm"]
 
 
 def generate_random_person_name():
-    """Tự động kết hợp ngẫu nhiên tạo ra hơn 500+ tên người Việt Nam thực tế"""
+    """Generate a Vietnamese full name without Page suffixes."""
     ho = random.choice(HO_VIET)
     dem = random.choice(DEM_VIET)
     ten = random.choice(TEN_VIET)
-    hau_to = random.choice(HAU_TO_PAGE)
-    return f"{ho} {dem} {ten}{hau_to}".strip()
+    return f"{ho} {dem} {ten}"
 
 
 def parse_page_plan(value: str):
@@ -212,7 +211,7 @@ def page_creation_notice_matches(text, page_name):
         return False
     text = normalize_ui_text(text)
     return any(re.search(pattern, text) for pattern in (
-        rf"(?<!\w){name}\s+was created(?:[.!]|$|\s+now\b)",
+        rf"(?<!\w){name}\s+was created(?:\b|[.!]|$)",
         rf"success!\s+you['’]ve created\s+{name}(?:[.!]|$)",
         rf"(?<!\w){name}\s+đã được tạo(?:[.!]|$)",
         rf"(?:thành công[!:]?\s*)bạn đã tạo\s+{name}(?:[.!]|$)",
@@ -226,7 +225,9 @@ PAGE_CREATION_EVIDENCE = r"""() => {
     const urlIdMatch = (location.search || '').match(/(?:^|[?&])id=(\d{5,})(?:&|$)/)
         || (location.pathname || '').match(/\/(?:profile\.php\/)?(\d{5,})(?:\/|$)/);
     const cookieIdMatch = (document.cookie || '').match(/(?:^|;\s*)i_user=(\d{5,})/);
-    const pageId = data?.getAttribute('data-page-id') || match?.[1] || urlIdMatch?.[1] || cookieIdMatch?.[1] || '';
+    // A numeric profile URL also identifies users; it is not Page-type evidence.
+    const typedPageId = data?.getAttribute('data-page-id') || match?.[1] || cookieIdMatch?.[1] || '';
+    const pageId = typedPageId || urlIdMatch?.[1] || '';
 
     const visible = el => Boolean(el && el.getClientRects && el.getClientRects().length > 0);
     const ignoredHeadings = new Set([
@@ -246,7 +247,7 @@ PAGE_CREATION_EVIDENCE = r"""() => {
 
     return {
         page_id: pageId,
-        page_type: pageId ? 'PAGE' : '',
+        page_type: typedPageId ? 'PAGE' : '',
         name: headingTexts[0] || '',
         names: Array.from(new Set(headingTexts)),
         canonical: validCanonical
@@ -327,8 +328,8 @@ RATE_LIMIT_PATTERNS = (
     "giới hạn tạo trang", "page creation limit",
     "tạm thời bị chặn", "temporarily blocked",
     "thử lại sau", "try again later",
-    "??? ??", "????????", "????", "????",
-    "?????????????????", "terlalu banyak halaman",
+    "제한에 도달", "上限に達しました", "達到上限", "已达上限",
+    "สร้างเพจมากเกินไป", "terlalu banyak halaman",
 )
 
 POLICY_REJECT_PATTERNS = (
@@ -339,10 +340,9 @@ POLICY_REJECT_PATTERNS = (
 
 
 def classify_facebook_page_feedback(alerts, body_text, page_name=""):
-    """Ph?n lo?i ch?nh x?c th?ng b?o ph?n h?i c?a Facebook khi t?o Page."""
+    """Phân loại chính xác thông báo phản hồi của Facebook khi tạo Page."""
     alert_norm = normalize_ui_text(" ".join(alerts or []))
     body_norm = normalize_ui_text(body_text or "")
-    combined = f"{alert_norm} {body_norm}".strip()
 
     if page_name and any(page_creation_notice_matches(txt, page_name) for txt in [*(alerts or []), body_text or ""]):
         return "CREATED_NOTICE", "Facebook xác nhận Page đã được khởi tạo."
@@ -552,11 +552,10 @@ async def select_page_category(self, page, category_input, requested_category):
     aliases = {req_norm}
     blog_aliases = [
         "Blog cá nhân", "Personal blog", "Blog personnel", "Blog personal",
-        "Blog pessoal", "Persönlicher Blog", "????????????", "Blog Pribadi",
-        "???(??)", "?? ???", "????", "?????",
-        "?????? ????", "????? ?????", "Kişisel blog", "Blog",
+        "Blog pessoal", "Persönlicher Blog", "Blog Pribadi", "Kişisel blog", "Blog",
     ]
-    if req_norm in {normalize_ui_text(x) for x in blog_aliases}:
+    is_blog_category = req_norm in {normalize_ui_text(x) for x in blog_aliases}
+    if is_blog_category:
         aliases.update(normalize_ui_text(x) for x in blog_aliases)
 
     async def verify_chip(opt_text):
@@ -582,12 +581,12 @@ async def select_page_category(self, page, category_input, requested_category):
             if await option.is_visible():
                 opt_text = (await option.inner_text()).strip()
                 if normalize_ui_text(opt_text) in aliases:
-                    await option.click()
+                    await self.human_click(page, option)
                     selected = await verify_chip(opt_text)
                     return bool(selected), "" if selected else "CATEGORY_SELECTION_NOT_VERIFIED"
         return None
 
-    # L?n 1: Ch? listbox t? t? kh?a ?? g? ban ??u (VD: "Blog cá nhân")
+    # Lần 1: Chờ listbox từ từ khóa đã gõ ban đầu (VD: "Blog cá nhân")
     has_any_option = False
     try:
         await options.first.wait_for(state="visible", timeout=5000)
@@ -600,19 +599,20 @@ async def select_page_category(self, page, category_input, requested_category):
         if pick_res is not None:
             return pick_res
 
-    # L?n 2: N?u giao di?n l? Ti?ng Anh / Ngo?i ng? khi?n "Blog cá nhân" ch? hi?n 4 m?c m?c ??nh
-    # (Local service, Shopping & retail...), t? ??ng x?a v? g? l?i b?ng t? kh?a Ti?ng Anh ("Personal blog" / "Blog")
-    if hasattr(page, "keyboard"):
-        fallback_queries = ["Personal blog", "Blog"] if req_norm == normalize_ui_text("Blog cá nhân") else ["Personal blog"]
+    # Retry only equivalent names of the requested category, never another category.
+    if is_blog_category and hasattr(page, "keyboard"):
+        fallback_queries = ["Personal blog", "Blog"]
         for alt_query in fallback_queries:
             if normalize_ui_text(alt_query) == req_norm:
                 continue
             try:
-                await category_input.click()
-                await category_input.fill("")
-                await asyncio.sleep(0.3)
-                await page.keyboard.type(alt_query, delay=65)
-                await asyncio.sleep(1.8)
+                if hasattr(self, "human_clear"):
+                    await self.human_clear(page, category_input)
+                else:
+                    await category_input.fill("")
+                await asyncio.sleep(random.uniform(0.25, 0.5))
+                await self.human_type(page, category_input, alt_query)
+                await asyncio.sleep(random.uniform(1.6, 2.4))
                 await options.first.wait_for(state="visible", timeout=4000)
                 has_any_option = True
                 aliases.add(normalize_ui_text(alt_query))
@@ -621,21 +621,8 @@ async def select_page_category(self, page, category_input, requested_category):
                     return pick_res
             except Exception:
                 continue
-
     if not has_any_option:
         return False, "CATEGORY_SUGGESTIONS_NOT_AVAILABLE"
-
-    # L?n 3: N?u ch? c? duy nh?t 1 g?i ? ho?c khi ng??i d?ng d?ng m?c ??nh "Blog cá nhân"
-    # m? Facebook ch? cho ch?n t? danh s?ch m?c ??nh (Local service...), ch?n m?c h?p l? ??u ti?n
-    if req_norm == normalize_ui_text("Blog cá nhân"):
-        for index in range(await options.count()):
-            option = options.nth(index)
-            if await option.is_visible():
-                opt_text = (await option.inner_text()).strip()
-                if opt_text:
-                    await option.click()
-                    selected = await verify_chip(opt_text)
-                    return bool(selected), "" if selected else "CATEGORY_SELECTION_NOT_VERIFIED"
 
     return False, "CATEGORY_NOT_FOUND"
 
@@ -682,8 +669,8 @@ async def run_create_page(
     idx,
     targets=None,
     max_pages=5,
-    min_page_del=60,
-    max_page_del=120,
+    min_page_del=800,
+    max_page_del=900,
     resolved_proxy="",
 ):
     """
@@ -789,11 +776,26 @@ async def run_create_page(
                     return results
                 set_page_flow_state("OPEN_CREATE_PAGE", page_name)
                 async def navigate_to_creation():
-                    try:
-                        if hasattr(page, "mouse") and callable(getattr(page.mouse, "move", None)):
+                    is_real_browser = inspect.iscoroutinefunction(getattr(getattr(page, "mouse", None), "move", None))
+                    if is_real_browser:
+                        try:
                             await page.mouse.move(random.randint(80, 260), random.randint(60, 180), steps=5)
-                    except Exception:
-                        pass
+                            pages_nav = page.locator(
+                                'a[href*="/pages/?category=top"], '
+                                'a[href="https://www.facebook.com/pages/"]'
+                            ).first
+                            if await pages_nav.count() > 0 and await pages_nav.is_visible():
+                                await self.human_click(page, pages_nav)
+                                await asyncio.sleep(random.uniform(2.0, 3.5))
+                                create_new_btn = page.locator('a[href*="/pages/creation"]').first
+                                if await create_new_btn.count() > 0 and await create_new_btn.is_visible():
+                                    await self.human_click(page, create_new_btn)
+                                    await asyncio.sleep(random.uniform(2.0, 3.5))
+                                    await self.guard_facebook_checkpoint(page, idx)
+                                    if "/pages/creat" in page.url.lower():
+                                        return None
+                        except Exception:
+                            pass
                     response = await page.goto(
                         "https://www.facebook.com/pages/creation/",
                         wait_until="domcontentloaded",
@@ -943,16 +945,14 @@ async def run_create_page(
 
             await self.human_type(page, name_input, page_name)
             await asyncio.sleep(1)
-            # Tự động bắt lỗi tên không hợp lệ từ Facebook và tự sửa
-            err_notice = page.locator('div[role="alert"], div:has-text("không hợp lệ"), div:has-text("đề xuất")')
-            if await err_notice.count() > 0 and await err_notice.first.is_visible():
-                self.log(f"[!] [{acc_name}] Tên '{page_name}' bị Facebook từ chối. Đang tự động đổi sang tên thuần...")
-
-                # Lọc lấy tên thuần (bỏ các từ nối, hậu tố)
-                clean_name = page_name.split(" -")[0].split(" Official")[0].split(" Review")[0].strip()
-
-                await name_input.fill(clean_name)
-                await asyncio.sleep(1)
+            # Only validation attached to the name field can reject its value.
+            if (await name_input.get_attribute("aria-invalid") or "").casefold() == "true":
+                set_page_flow_state("FAILED", "PAGE_NAME_INVALID")
+                record_result(build_create_page_result(
+                    "FAILED", acc_name, page_name, category_name,
+                    reason="PAGE_NAME_INVALID", account_index=idx, proxy=resolved_proxy,
+                ))
+                continue
 
             # ======================================================
             # BƯỚC 4: ĐIỀN HẠNG MỤC (CHỐNG NHẦM THANH TÌM KIẾM FACEBOOK)

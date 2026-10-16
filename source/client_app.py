@@ -1,3 +1,4 @@
+import inspect
 import asyncio
 from facebook.page_creator import (
     build_create_page_result,
@@ -75,7 +76,7 @@ from result_center import (
 )
 from long_run import DuplicatePageResult, ModuleCircuitBreaker, SingleInstanceLock, app_circuit_breaker
 from cryptography.fernet import Fernet, InvalidToken
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 
 ENABLE_DEBUG_LOG = False
 MAX_LOG_LINES = 1000
@@ -124,7 +125,7 @@ def transition_page_context(page_context, state, page_identity=None):
     )
 
 # ==================== THÔNG TIN PHIÊN BẢN & BẢO MẬT ====================
-CURRENT_VERSION = "2.4.4"
+CURRENT_VERSION = "2.4.5"
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/phat-boop/facebook-auto-tool/refs/heads/main/version.json"
 
 SECRET_SALT = b"FB_TOOL_SECRET_SALT_2026"
@@ -169,7 +170,6 @@ TEN_VIET = [
     "Tâm", "Thái", "Thắng", "Thanh", "Thảo", "Thịnh", "Thu", "Thuận", "Thư", "Thương", "Tiến", "Toàn", "Trang", "Trí",
     "Trinh", "Trúc", "Trung", "Tú", "Tuấn", "Tùng", "Uyên", "Vân", "Việt", "Vinh", "Vũ", "Vy", "Yến"
 ]
-HAU_TO_PAGE = ["", " - Blog Cá Nhân", " Cuộc Sống", " Chia Sẻ", " Daily", " Góc Nhỏ", " Kỷ Niệm"]
 
 
 
@@ -298,8 +298,8 @@ def page_wait_label(state):
     remaining = state.get("page_wait_remaining")
     if remaining is None:
         return "-"
-    minutes, seconds = divmod(max(0, int(remaining)), 60)
-    return f"{minutes:02d}:{seconds:02d} → {state['next_page_at'][11:19]}"
+    seconds = max(0, int(remaining))
+    return f"{seconds}s → {state['next_page_at'][11:19]}"
 
 
 class FriendRequestOutcome(tuple):
@@ -487,6 +487,25 @@ def write_create_page_results_xlsx(file_path, categorized_records, result_rows=N
     write_result_workbook(file_path, categorized_records, result_rows)
 
 
+def validate_account_identities(accounts):
+    indexes = set()
+    identities = {}
+    for account in accounts:
+        index = int(account["stt"])
+        identity = history_account_id({
+            **account, "account_id": account.get("account_id") or f"Tài khoản {index}",
+        })
+        if index in indexes:
+            raise ValueError(f"STT {index} xuất hiện nhiều lần trong danh sách.")
+        if identity in identities:
+            raise ValueError(
+                f"Dữ liệu trùng UID {identity} tại dòng {identities[identity]} và {index}. "
+                "Hãy giữ lại một dòng cho mỗi UID trước khi chạy."
+            )
+        indexes.add(index)
+        identities[identity] = index
+
+
 class AccountStateStore:
     def __init__(self, history=None):
         self._lock = threading.RLock()
@@ -499,7 +518,9 @@ class AccountStateStore:
             self.history.save(state, module, event_type, message, task_event=task_event)
 
     def sync(self, accounts):
+        accounts = tuple(accounts)
         with self._lock:
+            validate_account_identities(accounts)
             previous = {history_account_id(state): state for state in self._states.values()}
             active_indexes = set()
             for account in accounts:
@@ -563,6 +584,8 @@ class AccountStateStore:
                             self._states[index]["login_mode"] = saved["login_mode"]
                 else:
                     self._states[index] = existing
+                    if not existing.get("is_processing"):
+                        existing.pop("effective_proxy", None)
                     existing["stt"] = index
                     existing["account_id"] = account_id
                     existing["country"] = str(account.get("country") or "")
@@ -902,7 +925,7 @@ def split_account_metadata(raw_line):
 
 
 def build_uid_fingerprint_script(seed_value):
-    """T?o script ch?ng ph?t hi?n v?n tay tr?nh duy?t (CPU, RAM, WebGL, Canvas, Audio) c? ??nh theo t?ng t?i kho?n."""
+    """Tạo script chống phát hiện vân tay trình duyệt (CPU, RAM, WebGL, Canvas, Audio) cố định theo từng tài khoản."""
     seed_num = sum((i + 1) * ord(ch) for i, ch in enumerate(str(seed_value or "1")))
     cores = (4, 6, 8, 12, 16)[seed_num % 5]
     memory = (4, 8, 8, 16)[seed_num % 4]
@@ -915,6 +938,7 @@ def build_uid_fingerprint_script(seed_value):
     vendor, renderer = gpus[seed_num % len(gpus)]
     canvas_shift = (seed_num % 7) - 3 or 1
     return f"""
+        try {{ document.cookie = 'locale=en_US; path=/; domain=.facebook.com; max-age=31536000'; }} catch (e) {{}}
         Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
         try {{ delete navigator.__proto__.webdriver; }} catch (e) {{}}
         Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {cores} }});
@@ -973,6 +997,41 @@ def resolve_account_proxy(account_proxy, resolved_proxies, account_index):
         return inline_proxy
     resolved = str((resolved_proxies or {}).get(int(account_index), "") or "").strip()
     return "" if resolved in {"", "Không dùng"} else resolved
+
+
+def proxy_configuration_signature(config):
+    mode = config.get("proxy_mode", "round_robin")
+    source = {
+        "mode": mode,
+        "proxies": [line.strip() for line in str(config.get("proxies") or "").splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")],
+        "ratio": str(config.get("proxy_ratio", 20)),
+        "api": str(config.get("proxy_api") or "").strip() if mode == "rotating_api" else "",
+    }
+    return hashlib.sha256(json.dumps(source, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def inspector_network_context(account, config=None):
+    """Bind the inspector to this UID's captured route, never another row's proxy."""
+    identity = history_account_id(account)
+    proxy = str(account.get("effective_proxy") or account.get("proxy") or "").strip()
+    required = bool(account.get("proxy_required", False)) or proxy not in {"", "Không dùng"}
+    if config:
+        mode = config.get("proxy_mode", "round_robin")
+        required = required or bool(config.get("proxy_required", False)) or (
+            mode == "rotating_api" or bool(str(config.get("proxies") or "").strip())
+        )
+        index = next((index for index, captured in config.get("parsed_accounts", {}).items()
+                      if history_account_id(captured) == identity), None)
+        if index is None:
+            raise ValueError("Tài khoản không có trong cấu hình mạng đã chụp; hãy nạp lại tài khoản.")
+        if config.get("proxy_errors", {}).get(index):
+            raise ConnectionError("Proxy của tài khoản đang lỗi; không mở bằng IP thật.")
+        if mode == "rotating_api" and not config.get("proxy_snapshot_complete", False):
+            raise ConnectionError("Proxy API chưa sẵn sàng; không mở bằng IP thật.")
+        proxy = str(config.get("resolved_proxies", {}).get(index) or "").strip()
+    proxy = "" if proxy == "Không dùng" else proxy
+    return {"account_id": identity, "proxy": proxy, "required": required or bool(proxy)}
 
 
 
@@ -1209,6 +1268,13 @@ def consume_cleanup_result(task):
         task.exception()
 
 
+def is_browser_target_closed_error(error):
+    return isinstance(error, PlaywrightError) and (
+        type(error).__name__ == "TargetClosedError"
+        or "Target page, context or browser has been closed" in str(error)
+    )
+
+
 async def close_browser_resources(context=None, browser=None, page=None, close_timeout=BROWSER_CLOSE_TIMEOUT):
     """Bound each close independently; cancellation cannot skip remaining resources."""
     async def close_all():
@@ -1225,7 +1291,8 @@ async def close_browser_resources(context=None, browser=None, page=None, close_t
             except asyncio.CancelledError:
                 errors.append(RuntimeError("Browser resource close was cancelled"))
             except Exception as exc:
-                errors.append(exc)
+                if not is_browser_target_closed_error(exc):
+                    errors.append(exc)
         if not closing:
             return errors
         done, pending = await asyncio.wait(closing, timeout=close_timeout)
@@ -1239,7 +1306,8 @@ async def close_browser_resources(context=None, browser=None, page=None, close_t
             except asyncio.CancelledError:
                 errors.append(RuntimeError("Browser resource close was cancelled"))
             except Exception as exc:
-                errors.append(exc)
+                if not is_browser_target_closed_error(exc):
+                    errors.append(exc)
         return errors
 
     cleanup = asyncio.create_task(close_all(), name="browser-cleanup")
@@ -1805,13 +1873,10 @@ def reset_rotating_proxy(api_url: str):
     except Exception:
         return False
 
-def fetch_proxy_from_api(api_input: str) -> str:
-    """Tự động nhận diện Key hoặc Link API SuiProxy/TMProxy để lấy IP:Port mới nhất"""
+def proxy_api_request_settings(api_input):
     raw_val = api_input.strip()
     if not raw_val:
-        return ""
-
-    # 1. Nếu khách chỉ dán Key SuiProxy (không có http) -> Tự ghép link chuẩn
+        return "", {}
     if not raw_val.startswith("http"):
         request_url = f"https://api.suiproxy.com/api/proxy/get-new-proxy?api_key={raw_val}"
         api_key_header = raw_val
@@ -1828,39 +1893,55 @@ def fetch_proxy_from_api(api_input: str) -> str:
     if api_key_header:
         headers['X-API-KEY'] = api_key_header
 
+    return request_url, headers
+
+
+def parse_proxy_api_response(data):
+    data = data.strip()
+    if parse_proxy(data):
+        return data
+    if "{" in data and "}" in data:
+        payload = json.loads(data)
+        if isinstance(payload, dict):
+            for key in ("proxyHttp", "proxy", "http", "https", "ip_port"):
+                value = payload.get(key)
+                if isinstance(value, str) and ":" in value:
+                    return value.strip()
+            nested = payload.get("data")
+            if isinstance(nested, dict):
+                for key in ("proxyHttp", "proxy", "http", "https", "ip_port"):
+                    value = nested.get(key)
+                    if isinstance(value, str) and ":" in value:
+                        return value.strip()
+                if "ip" in nested and "port" in nested:
+                    return f"{nested['ip']}:{nested['port']}"
+            elif isinstance(nested, str) and ":" in nested:
+                return nested.strip()
+    return ""
+
+
+def fetch_proxy_from_api(api_input: str) -> str:
+    """Compatibility helper for callers outside the asynchronous run flow."""
+    request_url, headers = proxy_api_request_settings(api_input)
+    if not request_url:
+        return ""
     try:
         req = urllib.request.Request(request_url, headers=headers)
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = resp.read().decode('utf-8', errors='ignore').strip()
-            
-            # Xử lý phản hồi JSON chuẩn SuiProxy
-            if "{" in data and "}" in data:
-                res_json = json.loads(data)
-
-                # Trường hợp SuiProxy: trả về trực tiếp proxyHttp / proxy
-                for k in ["proxyHttp", "proxy", "http", "https", "ip_port"]:
-                    if k in res_json and isinstance(res_json[k], str) and ":" in res_json[k]:
-                        return res_json[k].strip()
-
-                # Trường hợp bọc trong object "data"
-                if "data" in res_json:
-                    d = res_json["data"]
-                    if isinstance(d, dict):
-                        for k in ["proxyHttp", "proxy", "http", "https", "ip_port"]:
-                            if k in d and isinstance(d[k], str) and ":" in d[k]:
-                                return d[k].strip()
-                        if "ip" in d and "port" in d:
-                            return f"{d['ip']}:{d['port']}"
-                    elif isinstance(d, str) and ":" in d:
-                        return d.strip()
-
-            # Trường hợp trả về text thuần IP:Port
-            ip_port_match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{2,5})', data)
-            if ip_port_match:
-                return ip_port_match.group(1)
+        return parse_proxy_api_response(data)
     except Exception:
-        pass
-    return ""
+        return ""
+
+
+async def fetch_proxy_from_api_async(api_input, request):
+    request_url, headers = proxy_api_request_settings(api_input)
+    if not request_url:
+        raise ValueError("API proxy chưa được cấu hình.")
+    response = await request.get(request_url, headers=headers, timeout=15000)
+    if response.status >= 400:
+        raise ConnectionError(f"Proxy API HTTP {response.status}")
+    return parse_proxy_api_response(await response.text())
 
 def generate_totp_code(secret_key: str) -> str:
     """Tạo mã TOTP hiện tại từ secret Base32."""
@@ -2326,7 +2407,14 @@ class ImportAccountDialog(tk.Toplevel):
             messagebox.showwarning("Cookie không hợp lệ", invalid_message, parent=self)
             return
 
-        self.on_import_callback(parsed_accounts)
+        try:
+            validate_account_identities([
+                {**account, "stt": index} for index, account in enumerate(parsed_accounts, 1)
+            ])
+            self.on_import_callback(parsed_accounts)
+        except ValueError as exc:
+            messagebox.showwarning("Nhập tài khoản", str(exc), parent=self)
+            return
         message = f"Đã nạp thành công {len(parsed_accounts)} tài khoản vào bảng!"
         if invalid_message:
             messagebox.showwarning("Nhập tài khoản", f"{message}\n{invalid_message}", parent=self)
@@ -2554,8 +2642,8 @@ class MainToolApp:
 
         min_delay = self._bounded_int(self.ent_min_delay.get(), 25, 0, 86400)
         max_delay = self._bounded_int(self.ent_max_delay.get(), 35, 0, 86400)
-        min_page_delay = self._bounded_int(self.ent_min_page_delay.get(), 60, 0, 86400)
-        max_page_delay = self._bounded_int(self.ent_max_page_delay.get(), 120, 0, 86400)
+        min_page_delay = self._bounded_int(self.ent_min_page_delay.get(), 800, 0, 86400)
+        max_page_delay = self._bounded_int(self.ent_max_page_delay.get(), 900, 0, 86400)
         parsed_accounts = {
             index: self.account_states.get(index, include_logs=False)
             for index in self.account_states.indexes()
@@ -2600,24 +2688,9 @@ class MainToolApp:
         values["auto_headless"] = values["threads"] > 12 and not values["headless"]
         if values["auto_headless"]:
             values["headless"] = True
-        # Bind proxies once before starting workers; preserve per-account API failures.
-        selected = self.parse_range_string(values["selected_indexes"]) or checked_indexes
-        proxy_errors = {}
-        for index, account in parsed_accounts.items():
-            if selected and index not in selected:
-                continue
-            proxy = resolve_account_proxy(account.get("proxy"), resolved_proxies, index)
-            if values["proxy_mode"] == "rotating_api" and values["proxy_api"]:
-                try:
-                    proxy = fetch_proxy_from_api(values["proxy_api"])
-                    if not proxy or not parse_proxy(proxy):
-                        raise ValueError("API proxy không trả về proxy hợp lệ.")
-                except Exception as exc:
-                    proxy_errors[index] = f"{type(exc).__name__}: {exc}"
-                    proxy = ""
-            resolved_proxies[index] = proxy
-        values["proxy_errors"] = proxy_errors
-        values["proxy_snapshot_complete"] = True
+        # Network preparation happens asynchronously before any browser is opened.
+        values["proxy_errors"] = {}
+        values["proxy_snapshot_complete"] = values["proxy_mode"] != "rotating_api"
         return RunConfig(values)
 
     def _build_layout(self):
@@ -3087,15 +3160,23 @@ class MainToolApp:
             setattr(self, attribute, entry)
             tk.Label(row, text="giây", font=("Segoe UI", 12), fg="#E2E8F0", bg="#131C2E").pack(side="left")
 
-        f4_tele = tk.Frame(card4, bg="#131C2E")
-        f4_tele.pack(fill="x", pady=(2, 0))
-        tk.Label(f4_tele, text="Telegram Token:", font=("Segoe UI", 10), fg="#94A3B8", bg="#131C2E").pack(side="left")
-        self.ent_tele_token = tk.Entry(f4_tele, width=16, font=("Segoe UI", 10), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
-        self.ent_tele_token.pack(side="left", padx=2)
+        self.ent_tele_token = tk.StringVar(self.root, value="")
+        self.ent_tele_chatid = tk.StringVar(self.root, value="")
 
-        tk.Label(f4_tele, text="Chat ID:", font=("Segoe UI", 10), fg="#94A3B8", bg="#131C2E").pack(side="left", padx=(4, 2))
-        self.ent_tele_chatid = tk.Entry(f4_tele, width=10, font=("Segoe UI", 10), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
-        self.ent_tele_chatid.pack(side="left")
+        feed_after_page = tk.Frame(card4, bg="#131C2E")
+        feed_after_page.pack(fill="x", pady=3)
+        tk.Label(feed_after_page, text="Lướt Feed sau khi tạo Page:", font=("Segoe UI", 13), fg="#E2E8F0", bg="#131C2E").pack(anchor="w")
+        feed_range = tk.Frame(feed_after_page, bg="#131C2E")
+        feed_range.pack(anchor="w", pady=(2, 0))
+        for attribute, default in (("ent_min_page_delay", "800"), ("ent_max_page_delay", "900")):
+            if attribute == "ent_max_page_delay":
+                tk.Label(feed_range, text="-", font=("Segoe UI", 13), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=4)
+            entry = tk.Spinbox(feed_range, from_=0, to=86400, width=5, font=("Segoe UI", 13), bg="#070B14", fg="#38BDF8", justify="center", relief="solid", bd=1)
+            entry.delete(0, "end")
+            entry.insert(0, default)
+            entry.pack(side="left", padx=4)
+            setattr(self, attribute, entry)
+        tk.Label(feed_range, text="giây", font=("Segoe UI", 12), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=4)
 
         card5 = tk.Frame(f_settings, bg="#131C2E", highlightbackground="#1E293B", highlightthickness=1, padx=12, pady=8)
         card5.pack(fill="x", pady=(0, 4))
@@ -3124,15 +3205,6 @@ class MainToolApp:
         self.ent_page_target = tk.Entry(f5_page, width=4, font=("Segoe UI", 12), bg="#070B14", fg="#38BDF8", relief="solid", bd=1)
         self.ent_page_target.insert(0, "5")
         self.ent_page_target.pack(side="left", padx=2)
-
-        tk.Label(f5_page, text="Delay Page (s):", font=("Segoe UI", 12), fg="#E2E8F0", bg="#131C2E").pack(side="left", padx=(12, 2))
-        self.ent_min_page_delay = tk.Entry(f5_page, width=4, font=("Segoe UI", 12), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
-        self.ent_min_page_delay.insert(0, "60")
-        self.ent_min_page_delay.pack(side="left", padx=2)
-        tk.Label(f5_page, text="-", font=("Segoe UI", 12), fg="#E2E8F0", bg="#131C2E").pack(side="left")
-        self.ent_max_page_delay = tk.Entry(f5_page, width=4, font=("Segoe UI", 12), bg="#070B14", fg="#FFFFFF", relief="solid", bd=1)
-        self.ent_max_page_delay.insert(0, "120")
-        self.ent_max_page_delay.pack(side="left", padx=2)
 
         f5_workers = tk.Frame(card5, bg="#131C2E")
         f5_workers.pack(fill="x", pady=3)
@@ -4020,6 +4092,62 @@ class MainToolApp:
         self.post_ui(update_proxy)
         return effective_proxy
 
+    async def prepare_run_proxies(self, playwright_instance, account_jobs):
+        """Resolve each API proxy once without blocking Tk or opening browsers."""
+        config = self.run_config
+        if config.get("proxy_snapshot_complete", True):
+            return
+        resolved = dict(config.get("resolved_proxies", {}))
+        errors = dict(config.get("proxy_errors", {}))
+        api = config.get("proxy_api", "")
+        request = None
+        tasks = []
+        limiter = asyncio.Semaphore(min(3, max(1, int(config.get("threads", 3)))))
+
+        async def resolve(job):
+            index = job["idx"]
+            async with limiter:
+                if self.stop_requested:
+                    raise asyncio.CancelledError()
+                self.set_account_state(index, current_action="Đang lấy proxy trước khi mở trình duyệt")
+                try:
+                    if not api:
+                        raise ValueError("API xoay chưa được cấu hình; không dùng IP thật.")
+                    proxy = await fetch_proxy_from_api_async(api, request)
+                    if not proxy or not parse_proxy(proxy):
+                        raise ValueError("API proxy không trả về proxy hợp lệ.")
+                    resolved[index] = proxy
+                    errors.pop(index, None)
+                    job["assigned_proxy_str"] = proxy
+                except Exception as exc:
+                    # Playwright network errors may contain a secret API URL.
+                    detail = str(exc) if isinstance(exc, (ValueError, ConnectionError)) else "Không lấy được proxy từ API."
+                    errors[index] = f"{type(exc).__name__}: {detail}"
+                    resolved[index] = ""
+                    job["assigned_proxy_str"] = None
+
+        try:
+            if api:
+                request = await playwright_instance.request.new_context()
+            tasks = [asyncio.create_task(resolve(job)) for job in account_jobs]
+            await asyncio.gather(*tasks)
+            if self.stop_requested:
+                raise asyncio.CancelledError()
+            values = dict(config)
+            values.update(resolved_proxies=resolved, proxy_errors=errors, proxy_snapshot_complete=True)
+            self.run_config = RunConfig(values)
+        finally:
+            for task in tasks:
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if request is not None:
+                try:
+                    await asyncio.wait_for(request.dispose(), timeout=BROWSER_CLOSE_TIMEOUT)
+                except Exception as exc:
+                    self.log(f"[ERROR] Không đóng được kết nối API proxy: {type(exc).__name__}")
+
     def stop_checkpoint_account(self, index):
         state = self.account_states.get(index)
         if state is None or state.get("checkpoint_stopped"):
@@ -4204,13 +4332,18 @@ class MainToolApp:
 
     def add_accounts_to_table(self, account_list):
         source_lines = self._normalize_account_input()
+        records = dict(self._account_import_records)
         for account in account_list:
             record = runtime_account_record(account)
             if record is None:
                 record = import_account_record(account.get("raw", ""), len(source_lines) + 1)
             if record is not None:
                 source_lines.append(record.cookie)
-                self._account_import_records[len(source_lines)] = record
+                records[len(source_lines)] = record
+        validate_account_identities([
+            {**record.to_account_dict(), "stt": index} for index, record in records.items()
+        ])
+        self._account_import_records = records
         self.txt_accounts.delete("1.0", "end")
         if source_lines:
             self.txt_accounts.insert("1.0", "\n".join(source_lines) + "\n")
@@ -4273,6 +4406,7 @@ class MainToolApp:
             "targets": self.txt_targets.get("1.0", "end").strip(),
             "selected_modes": modes_saved,
             "proxy_mode": self.proxy_mode.get(),
+            "proxy_api": protect_setting(self.ent_proxy_api.get().strip()),
             "proxy_ratio": self.ent_proxy_ratio.get(),
             "threads": self.ent_threads.get(),
             "batch_size": self.ent_batch_size.get(),
@@ -4283,8 +4417,8 @@ class MainToolApp:
             "target": self.ent_target.get(),
             "page_target": self.ent_page_target.get() if hasattr(self, 'ent_page_target') else "5",
             "max_create_page_workers": self.ent_max_create_page_workers.get() if hasattr(self, 'ent_max_create_page_workers') else "3",
-            "min_page_delay": self.ent_min_page_delay.get() if hasattr(self, 'ent_min_page_delay') else "60",
-            "max_page_delay": self.ent_max_page_delay.get() if hasattr(self, 'ent_max_page_delay') else "120",
+            "min_page_delay": self.ent_min_page_delay.get() if hasattr(self, 'ent_min_page_delay') else "800",
+            "max_page_delay": self.ent_max_page_delay.get() if hasattr(self, 'ent_max_page_delay') else "900",
             "min_delay": self.ent_min_delay.get(),
 
             "max_delay": self.ent_max_delay.get(),
@@ -4323,6 +4457,9 @@ class MainToolApp:
                     if k in CORE_AUTOMATION_MODES and k in self.mode_vars:
                         self.mode_vars[k].set(val)
             if "proxy_mode" in data: self.proxy_mode.set(data["proxy_mode"])
+            if "proxy_api" in data:
+                self.ent_proxy_api.delete(0, "end")
+                self.ent_proxy_api.insert(0, unprotect_setting(data["proxy_api"]))
             if "proxy_ratio" in data: self.ent_proxy_ratio.delete(0, "end"); self.ent_proxy_ratio.insert(0, data["proxy_ratio"])
             if "threads" in data: self.ent_threads.delete(0, "end"); self.ent_threads.insert(0, data["threads"])
             if "batch_size" in data: self.ent_batch_size.delete(0, "end"); self.ent_batch_size.insert(0, data["batch_size"])
@@ -4350,8 +4487,8 @@ class MainToolApp:
             if "min_delay" in data: self.ent_min_delay.delete(0, "end"); self.ent_min_delay.insert(0, data["min_delay"])
             if "max_delay" in data: self.ent_max_delay.delete(0, "end"); self.ent_max_delay.insert(0, data["max_delay"])
             if "check_notif" in data: self.chk_check_notif.set(data["check_notif"])
-            if "tele_token" in data: self.ent_tele_token.delete(0, "end"); self.ent_tele_token.insert(0, unprotect_setting(data["tele_token"]))
-            if "tele_chatid" in data: self.ent_tele_chatid.delete(0, "end"); self.ent_tele_chatid.insert(0, data["tele_chatid"])
+            if "tele_token" in data: self.ent_tele_token.set(unprotect_setting(data["tele_token"]))
+            if "tele_chatid" in data: self.ent_tele_chatid.set(data["tele_chatid"])
             
             self.reload_table_from_text()
         except Exception as e:
@@ -4362,6 +4499,7 @@ class MainToolApp:
     def on_close(self):
         if self.close_requested:
             return
+        self.cancel_uid_checks()
         try:
             self.save_settings()
         except Exception:
@@ -4466,8 +4604,11 @@ class MainToolApp:
     def reload_table_from_text(self, checked_indexes=None, normalize_before_run=False):
         if getattr(self, "is_running", False) and not normalize_before_run:
             return
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        previous_rows = tuple(self.tree.get_children())
+        checked_uids = {
+            str(values[2]) for item in previous_rows
+            if len(values := self.tree.item(item, "values")) >= 3 and values[0] == "[✔]"
+        }
 
         raw_acc_lines = self._normalize_account_input()
         proxy_lines = [p.strip() for p in self.txt_proxies.get("1.0", "end").splitlines() if p.strip() and not p.startswith("#")]
@@ -4514,12 +4655,27 @@ class MainToolApp:
 
             account_records[-1]["proxy"] = "" if assigned_proxy == "Không dùng" else assigned_proxy
 
+        try:
+            self.account_states.sync(account_records)
+        except ValueError as exc:
+            error = str(exc)
+            if error != getattr(self, "_account_import_error", None):
+                self.log(f"[ERROR][IMPORT] {error}")
+            self._account_import_error = error
+            if hasattr(self, "lbl_acc_count"):
+                self.lbl_acc_count.config(text="Dữ liệu trùng UID/STT")
+            return False
+        self._account_import_error = None
+        for item in previous_rows:
+            self.tree.delete(item)
+        for account in account_records:
+            idx = account["stt"]
+            # A refresh must not move a checkmark to a different UID at the same STT.
+            checked = (idx in checked_indexes if checked_indexes is not None
+                       else not previous_rows or str(account["uid"]) in checked_uids)
             self.tree.insert("", "end", iid=str(idx), values=management_account_values(
-                {**parsed, "stt": idx, "status": "UNKNOWN", "current_action": "Chưa chạy"},
-                checked_indexes is None or idx in checked_indexes,
+                {**account, "status": "UNKNOWN", "current_action": "Chưa chạy"}, checked,
             ), tags=("UNKNOWN",))
-
-        self.account_states.sync(account_records)
         for index in self.account_states.indexes():
             item_id = str(index)
             self.refresh_management_account_row(index)
@@ -4535,12 +4691,14 @@ class MainToolApp:
                 self.lbl_tree_empty.place_forget()
             else:
                 self.lbl_tree_empty.place(relx=0.5, rely=0.5, anchor="center")
+        return True
 
     def start_thread(self):
         if self.run_thread and self.run_thread.is_alive():
             self.log("[!] Tiến trình trước vẫn đang dọn dẹp. Vui lòng thử lại sau 2 giây.")
             return
 
+        self.cancel_uid_checks()
         self._run_generation = getattr(self, "_run_generation", 0) + 1
         self._finished_run_generation = None
         self._cancel_requested_generation = None
@@ -4559,18 +4717,20 @@ class MainToolApp:
             if not any(line.strip() and not line.lstrip().startswith("#")
                        for line in self.txt_accounts.get("1.0", "end").splitlines()):
                 raise ValueError("Không có tài khoản để chạy.")
-            checked_indexes = {
-                int(self.tree.item(item, "values")[1])
-                for item in self.tree.get_children()
-                if str(self.tree.item(item, "values")[0]) == "[✔]"
-                and str(self.tree.item(item, "values")[1]).isdigit()
-            }
-            self.reload_table_from_text(checked_indexes=checked_indexes or None)
+            if self.reload_table_from_text() is False:
+                raise ValueError(self._account_import_error)
             if not self.account_states.indexes():
                 raise ValueError("Không có tài khoản hợp lệ để chạy.")
             self.run_config = self.capture_run_config()
-            selected = self.parse_range_string(self.run_config.get("selected_indexes", "")) or self.run_config.get("checked_indexes", set())
-            self.run_account_indexes = set(selected) if selected else set(self.account_states.indexes())
+            manual_selection = self.run_config.get("selected_indexes", "")
+            selected = self.parse_range_string(manual_selection)
+            if manual_selection and not selected:
+                raise ValueError("Chọn STT chạy không hợp lệ.")
+            if not manual_selection:
+                selected = self.run_config.get("checked_indexes", self.account_states.indexes())
+            self.run_account_indexes = set(selected) & set(self.account_states.indexes())
+            if not self.run_account_indexes:
+                raise ValueError("Chưa chọn tài khoản nào để chạy.")
             self.save_settings()
         except Exception as exc:
             self.run_error = f"Không chuẩn bị được lượt chạy: {type(exc).__name__}: {exc}"
@@ -4983,8 +5143,65 @@ class MainToolApp:
 
     
 
+    async def _smooth_human_scroll(self, page, deadline):
+        """Cuộn trang theo quán tính mượt mà (ease-in-out) như người thật lăn chuột."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        direction = -1 if random.random() < 0.12 else 1
+        total_distance = random.randint(140, 240) if direction < 0 else random.randint(320, 580)
+        steps = random.randint(5, 8)
+        weights = [math.sin(math.pi * (i + 1) / (steps + 1)) for i in range(steps)]
+        weight_sum = sum(weights) or 1.0
+
+        for w in weights:
+            if not self.is_running or getattr(self, "stop_requested", False):
+                return
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                return
+            delta_y = max(6, round(total_distance * (w / weight_sum))) * direction
+            try:
+                await asyncio.wait_for(page.mouse.wheel(0, delta_y), timeout=min(3.0, rem))
+            except asyncio.TimeoutError:
+                if time.monotonic() >= deadline:
+                    return
+                raise
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                return
+            await asyncio.sleep(min(0.04, rem))
+
+        # Rê chuột nhẹ trên vùng bài viết nếu mouse.move là coroutine thật của Playwright
+        move_fn = getattr(getattr(page, "mouse", None), "move", None)
+        if inspect.iscoroutinefunction(move_fn) and (deadline - time.monotonic()) > 0.6 and random.random() < 0.45:
+            try:
+                await move_fn(random.randint(140, 340), random.randint(160, 360), steps=random.randint(4, 8))
+            except Exception:
+                pass
+
+    async def verify_support_session_after_timeout(self, page, error, timeout=5.0):
+        """An optional UI timeout is recoverable only with the same verified session."""
+        if page.is_closed():
+            raise RuntimeError("Profile đã đóng trong lúc Feed đệm") from error
+        try:
+            result, detail = await asyncio.wait_for(
+                self.verify_facebook_session(page, page.context), timeout=timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("Feed đệm timeout; không xác minh được phiên Facebook") from exc
+        if result == LOGIN_CHECKPOINT:
+            log_context = getattr(self, "account_log_context", None)
+            index = log_context.get() if log_context is not None else None
+            if index is not None:
+                self.stop_checkpoint_account(index)
+            raise FacebookCheckpointStopped()
+        if result != LOGIN_SUCCESS:
+            raise RuntimeError(f"Feed đệm {type(error).__name__}: {detail}") from error
+
     async def _wait_support_activity(self, page, duration_seconds, scroll=False):
         deadline = time.monotonic() + duration_seconds
+        scroll_timeout_logged = False
         while self.is_running and not getattr(self, "stop_requested", False):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -4997,12 +5214,20 @@ class MainToolApp:
                 return
             if scroll:
                 try:
-                    await asyncio.wait_for(page.mouse.wheel(0, 500), timeout=min(5, remaining))
-                except asyncio.TimeoutError:
-                    if time.monotonic() >= deadline:
+                    await self._smooth_human_scroll(page, deadline)
+                except (asyncio.TimeoutError, PlaywrightTimeoutError) as exc:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
                         return
-                    raise
-            await asyncio.sleep(min(5 if scroll else 1, max(0, deadline - time.monotonic())))
+                    await self.verify_support_session_after_timeout(page, exc, timeout=min(5.0, remaining))
+                    if not scroll_timeout_logged:
+                        self.log("[!] Cuộn Feed phản hồi chậm; phiên vẫn hợp lệ, tiếp tục thời gian đệm.")
+                        scroll_timeout_logged = True
+                pause_time = random.uniform(1.2, 2.6)
+            else:
+                pause_time = 1.0
+            await asyncio.sleep(min(pause_time, max(0, deadline - time.monotonic())))
+
 
     async def warm_up_feed(self, page, acc_name, duration_seconds=30):
         """Browse the Feed for the configured duration, without reactions."""
@@ -5010,7 +5235,18 @@ class MainToolApp:
         if duration == 0 or not self.is_running or getattr(self, "stop_requested", False):
             return
         self.log(f"[*] [{acc_name}] Lướt Feed đệm trong {duration} giây...")
-        await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=25000)
+        current = urlparse(str(page.url or ""))
+        host = (current.hostname or "").casefold()
+        on_home = (current.scheme in {"http", "https"}
+                   and (host == "facebook.com" or host.endswith(".facebook.com"))
+                   and current.path in {"", "/", "/home.php"})
+        # Login has already verified this home page; do not load it a second time.
+        if not on_home:
+            try:
+                await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=25000)
+            except PlaywrightTimeoutError as exc:
+                await self.verify_support_session_after_timeout(page, exc)
+                self.log(f"[!] [{acc_name}] Trang chủ tải chậm nhưng phiên đã xác minh; tiếp tục Feed đệm.")
         await self._wait_support_activity(page, duration, scroll=True)
 
     async def create_browser_page(
@@ -5066,10 +5302,11 @@ class MainToolApp:
             "--disable-popup-blocking",
             "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding",
-            "--disable-features=TranslateUI",
+            "--disable-features=Translate,TranslateUI,OptimizationHints",
             "--no-default-browser-check",
             "--no-first-run",
-            "--enable-translate",
+            "--disable-translate",
+            "--lang=en-US",
             f"--window-position={pos_x},{pos_y}",
             f"--window-size={win_w},{win_h}",
         ]
@@ -5105,11 +5342,12 @@ class MainToolApp:
         try:
             # Dùng no_viewport=True để Facebook nhận diện đây là cửa sổ thật
             context_options = {"no_viewport": True, "ignore_https_errors": False}
-            if locale_options["locale"]:
-                context_options["locale"] = locale_options["locale"]
-                context_options["extra_http_headers"] = {
-                    "Accept-Language": locale_options["accept_language"]
-                }
+            effective_loc = locale_options["locale"] or "en-US"
+            effective_accept = locale_options["accept_language"] or "en-US,en;q=0.9"
+            context_options["locale"] = effective_loc
+            context_options["extra_http_headers"] = {
+                "Accept-Language": effective_accept
+            }
             normalized_timezone = normalize_account_timezone(account_timezone)
             if normalized_timezone:
                 context_options["timezone_id"] = normalized_timezone
@@ -5144,8 +5382,10 @@ class MainToolApp:
             return False
         lower, upper = sorted((max(0, int(min_delay)), max(0, int(max_delay))))
         delay = random.randint(lower, upper)
-        deadline = time.monotonic() + delay
-        next_page_at = (datetime.now() + timedelta(seconds=delay)).isoformat(timespec="seconds")
+        if delay == 0:
+            return True
+        deadline = None
+        next_page_at = ""
         timer = None
 
         def update_countdown():
@@ -5162,23 +5402,23 @@ class MainToolApp:
                 await asyncio.sleep(min(1, remaining))
 
         try:
-            update_countdown()
-            self.record_task_result(index, "CREATE_PAGE", "RUNNING", "Chờ Page tiếp", preserve_outcomes=True)
-            self.log(f"[PAGE][WAIT] [{acc_name}] Delay {delay}s; Page tiếp lúc {next_page_at[11:19]}.")
-            timer = asyncio.create_task(countdown())
+            self.record_task_result(index, "CREATE_PAGE", "RUNNING", "Chuẩn bị Feed sau Page", preserve_outcomes=True)
+            self.set_account_state(index, current_action="Đang chuẩn bị Feed sau khi tạo Page")
             if not await self.ensure_personal_profile(context, page, acc_name):
                 raise RuntimeError("Không xác minh được danh tính cá nhân trước khi chờ Page tiếp")
             if not self.is_running or getattr(self, "stop_requested", False):
                 self.finalize_active_account_tasks(index, "SKIPPED", "Đã dừng theo yêu cầu")
                 return False
-            remaining = deadline - time.monotonic()
-            if remaining > 0:
-                self.set_account_state(index, current_action="Đang lướt Feed; chờ Page tiếp")
-                await asyncio.wait_for(
-                    page.goto("https://www.facebook.com/", wait_until="domcontentloaded",
-                              timeout=max(1, int(min(15, remaining) * 1000))),
-                    timeout=remaining,
-                )
+            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=15000)
+            if not self.is_running or getattr(self, "stop_requested", False):
+                self.finalize_active_account_tasks(index, "SKIPPED", "Đã dừng theo yêu cầu")
+                return False
+            deadline = time.monotonic() + delay
+            next_page_at = (datetime.now() + timedelta(seconds=delay)).isoformat(timespec="seconds")
+            self.set_account_state(index, current_action="Đang lướt Feed sau Page; hết đếm ngược sẽ tạo tiếp")
+            update_countdown()
+            self.log(f"[PAGE][WAIT] [{acc_name}] Lướt Feed {delay}s; Page tiếp lúc {next_page_at[11:19]}.")
+            timer = asyncio.create_task(countdown())
             while self.is_running and not getattr(self, "stop_requested", False):
                 await self.guard_facebook_checkpoint(page, index)
                 is_closed = getattr(page, "is_closed", None)
@@ -5187,8 +5427,8 @@ class MainToolApp:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return True
-                await asyncio.wait_for(page.mouse.wheel(0, 500), timeout=min(15, remaining))
-                await asyncio.sleep(min(5, max(0, deadline - time.monotonic())))
+                await self._smooth_human_scroll(page, deadline)
+                await asyncio.sleep(min(random.uniform(1.4, 3.2), max(0, deadline - time.monotonic())))
             self.finalize_active_account_tasks(index, "SKIPPED", "Đã dừng theo yêu cầu")
             return False
         except asyncio.CancelledError:
@@ -5256,9 +5496,13 @@ class MainToolApp:
         )
 
         sent = 0
+        consecutive_unconfirmed = 0
+        max_consecutive_failures = 6
 
         for keyword in search_names:
-            if not self.is_running or sent >= target_total:
+            if consecutive_unconfirmed >= max_consecutive_failures:
+                break
+            if not self.is_running or self.stop_requested or sent >= target_total:
                 break
 
             keyword = keyword.strip()
@@ -5279,12 +5523,14 @@ class MainToolApp:
                 # Số lần liên tiếp scroll nhưng không có dữ liệu mới
                 no_new_data_count = 0
 
-                while self.is_running and sent < target_total:
+                while (self.is_running and not self.stop_requested and sent < target_total
+                       and consecutive_unconfirmed < max_consecutive_failures):
                     try:
                         btns = page.locator(ADD_FRIEND_SELECTORS)
                         btn_count = await btns.count()
                     except Exception as exc:
                         self.record_task_result(idx, "FRIEND_REQUEST", "ERROR", str(exc))
+                        consecutive_unconfirmed += 1
                         btn_count = 0
 
                     # =====================================
@@ -5300,15 +5546,17 @@ class MainToolApp:
                             confirmed, detail = outcome
                             if confirmed:
                                 sent += 1
+                                consecutive_unconfirmed = 0
                                 no_new_data_count = 0
                                 self.log(
                                     f"[✔] [{acc_name}] Đã xác nhận gửi {sent}/{target_total} (Từ khóa: {keyword})"
                                 )
                                 await asyncio.sleep(random.randint(min_del, max_del))
                             else:
+                                consecutive_unconfirmed += 1
                                 self.log(f"[!] [{acc_name}] Không tính lượt kết bạn: {detail}")
                                 no_new_data_count += 1
-                                await page.evaluate("window.scrollBy(0, 350)")
+                                await page.mouse.wheel(0, random.randint(260, 420))
                                 await asyncio.sleep(2)
                                 if no_new_data_count > 5:
                                     self.log(
@@ -5317,10 +5565,12 @@ class MainToolApp:
                                     break
 
                         except Exception as click_err:
+                            consecutive_unconfirmed += 1
+                            no_new_data_count += 1
                             self.record_task_result(idx, "FRIEND_REQUEST", "ERROR", str(click_err))
                             self.log(f"[!] [{acc_name}] Nút bị che hoặc lỗi: {click_err}")
                             # Cuộn nhẹ để nút lỗi trôi qua
-                            await page.evaluate("window.scrollBy(0, 350)")
+                            await page.mouse.wheel(0, random.randint(260, 420))
                             await asyncio.sleep(2)
 
                     # =====================================
@@ -5333,13 +5583,16 @@ class MainToolApp:
                             break
 
                         self.log(f"[*] [{acc_name}] Đang cuộn màn hình nạp thêm bạn bè...")
-                        await page.evaluate("window.scrollBy(0, 800)")
+                        await page.mouse.wheel(0, random.randint(480, 760))
                         await asyncio.sleep(random.uniform(2.5, 4.0))
 
             except Exception as e:
+                consecutive_unconfirmed += 1
                 self.log(f"[-] [{acc_name}] Lỗi khi tìm '{keyword}': {e}")
                 self.record_task_result(idx, "FRIEND_REQUEST", "ERROR", str(e))
 
+        if consecutive_unconfirmed >= max_consecutive_failures:
+            self.log(f"[!] [{acc_name}] Dừng kết bạn sau {consecutive_unconfirmed} lỗi/lượt chưa xác nhận liên tiếp.")
         self.log(f"[FRIEND][SUMMARY] [{acc_name}] Lời mời đã xác minh: {sent}")
         return sent
 
@@ -5576,20 +5829,38 @@ class MainToolApp:
                     await btn.click(timeout=800)
         except Exception:
             pass            
+    async def human_clear(self, page, locator, max_backspaces=40):
+        """Xóa nội dung ô nhập liệu từ từ bằng phím Backspace như người thật."""
+        try:
+            await locator.click()
+            await asyncio.sleep(random.uniform(0.18, 0.35))
+            if hasattr(page, "keyboard"):
+                await page.keyboard.press("End")
+                for _ in range(max_backspaces):
+                    await page.keyboard.press("Backspace")
+                    await asyncio.sleep(random.uniform(0.03, 0.07))
+            await locator.fill("")
+        except Exception:
+            try:
+                await locator.fill("")
+            except Exception:
+                pass
+
     async def human_type(self, page, locator, text: str, error_rate=0.03):
-        """Gõ từng ký tự với độ trễ biến thiên, mô phỏng gõ nhầm và sửa lại."""
+        """Gõ từng ký tự chậm rãi với độ trễ biến thiên, mô phỏng gõ nhầm và sửa lại."""
         await locator.click()
-        await asyncio.sleep(random.uniform(0.3, 0.6))
+        await asyncio.sleep(random.uniform(0.35, 0.7))
         for char in text:
             if random.random() < error_rate:
                 wrong_char = random.choice("abcdefghijklmnopqrstuvwxyz")
                 await page.keyboard.press(wrong_char)
-                await asyncio.sleep(random.uniform(0.12, 0.22))
+                await asyncio.sleep(random.uniform(0.16, 0.28))
                 await page.keyboard.press("Backspace")
-                await asyncio.sleep(random.uniform(0.08, 0.16))
-            await page.keyboard.type(char, delay=random.randint(55, 140))
-            if char == " " and random.random() < 0.35:
-                await asyncio.sleep(random.uniform(0.25, 0.5))
+                await asyncio.sleep(random.uniform(0.12, 0.22))
+            await page.keyboard.type(char, delay=random.randint(85, 195))
+            if char == " " and random.random() < 0.4:
+                await asyncio.sleep(random.uniform(0.3, 0.65))
+
 
     async def human_click(self, page, locator):
         """Di chuyển chuột có quỹ đạo mềm và click lệch tâm tự nhiên."""
@@ -5635,7 +5906,7 @@ class MainToolApp:
                     await asyncio.sleep(random.uniform(1.0, 1.5))
 
         return False
-    async def run_create_page(self, page, context, acc_name, idx, targets=None, max_pages=5, min_page_del=60, max_page_del=120, resolved_proxy=''):
+    async def run_create_page(self, page, context, acc_name, idx, targets=None, max_pages=5, min_page_del=800, max_page_del=900, resolved_proxy=''):
         async with self.create_page_worker_slot(idx):
             return await _pc_run_create_page(
                 self,
@@ -5687,10 +5958,10 @@ class MainToolApp:
                         await asyncio.sleep(random.randint(min_del, max_del))
                     else:
                         self.log(f"[!] [{acc_name}] Không tính lượt kết bạn nhóm: {detail}")
-                        await page.evaluate("window.scrollBy(0, 500)")
+                        await page.mouse.wheel(0, random.randint(360, 560))
                         await asyncio.sleep(2)
                 else:
-                    await page.evaluate("window.scrollBy(0, 800)")
+                    await page.mouse.wheel(0, random.randint(480, 760))
                     await asyncio.sleep(2)
         except Exception as e:
             self.log(f"[-] [{acc_name}] Lỗi kết bạn nhóm: {e}")
@@ -5750,7 +6021,7 @@ class MainToolApp:
 
     
     async def sync_live_account_cookies(self, index, context, acc_name):
-        """??ng b? l?i b? Cookie m?i nh?t t? tr?nh duy?t sau phi?n ch?y ?? gi? phi?n s?ng l?u d?i."""
+        """Đồng bộ lại bộ Cookie mới nhất từ trình duyệt sau phiên chạy để giữ phiên sống lâu dài."""
         try:
             state = self.account_states.get(index)
             if not state or state.get("status") != "LIVE" or context is None:
@@ -5798,6 +6069,7 @@ class MainToolApp:
         state = self.account_states.get(index) or {}
         expected_uid = state.get("uid") or username
         try:
+            # The imported account snapshot is authoritative, not an older profile cache.
             cookies = parse_cookies(cookie_str)
             if not cookies:
                 return LOGIN_TECHNICAL_ERROR, "Không đọc được dữ liệu Cookie để khôi phục phiên"
@@ -5979,8 +6251,8 @@ class MainToolApp:
                 if modes.get("create_page", False):
                     self.record_task_result(idx, "CREATE_PAGE", "RUNNING", "Đang tạo Page")
                     page_target_num = config.get("page_target", 5)
-                    p_min_del = config.get("min_page_delay", 60)
-                    p_max_del = config.get("max_page_delay", 120)
+                    p_min_del = config.get("min_page_delay", 800)
+                    p_max_del = config.get("max_page_delay", 900)
                     
                     create_page_results = await self.run_create_page(
                         page, context, acc_name, idx, targets_by_mode["create_page"],
@@ -6074,7 +6346,7 @@ class MainToolApp:
                 self.log(f"[!] Đã dừng nick {acc_name} theo yêu cầu.")
                 raise
             except Exception as e:
-                reason = f"Lỗi nick {acc_name}: {e}"
+                reason = f"Lỗi nick {acc_name}: {type(e).__name__}: {e}"
                 self.finalize_active_account_tasks(idx, "ERROR", reason)
                 self.set_account_failure(idx, "automation", reason)
                 self.update_tree_row(str(idx), status="ERROR")
@@ -6133,8 +6405,16 @@ class MainToolApp:
         target_indexes = self.parse_range_string(manual_syntax)
 
         # 2. ƯU TIÊN 2: NẾU Ô CÚ PHÁP TRỐNG, LẤY CÁC DÒNG CÓ DẤU [✔] TRONG BẢNG TREEVIEW
+        if manual_syntax and not target_indexes:
+            self.run_status = "FAILED"
+            self.log("[ERROR] Chọn STT chạy không hợp lệ; không chạy tài khoản nào.")
+            return
+        if not manual_syntax:
+            target_indexes = set(config.get("checked_indexes", range(1, len(raw_acc_lines) + 1)))
         if not target_indexes:
-            target_indexes = set(config.get("checked_indexes", set()))
+            self.run_status = "FAILED"
+            self.log("[ERROR] Chưa chọn tài khoản nào để chạy.")
+            return
 
         threads_count = max(1, min(20, int(config.get("threads", 3))))
         modes = {mode: bool(config.get("modes", {}).get(mode)) for mode in CORE_AUTOMATION_MODES}
@@ -6172,7 +6452,7 @@ class MainToolApp:
         semaphore = asyncio.Semaphore(threads_count)
         account_jobs = []
         for idx, line in enumerate(raw_acc_lines, 1):
-            if target_indexes and idx not in target_indexes:
+            if idx not in target_indexes:
                 continue
             parsed = parsed_accounts.get(idx) or parsed_accounts.get(str(idx))
             record = runtime_account_record(parsed)
@@ -6211,6 +6491,19 @@ class MainToolApp:
                 "timezone": parsed.get("timezone", ""),
             })
 
+        try:
+            validate_account_identities([
+                {"stt": job["idx"], "uid": job["login_user"], "account_id": job["acc_name"]}
+                for job in account_jobs
+            ])
+        except ValueError as exc:
+            self.run_status = "FAILED"
+            self.log(f"[ERROR][IMPORT] {exc}")
+            return
+        if not account_jobs:
+            self.run_status = "FAILED"
+            self.log("[ERROR] Không có tài khoản hợp lệ trong danh sách đã chọn.")
+            return
         batches = split_account_batches(account_jobs, batch_size)
         if target_indexes:
             for index in self.account_states.indexes():
@@ -6233,6 +6526,7 @@ class MainToolApp:
         unexpected_errors = []
 
         async with async_playwright() as p:
+            await self.prepare_run_proxies(p, account_jobs)
             for batch_number, batch_jobs in enumerate(batches, start=1):
                 if self.stop_requested:
                     break
@@ -6315,24 +6609,68 @@ class MainToolApp:
                 else "Toàn bộ dàn nick đã hoàn thành tất cả tiến trình!"
             ))
 
+    def cancel_uid_checks(self):
+        cancel = getattr(self, "_uid_check_cancel", None)
+        if cancel is not None:
+            cancel.set()
+
     def check_live_selected(self):
+        run_thread = getattr(self, "run_thread", None)
+        if self.is_running or (run_thread and run_thread.is_alive()):
+            messagebox.showwarning("Đang chạy", "Dừng lượt chạy hiện tại trước khi kiểm tra UID.")
+            return
         selected = self.tree.selection() or self.tree.get_children()
         if not selected:
             messagebox.showwarning("Chú ý", "Bảng đang trống!")
             return
 
-        selected_accounts = [
-            (item, str(self.tree.item(item, "values")[2]).strip())
-            for item in selected
-        ]
-        for item, _uid in selected_accounts:
-            if str(item).isdigit():
-                self.set_account_state(int(item), status="CHECKING", current_action="Kiểm tra UID")
-                self.update_tree_row(item, status="ĐANG KIỂM TRA")
+        selected_accounts = []
+        for item in selected:
+            state = self.management_account_for_item(item)
+            if state is not None:
+                selected_accounts.append((history_account_id(state), str(state.get("uid") or "")))
+                self.set_account_state(state["stt"], current_action="Đang kiểm tra UID; không xác minh phiên đăng nhập")
+        if not selected_accounts:
+            messagebox.showwarning("Chú ý", "Không có tài khoản hợp lệ để kiểm tra UID.")
+            return
+        self.cancel_uid_checks()
+        cancel = self._uid_check_cancel = threading.Event()
+        run_generation = getattr(self, "_run_generation", 0)
+
+        def is_current_check():
+            thread = getattr(self, "run_thread", None)
+            return (not cancel.is_set()
+                    and getattr(self, "_uid_check_cancel", None) is cancel
+                    and run_generation == getattr(self, "_run_generation", 0)
+                    and not self.is_running and not (thread and thread.is_alive())
+                    and not getattr(self, "close_requested", False))
+
+        def apply_result(identity, uid, status, action, failure_kind=None):
+            if not is_current_check():
+                return
+            for index in self.account_states.indexes():
+                state = self.account_states.get(index, include_logs=False)
+                if (state is None or history_account_id(state) != identity or str(state.get("uid") or "") != uid
+                        or state.get("is_processing")):
+                    continue
+                if failure_kind:
+                    self.set_account_failure(index, failure_kind, action)
+                else:
+                    self.set_account_state(index, status=status, current_action=action)
+                self.log(f"[*] [{uid}] {action}", account_index=index)
+                self.update_tree_row(str(index))
+                break
+
+        def finish_check():
+            if is_current_check():
+                messagebox.showinfo("Hoàn tất", "Đã kiểm tra UID. LIVE/DIE cần xác minh đăng nhập.")
 
         def worker():
-            for item, uid in selected_accounts:
-                account_index = int(item) if str(item).isdigit() else None
+            for identity, uid in selected_accounts:
+                if cancel.is_set():
+                    return
+                failure_kind = None
+                status = "UNKNOWN"
                 if uid and uid.isdigit():
                     try:
                         url = f"https://graph.facebook.com/{uid}/picture?type=normal"
@@ -6342,25 +6680,15 @@ class MainToolApp:
                         action = "UID có phản hồi; cần đăng nhập để xác nhận LIVE/DIE"
                         if "static.xx.fbcdn.net" in response_url:
                             action = "UID không xác định; cần đăng nhập để kết luận"
-                        if account_index is not None:
-                            self.set_account_state(account_index, status="UNKNOWN", current_action=action)
-                            self.log(f"[*] [{uid}] {action}", account_index=account_index)
-                        status_live = "CHƯA KIỂM TRA"
                     except Exception as error:
-                        if account_index is not None:
-                            self.set_account_failure(
-                                account_index,
-                                "network",
-                                f"Không thể kiểm tra UID do lỗi mạng: {error}",
-                            )
-                        status_live = "ERROR"
+                        failure_kind, status = "network", "ERROR"
+                        action = f"Không thể kiểm tra UID do lỗi mạng: {type(error).__name__}: {error}"
                 else:
-                    if account_index is not None:
-                        self.set_account_failure(account_index, "input", "Không có UID hợp lệ để kiểm tra.")
-                    status_live = "ERROR"
-
-                self.update_tree_row(item, status=status_live)
-            self.post_ui(lambda: messagebox.showinfo("Hoàn tất", "Đã kiểm tra xong tình trạng Live/Die."))
+                    failure_kind, status = "input", "ERROR"
+                    action = "Không có UID hợp lệ để kiểm tra."
+                self.post_ui(lambda identity=identity, uid=uid, status=status, action=action, kind=failure_kind:
+                             apply_result(identity, uid, status, action, kind))
+            self.post_ui(finish_check)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -6382,10 +6710,59 @@ class MainToolApp:
 
         self.open_account_inspector(self.management_account_for_item(selected[0]))
 
+    def capture_inspector_account(self, account):
+        """UI-thread capture; inspector workers never read widgets or rotate proxies."""
+        identity = history_account_id(account)
+        config = getattr(self, "run_config", {}) or {}
+        thread = getattr(self, "run_thread", None)
+        active = self.is_running or (thread and thread.is_alive())
+        if active:
+            source = next((source for source in config.get("parsed_accounts", {}).values()
+                           if history_account_id(source) == identity), None)
+            if source is None:
+                raise ValueError("Tài khoản không có trong cấu hình của lượt chạy hiện tại.")
+        else:
+            if self.reload_table_from_text() is False:
+                raise ValueError(self._account_import_error)
+            states = {index: self.account_states.get(index, include_logs=False)
+                      for index in self.account_states.indexes()}
+            source = next((state for state in states.values()
+                           if history_account_id(state) == identity), None)
+            mode = self.proxy_mode.get()
+            current = {
+                "proxy_mode": mode,
+                "proxies": self.txt_proxies.get("1.0", "end").strip(),
+                "proxy_ratio": self.ent_proxy_ratio.get(),
+                "proxy_api": self.ent_proxy_api.get().strip() if mode == "rotating_api" else "",
+            }
+            same_network = bool(config) and proxy_configuration_signature(current) == proxy_configuration_signature(config)
+            if mode == "rotating_api" or source is None:
+                if not same_network:
+                    raise ConnectionError("Cấu hình proxy đã đổi hoặc chưa được chuẩn bị; hãy chạy lại bước lấy proxy.")
+                if source is None:
+                    source = next((source for source in config.get("parsed_accounts", {}).values()
+                                   if history_account_id(source) == identity), None)
+                    if source is None:
+                        raise ValueError("Không có cấu hình mạng cho tài khoản; hãy nạp lại tài khoản.")
+            else:
+                current.update(
+                    parsed_accounts=states,
+                    resolved_proxies={index: state.get("proxy", "") for index, state in states.items()},
+                    proxy_snapshot_complete=True,
+                    proxy_required=bool(same_network and config.get("proxy_required", False)),
+                )
+                config = current
+        network = inspector_network_context(source, config)
+        return RunConfig({**source, "inspector_network": network})
+
     def open_account_inspector(self, account):
         if account is None:
             return
-        snapshot = RunConfig(account)
+        try:
+            snapshot = self.capture_inspector_account(account)
+        except (ValueError, ConnectionError) as exc:
+            messagebox.showerror("Chrome kiểm tra", str(exc))
+            return
         def launch():
             try:
                 asyncio.run(self.inspect_account_session(snapshot))
@@ -6396,12 +6773,23 @@ class MainToolApp:
 
     async def inspect_account_session(self, account):
         """Manual inspection owns its driver, browser and ephemeral account context."""
-        proxy = str(account.get("effective_proxy") or account.get("proxy") or "")
-        proxy = "" if proxy == "Không dùng" else proxy
+        network = account.get("inspector_network")
+        if network is None:
+            network = inspector_network_context(account, getattr(self, "run_config", None))
+        if network.get("account_id") != history_account_id(account):
+            raise ValueError("Proxy không thuộc tài khoản đang kiểm tra.")
+        proxy = network.get("proxy", "")
         proxy_cfg = parse_proxy(proxy)
-        if proxy and not proxy_cfg:
-            raise ValueError("Proxy không hợp lệ; không mở bằng IP thật.")
+        if (network.get("required") and not proxy_cfg) or (proxy and not proxy_cfg):
+            raise ValueError("Thiếu proxy bắt buộc hoặc proxy không hợp lệ; không mở bằng IP thật.")
         browser = context = page = None
+        page_crashed = False
+        page_closed = asyncio.Event()
+
+        def on_page_crash(_page):
+            nonlocal page_crashed
+            page_crashed = True
+
         async with async_playwright() as p:
             try:
                 launch_options = {"headless": False}
@@ -6421,9 +6809,23 @@ class MainToolApp:
                 context = await browser.new_context(**context_options)
                 await context.add_cookies(parse_cookies(account.get("cookie", "")))
                 page = await context.new_page()
+                page.on("crash", on_page_crash)
+                page.on("close", lambda _page: page_closed.set())
                 await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=40000)
                 while browser.is_connected() and context.pages:
                     await asyncio.sleep(0.5)
+            except PlaywrightError as exc:
+                interrupted = is_browser_target_closed_error(exc) or "net::ERR_ABORTED" in str(exc)
+                if not interrupted or page is None or page_crashed:
+                    raise
+                if page.is_closed() is not True and browser.is_connected() is not False:
+                    # Navigation may reject just before Playwright delivers the close event.
+                    try:
+                        await asyncio.wait_for(page_closed.wait(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        raise exc
+                if page_crashed:
+                    raise
             finally:
                 await close_browser_resources(context, browser, page)
 

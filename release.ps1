@@ -1,12 +1,16 @@
 ﻿[CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true, Position = 0)]
+    [Parameter(Position = 0)]
     [ValidatePattern('^\d+\.\d+\.\d+$')]
     [string]$Version,
 
     [Parameter(Position = 1)]
     [ValidateNotNullOrEmpty()]
-    [string]$Changelog = 'Cập nhật Tool'
+    [string]$Changelog = 'Cập nhật Tool',
+
+    [switch]$BuildOnly,
+
+    [string]$PythonPath
 )
 
 Set-StrictMode -Version Latest
@@ -20,6 +24,22 @@ function Get-RequiredCommand {
         throw "Không tìm thấy lệnh '$Name' trong PATH."
     }
     return $command.Source
+}
+
+function Resolve-BuildPython {
+    param([string]$ExplicitPath)
+
+    if ($ExplicitPath) {
+        if (-not (Test-Path -LiteralPath $ExplicitPath -PathType Leaf)) {
+            throw "Python executable not found: $ExplicitPath"
+        }
+        return (Resolve-Path -LiteralPath $ExplicitPath).ProviderPath
+    }
+    $localPython = Join-Path $projectRoot '.venv-build\Scripts\python.exe'
+    if (Test-Path -LiteralPath $localPython -PathType Leaf) {
+        return $localPython
+    }
+    return Get-RequiredCommand 'python'
 }
 
 function Invoke-NativeCapture {
@@ -74,6 +94,20 @@ function Write-Utf8NoBom {
     [System.IO.File]::WriteAllText($Path, $Content, $encoding)
 }
 
+function Get-Sha256Hash {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return [System.BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '')
+    }
+    finally {
+        $sha.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Set-JsonProperty {
     param(
         [Parameter(Mandatory = $true)]$Object,
@@ -92,22 +126,31 @@ function Set-JsonProperty {
 function Remove-PathWithRetry {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$AllowedRoot,
         [switch]$Recurse,
         [int]$RetryCount = 3
     )
 
-    if (-not (Test-Path -LiteralPath $Path)) {
+    $absolutePath = [System.IO.Path]::GetFullPath($Path)
+    $rootPrefix = [System.IO.Path]::GetFullPath($AllowedRoot).TrimEnd([char[]]@('\', '/')) + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $absolutePath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Cleanup target is outside its allowed directory: $absolutePath"
+    }
+    if (-not (Test-Path -LiteralPath $absolutePath)) {
         return
+    }
+    if ((Get-Item -LiteralPath $absolutePath -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Refusing cleanup of a linked directory: $absolutePath"
     }
 
     $lastError = $null
     for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
         try {
             if ($Recurse) {
-                Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+                Remove-Item -LiteralPath $absolutePath -Recurse -Force -ErrorAction Stop
             }
             else {
-                Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+                Remove-Item -LiteralPath $absolutePath -Force -ErrorAction Stop
             }
             return
         }
@@ -129,7 +172,7 @@ function Invoke-PytestGate {
     )
 
     Write-Host "`n==> Chạy unit test" -ForegroundColor Cyan
-    $result = Invoke-NativeCapture $PythonPath @('-m', 'pytest', '-v', '--color=no')
+    $result = Invoke-NativeCapture $PythonPath @('-m', 'pytest', '-q', '--color=no')
     $lines = @($result.Output | ForEach-Object { "$_" })
     foreach ($line in $lines) {
         Write-Host $line
@@ -156,13 +199,71 @@ function Invoke-PytestGate {
     Write-Host 'Result: PASS' -ForegroundColor Green
 }
 
+function Invoke-ProjectBuild {
+    param([Parameter(Mandatory = $true)][string]$PythonPath)
+
+    Invoke-NativeChecked $PythonPath @('-m', 'compileall', '-q', $sourceRoot) 'Check Python syntax' | Out-Null
+    Invoke-PytestGate $PythonPath
+
+    $buildRoot = Join-Path $projectRoot 'build'
+    $buildDirectory = Join-Path $buildRoot ("release-" + [guid]::NewGuid().ToString('N'))
+    $stagedDist = Join-Path $buildDirectory 'dist'
+    $stagedWork = Join-Path $buildDirectory 'work'
+    $distDirectory = Split-Path -Parent $exePath
+    $temporaryExe = Join-Path $distDirectory ('.client_app-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
+        Invoke-NativeChecked $PythonPath @(
+            '-m', 'PyInstaller', '--noconfirm', '--clean',
+            '--distpath', $stagedDist, '--workpath', $stagedWork, $specPath
+        ) 'Build client_app.exe' | Out-Null
+        $builtExe = Join-Path $stagedDist 'client_app.exe'
+        if (-not (Test-Path -LiteralPath $builtExe -PathType Leaf)) {
+            throw "Build produced no EXE: $builtExe"
+        }
+        $stream = [System.IO.File]::OpenRead($builtExe)
+        try {
+            if ($stream.ReadByte() -ne 0x4D -or $stream.ReadByte() -ne 0x5A) {
+                throw 'Build output is not a Windows EXE.'
+            }
+        }
+        finally {
+            $stream.Dispose()
+        }
+        $sha256 = Get-Sha256Hash $builtExe
+        New-Item -ItemType Directory -Path $distDirectory -Force | Out-Null
+        [System.IO.File]::Copy($builtExe, $temporaryExe, $false)
+        if (Test-Path -LiteralPath $exePath) {
+            [System.IO.File]::Replace($temporaryExe, $exePath, [NullString]::Value)
+        }
+        else {
+            [System.IO.File]::Move($temporaryExe, $exePath)
+        }
+        Write-Host "EXE: $exePath" -ForegroundColor Green
+        Write-Host "SHA256 local: $sha256" -ForegroundColor Green
+        return [pscustomobject]@{ ExePath = $exePath; Sha256 = $sha256 }
+    }
+    finally {
+        foreach ($cleanup in @(
+            @{ Path = $temporaryExe; Root = $distDirectory; Recurse = $false },
+            @{ Path = $buildDirectory; Root = $buildRoot; Recurse = $true }
+        )) {
+            try {
+                Remove-PathWithRetry -Path $cleanup.Path -AllowedRoot $cleanup.Root -Recurse:$cleanup.Recurse
+            }
+            catch {
+                Write-Warning "Build cleanup: $($_.Exception.Message)"
+            }
+        }
+    }
+}
+
 $projectRoot = $PSScriptRoot
 $sourceRoot = Join-Path $projectRoot 'source'
 $clientPath = Join-Path $sourceRoot 'client_app.py'
 $versionJsonPath = Join-Path $projectRoot 'version.json'
 $specPath = Join-Path $projectRoot 'client_app.spec'
 $exePath = Join-Path $projectRoot 'dist\client_app.exe'
-$buildWorkPath = Join-Path $projectRoot 'build\client_app'
 $tagName = "v$Version"
 $originalClientContent = $null
 $sourceCommitted = $false
@@ -171,9 +272,24 @@ $failure = $null
 
 Push-Location $projectRoot
 try {
+    $python = Resolve-BuildPython $PythonPath
+    $env:PYTHONUTF8 = '1'
+    Write-Host "Python: $python" -ForegroundColor DarkGray
+    foreach ($requiredFile in @($clientPath, $specPath, (Join-Path $projectRoot 'requirements-build.txt'))) {
+        if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
+            throw "Required build file not found: $requiredFile"
+        }
+    }
+    if ($BuildOnly) {
+        Invoke-ProjectBuild $python | Out-Null
+        Write-Host 'Local build complete. No Git/GitHub changes.' -ForegroundColor Green
+        return
+    }
+    if (-not $Version) {
+        throw 'Usage: .\release.ps1 VERSION "Changelog"; or .\release.ps1 -BuildOnly'
+    }
     $git = Get-RequiredCommand 'git'
     $gh = Get-RequiredCommand 'gh'
-    $python = Get-RequiredCommand 'python'
 
     Write-Host "Release target: $tagName" -ForegroundColor Green
     Write-Host "Changelog: $Changelog"
@@ -248,23 +364,8 @@ try {
     Write-Utf8NoBom $clientPath $updatedClientContent
     Write-Host "Đã cập nhật CURRENT_VERSION thành $Version." -ForegroundColor Green
 
-    Invoke-PytestGate $python
-
-    # Dọn output cũ trước khi build để tránh PyInstaller dùng state cũ.
-    # Nếu Windows đang khóa file/thư mục, lỗi sẽ nêu rõ thay vì fail khó hiểu ở giữa build.
-    Remove-PathWithRetry -Path $buildWorkPath -Recurse
-    Remove-PathWithRetry -Path $exePath
-    Invoke-NativeChecked $python @('-m', 'PyInstaller', '--noconfirm', '--clean', $specPath) 'Build client_app.exe' | Out-Null
-    if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
-        throw "Build hoàn tất nhưng không tìm thấy $exePath."
-    }
-
-    $header = [System.IO.File]::ReadAllBytes($exePath)
-    if ($header.Length -lt 2 -or $header[0] -ne 0x4D -or $header[1] -ne 0x5A) {
-        throw 'File build không phải Windows EXE hợp lệ.'
-    }
-    $localSha256 = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToUpperInvariant()
-    Write-Host "SHA256 local: $localSha256" -ForegroundColor Green
+    $buildResult = Invoke-ProjectBuild $python
+    $localSha256 = $buildResult.Sha256
 
     Invoke-NativeChecked $git @('add', '-A', '--', '.') 'Đưa source vào staging' | Out-Null
     Invoke-NativeChecked $git @('reset', '--', 'version.json') 'Để version.json cho commit cuối' | Out-Null
@@ -308,7 +409,7 @@ try {
     if (-not (Test-Path -LiteralPath $downloadedExe -PathType Leaf)) {
         throw 'Không tải lại được client_app.exe từ Draft Release.'
     }
-    $releaseSha256 = (Get-FileHash -LiteralPath $downloadedExe -Algorithm SHA256).Hash.ToUpperInvariant()
+    $releaseSha256 = Get-Sha256Hash $downloadedExe
     Write-Host "SHA256 release: $releaseSha256" -ForegroundColor Green
     if ($releaseSha256 -ne $localSha256) {
         throw 'SHA256 của asset trên GitHub không khớp. Draft Release sẽ không được publish.'
@@ -349,7 +450,7 @@ catch {
 }
 finally {
     if ($null -ne $downloadDirectory -and (Test-Path -LiteralPath $downloadDirectory)) {
-        Remove-Item -LiteralPath $downloadDirectory -Recurse -Force
+        Remove-PathWithRetry -Path $downloadDirectory -AllowedRoot ([System.IO.Path]::GetTempPath()) -Recurse
     }
     Pop-Location
 }
